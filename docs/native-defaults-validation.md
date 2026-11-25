@@ -234,3 +234,12 @@ The current production translation metadata contains 120,362 guard starts. A rep
 The manifest reports direct calls only for CameraMtx (`801A81D4`, UpdateCameraMtx) and LightSettingCopy (`8019DFAC`, Copy32ByteBlocks). Source inspection confirms that CameraMtx declines the update path before modifying state and checks PSMTXCopy's guard for its native copy path. LightSettingCopy checks Copy32ByteBlocks' guard before native execution. EnvTexMtx likewise checks the inlined PSMTXIdentity guard. The other audited bodies report no direct calls. These checks supplement the earlier dependency-invalidation regressions; a clean interval inventory alone does not prove instruction semantics, indirect-call behavior, or runtime invalidation delivery.
 
 Run `python3 docs/tools/audit-native-guard-ranges.py /path/to/wiicompiled/generated --output /tmp/native-guard-ranges.json` after generating a production build. [Accepted metadata receipt](native-guard-ranges.json) includes input hashes and per-helper ranges. Generated guest code is not included. This audit adds no runtime change and does not replace pending native ARM execution.
+
+
+### Gameplay-region rollback clock boundary
+
+Source inspection of the tested Dolphin 0.2.8 build distinguishes two restore contracts. Its gameplay-region `RollbackManager::LoadFrame` branch restores selected memory and CPU registers while deliberately retaining forward-running time, devices and CPU slice position. Its full-machine branch separately restores CoreTiming and machine registers. The connected REX tests use the gameplay-region contract.
+
+The recomp gameplay and online snapshot callbacks likewise restore selected memory and CPU context without rewinding `DetClock`; resimulation changes pacing while guest clock reads continue advancing virtual time. Therefore clock-derived bytes can differ after resimulation even when snapshot restoration itself is correct. Rewinding only the recomp clock would change its behavior relative to this Dolphin mode and is not justified as a fix by the repeated-save differences alone.
+
+This is a source-level contract observation, not proof that every differing byte is harmless, that guest clocks are numerically identical between engines, or that arbitrary clock-dependent mods will remain synchronized. Non-clock differences and native ARM validation remain open. [Source identities and audit scope](rollback-clock-contract.json).

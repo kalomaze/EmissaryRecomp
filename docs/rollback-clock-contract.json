@@ -1,0 +1,28 @@
+{
+  "kind": "Source-level rollback clock contract audit; not a new gameplay run",
+  "recomp_files_sha256": {
+    "wiicompiled/runtime/src/brawl_rollback.cpp": "ea94889cc979ad6d366590e7dac18fe1d183d2e692395e27e15e8e637183c3d9",
+    "wiicompiled/runtime/src/brawl_online_core.cpp": "701137d58f7d4e4520bb75944e5a726c51382b7fdcb5d1a95a972f6be605c019",
+    "wiicompiled/runtime/src/det_clock.cpp": "5a79ce26844d1db8eec73d567bc960aeaf4bf24014f41ea9db37a78754f98e5e",
+    "wiicompiled/runtime/src/hle/os/os_time.cpp": "8c82b3c517ca0d27aa1e371ae9f7a460c245c814ffe9f972beb89afe1a6d9de3"
+  },
+  "dolphin_files_sha256": {
+    "Core/Rollback/RollbackManager.cpp": "d14f4b0f095440952d0ad3d55b7b13b4be1570b98d31b067ed8784c32c11ff4f",
+    "Core/CoreTiming.cpp": "ba290002e2d3dc4469668bdb9c92ff0dae12d48a6f19ce08e08f9ea399896a16"
+  },
+  "observations": [
+    "Dolphin RollbackManager::LoadFrame region-mode branch restores CPU registers and selected memory, explicitly retaining forward-running time/devices/slice position.",
+    "Dolphin full-machine branch separately restores CoreTiming/downcount/machine registers; that is not the connected gameplay-region mode.",
+    "Recomp gameplay Load and online SnapshotRestore/RestoreRegs restore selected memory and CPU context, without restoring DetClock.",
+    "DetClock SetRollbackResimulating changes pacing; ReadForGuest and AdvanceTo continue advancing virtual ticks."
+  ],
+  "implications": [
+    "Clock-derived RAM can change on a repeated simulation without a failed snapshot restore.",
+    "Do not rewind only the recomp clock as a compatibility fix for gameplay-region rollback.",
+    "This does not prove arbitrary time-dependent mods are deterministic or classify other region differences as harmless."
+  ],
+  "remaining": [
+    "Attribute and assess non-clock state differences",
+    "Validate current runtime natively on ARM"
+  ]
+}
