@@ -18,5 +18,29 @@
     "runtime.log": "46caa417da78be0aabca081b9a62c064a9da7d09ed534a3cfa399ae5ef3f9e5c",
     "driver": "66e0b922dc53aff1e1fb519212fe42f898a9f7d1861eb84d9e1b4f27b8882c3a",
     "gdb_script": "d306164ff7f6707171ef94b144b58c36e03caeb8a0fe79b50fb6b60ce7005752"
+  },
+  "reader_followup": {
+    "accepted_watch_stops": 24,
+    "locked_cache_load_stops": 2,
+    "locked_cache_store_stops": 22,
+    "snapshot_stops_filtered": 5,
+    "load_chain": [
+      "PPC_WriteSpr",
+      "func_8015D8B4_body",
+      "func_801A4204_body",
+      "func_801AE31C_body",
+      "func_801B21E8_body"
+    ],
+    "disassembly": "PPC_WriteSpr memcpy return ef998b is memory-to-locked-cache; ef98d6 precedes GxNotifyGuestRamDmaWrite and is locked-cache-to-memory. Read watch stops must not all be counted as loads.",
+    "conclusion": "Watched memory has a guest consumer; do not exclude it from snapshots. Downstream gameplay versus rendering relevance remains unresolved.",
+    "limitations": [
+      "24 accepted stops in one host mapping; not exhaustive or an alias-read audit",
+      "Debugger intentionally terminates; not a completed parity run"
+    ],
+    "artifacts_sha256": {
+      "stage-reader-v3/runtime.log": "ca8ef462822f2812285c9cc900f35c7efd9dc0f77fc617447a66b22c1da50491",
+      "watch-stage-reader-filtered.gdb": "9c4d044fd0d62b772f1424d552c14de71b704d6edff825d04cb15c2e6d3a9f38",
+      "watch-stage-reader-filtered-driver.py": "ee85f1e2ad0e108a3666eab449139f0a814a95e9d2698b9bb104e1300e50955d"
+    }
   }
 }
