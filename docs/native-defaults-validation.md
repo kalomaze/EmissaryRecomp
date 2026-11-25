@@ -153,3 +153,15 @@ The fixture reflects the production guard split and verifies both a modified con
 A separate REX control with native Gecko disabled still reports 297 full-memory differences. Its 597 trace rows exactly match the native run's recorded gameplay, fighter, RNG and input fields. That excludes native Gecko as the sole explanation, but does not clear other native paths or establish full-memory determinism. [Validation receipt](gecko-continuation-validation.json).
 
 The same binary passes Project+ recordings 001/064/128 for 120 output frames with one redo, including all 1,062 snapshot operations and no reported native differential failures.
+
+
+### Timing after both Gecko fixes
+
+A paired 16-capture batch compares `4bfba01` (before both Gecko changes) with `f6a159d` (interpreted exit plus continuation guards), using recording 128, lean memory and compiled mods without PGO on the same x86 host. Four runs per build/depth use counterbalanced order and 960 interior marker intervals each. All checksum/work-count gates pass; local reanalysis exactly reproduces all 16 reports.
+
+| Depth | Mean before / after (ms) | p99 before / after (ms) | Run-mean SD before / after (ms) |
+|---|---:|---:|---:|
+| 0f | 1.952174 / 1.956363 | 2.428352 / 2.416683 | 0.052221 / 0.038752 |
+| 1f | 3.900894 / 3.926366 | 4.731870 / 4.734326 | 0.152292 / 0.115571 |
+
+The measured mean differences are +0.004189 ms (+0.21%) and +0.025471 ms (+0.65%). They are small relative to between-run variation, but this batch does not establish zero overhead. Percentiles are averages of per-run percentiles. This covers one recording and is not a new Dolphin, Switch/Horizon or native ARM comparison. [Run statistics and identities](gecko-safety-timing.json).

@@ -1,0 +1,514 @@
+{
+  "comparison": "4bfba01 before both Gecko fixes versus f6a159d with interpreted exit and continuation guards",
+  "host": "EPYC 9575F, CPUs96-127",
+  "workload": "recording128, 1200 output frames per run,960 interior frame-marker intervals",
+  "configuration": "lean memory, compiled mods, noPGO",
+  "design": "16 serial counterbalanced captures; four per build/depth",
+  "identities": {
+    "old": {
+      "binary": "e9b75cde36ab6cd62885830f7947e69a0b56abc28fb7de8fb2091d1efa5914c5",
+      "config": "a43fa16dc71d6f1722a1c292df04ebeecfde5869c156b45ee72f8627c3ded0cf"
+    },
+    "new": {
+      "binary": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+      "config": "a43fa16dc71d6f1722a1c292df04ebeecfde5869c156b45ee72f8627c3ded0cf"
+    }
+  },
+  "summary_ms": {
+    "0": {
+      "old": {
+        "mean": 1.9521741979166667,
+        "p75": 2.0372425,
+        "p90": 2.1697397,
+        "p95": 2.2560324124999998,
+        "p99": 2.4283515049999997,
+        "sd_run_mean": 0.0522211596883784
+      },
+      "new": {
+        "mean": 1.956363473697917,
+        "p75": 2.0435511875,
+        "p90": 2.166757725,
+        "p95": 2.2483195125,
+        "p99": 2.4166831024999995,
+        "sd_run_mean": 0.03875167338922066
+      }
+    },
+    "2": {
+      "old": {
+        "mean": 3.9008942018229167,
+        "p75": 4.0875065625,
+        "p90": 4.314607275,
+        "p95": 4.4493776,
+        "p99": 4.731869979999999,
+        "sd_run_mean": 0.15229220292834228
+      },
+      "new": {
+        "mean": 3.9263655906249997,
+        "p75": 4.10702825,
+        "p90": 4.33330615,
+        "p95": 4.461668362499999,
+        "p99": 4.734326492499999,
+        "sd_run_mean": 0.11557127161586629
+      }
+    }
+  },
+  "local_reanalysis": {
+    "runs": 16,
+    "identical": true
+  },
+  "runs": [
+    {
+      "name": "gecko-guard-m128-d0-s0-old",
+      "engine": "recomp",
+      "arm": "old",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.8806448583333335,
+        "p75": 1.9641992499999998,
+        "p90": 2.0981642,
+        "p95": 2.1873796,
+        "p99": 2.37687102
+      },
+      "Mcycles": {
+        "mean": 9.491335184375002,
+        "p75": 9.90892475,
+        "p90": 10.5941083,
+        "p95": 11.043047999999999,
+        "p99": 12.00051999
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.050324250979387,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "e9b75cde36ab6cd62885830f7947e69a0b56abc28fb7de8fb2091d1efa5914c5",
+      "checksums": "PASS",
+      "samples_sha256": "2f72b23e3114474030c66e66297187c2ec5b97616439ea2774c0fb3990aec522"
+    },
+    {
+      "name": "gecko-guard-m128-d0-s1-new",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.9826640666666668,
+        "p75": 2.0703774999999998,
+        "p90": 2.1901252,
+        "p95": 2.25990715,
+        "p99": 2.4356858
+      },
+      "Mcycles": {
+        "mean": 9.961168294791666,
+        "p75": 10.410289,
+        "p90": 11.002001,
+        "p95": 11.3651035,
+        "p99": 12.245214059999999
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.0496466631936805,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+      "checksums": "PASS",
+      "samples_sha256": "ddf5c2e619626c11ff22d49ee29f89f23de7274aa1ab35ac1f052725d03e7949"
+    },
+    {
+      "name": "gecko-guard-m128-d0-s2-new",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.9251202041666668,
+        "p75": 2.01148225,
+        "p90": 2.1390403,
+        "p95": 2.2272021,
+        "p99": 2.4033606599999997
+      },
+      "Mcycles": {
+        "mean": 9.707612090624998,
+        "p75": 10.146937750000001,
+        "p90": 10.7904636,
+        "p95": 11.24384695,
+        "p99": 12.134453119999998
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.050403127154926,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+      "checksums": "PASS",
+      "samples_sha256": "0f148c70803391f8890b1f49087055fddd990b571f27ee21a7048fbd3c11bec4"
+    },
+    {
+      "name": "gecko-guard-m128-d0-s3-old",
+      "engine": "recomp",
+      "arm": "old",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.95778191875,
+        "p75": 2.0479777500000003,
+        "p90": 2.1709012,
+        "p95": 2.2657401499999996,
+        "p99": 2.42456092
+      },
+      "Mcycles": {
+        "mean": 9.833552330208333,
+        "p75": 10.295366249999999,
+        "p90": 10.9118995,
+        "p95": 11.396141349999999,
+        "p99": 12.197927669999999
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.036857048244114,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "e9b75cde36ab6cd62885830f7947e69a0b56abc28fb7de8fb2091d1efa5914c5",
+      "checksums": "PASS",
+      "samples_sha256": "a3a46c5337ca8388eb6f55332b3172905b87e36b952978c4d407b49eda74482d"
+    },
+    {
+      "name": "gecko-guard-m128-d0-s4-new",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.9964180427083336,
+        "p75": 2.08169525,
+        "p90": 2.2052411000000003,
+        "p95": 2.2838396,
+        "p99": 2.43623301
+      },
+      "Mcycles": {
+        "mean": 10.039795479166665,
+        "p75": 10.46496475,
+        "p90": 11.0897304,
+        "p95": 11.5069495,
+        "p99": 12.244359949999998
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.039781319008087,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+      "checksums": "PASS",
+      "samples_sha256": "4c09c5660111b9d5be73e39971132532fe8dda90633ba7719e49a0077a695209"
+    },
+    {
+      "name": "gecko-guard-m128-d0-s5-old",
+      "engine": "recomp",
+      "arm": "old",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 2.005876580208333,
+        "p75": 2.09154425,
+        "p90": 2.2281134000000002,
+        "p95": 2.3134656999999996,
+        "p99": 2.4813443599999996
+      },
+      "Mcycles": {
+        "mean": 10.078989926041665,
+        "p75": 10.509130749999999,
+        "p90": 11.191434000000001,
+        "p95": 11.638891899999999,
+        "p99": 12.48230925
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.035411493095771,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "e9b75cde36ab6cd62885830f7947e69a0b56abc28fb7de8fb2091d1efa5914c5",
+      "checksums": "PASS",
+      "samples_sha256": "6e38d6d257df441b00f12da89e70927229e6fe73fa28bf56471bf20940f703cd"
+    },
+    {
+      "name": "gecko-guard-m128-d0-s6-old",
+      "engine": "recomp",
+      "arm": "old",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.964393434375,
+        "p75": 2.04524875,
+        "p90": 2.18178,
+        "p95": 2.2575442,
+        "p99": 2.4306297199999998
+      },
+      "Mcycles": {
+        "mean": 9.866408695833332,
+        "p75": 10.276796000000001,
+        "p90": 10.974923100000002,
+        "p95": 11.346847949999999,
+        "p99": 12.21836867
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.037171186128481,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "e9b75cde36ab6cd62885830f7947e69a0b56abc28fb7de8fb2091d1efa5914c5",
+      "checksums": "PASS",
+      "samples_sha256": "bb90e95a09d7e04c5d3533d646e4bad2c7274f34ef899c97bdd03232058a52ec"
+    },
+    {
+      "name": "gecko-guard-m128-d0-s7-new",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.9212515812500002,
+        "p75": 2.01064975,
+        "p90": 2.1326243000000003,
+        "p95": 2.2223292,
+        "p99": 2.391452939999999
+      },
+      "Mcycles": {
+        "mean": 9.668432092708333,
+        "p75": 10.1204915,
+        "p90": 10.7231409,
+        "p95": 11.16875995,
+        "p99": 12.048673129999996
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.040037020747043,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+      "checksums": "PASS",
+      "samples_sha256": "196262310487a13341b1199247243591e7ce235c4873e9e5e295a2428568d2c0"
+    },
+    {
+      "name": "gecko-guard-m128-d2-s0-old",
+      "engine": "recomp",
+      "arm": "old",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 4.00495685,
+        "p75": 4.190207,
+        "p90": 4.4216238,
+        "p95": 4.5615920999999995,
+        "p99": 4.83719828
+      },
+      "Mcycles": {
+        "mean": 20.166319643749997,
+        "p75": 21.08988275,
+        "p90": 22.2543646,
+        "p95": 22.97261425,
+        "p99": 24.36314157
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.050586809332155,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "e9b75cde36ab6cd62885830f7947e69a0b56abc28fb7de8fb2091d1efa5914c5",
+      "checksums": "PASS",
+      "samples_sha256": "4f893ae419119edf8d742bb9f89af5a01f1422373b014ec7be58a579e9fea13b"
+    },
+    {
+      "name": "gecko-guard-m128-d2-s1-new",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.9074970979166666,
+        "p75": 4.093261,
+        "p90": 4.354847,
+        "p95": 4.50126625,
+        "p99": 4.766276679999999
+      },
+      "Mcycles": {
+        "mean": 22.02651789583333,
+        "p75": 20.58473425,
+        "p90": 21.9147286,
+        "p95": 22.64051115,
+        "p99": 23.995884649999994
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 347.4443874869236,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+      "checksums": "PASS",
+      "samples_sha256": "552f4142f3e034f14d41861fd9d19866289a5a9a02a6998f12e0cb3d98903185"
+    },
+    {
+      "name": "gecko-guard-m128-d2-s2-new",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.7718675385416662,
+        "p75": 3.95372225,
+        "p90": 4.1438443,
+        "p95": 4.267748699999999,
+        "p99": 4.55085244
+      },
+      "Mcycles": {
+        "mean": 18.954202430208333,
+        "p75": 19.865279,
+        "p90": 20.8391709,
+        "p95": 21.450488949999997,
+        "p99": 22.835057839999997
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.038872653866867,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+      "checksums": "PASS",
+      "samples_sha256": "629c815bdbde6abb1da8d27d07576cf0458b6d0d6c2202900736538c6efe9f12"
+    },
+    {
+      "name": "gecko-guard-m128-d2-s3-old",
+      "engine": "recomp",
+      "arm": "old",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.68040055625,
+        "p75": 3.869519,
+        "p90": 4.1110874,
+        "p95": 4.25335,
+        "p99": 4.512204249999999
+      },
+      "Mcycles": {
+        "mean": 18.525247322916666,
+        "p75": 19.476905,
+        "p90": 20.706686100000002,
+        "p95": 21.427176749999997,
+        "p99": 22.72103696
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.039214880714203,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "e9b75cde36ab6cd62885830f7947e69a0b56abc28fb7de8fb2091d1efa5914c5",
+      "checksums": "PASS",
+      "samples_sha256": "ce581b259b2e12ba8f50b459d2fec6ebb5eb0cefd0537340318ea4f688de1317"
+    },
+    {
+      "name": "gecko-guard-m128-d2-s4-new",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 4.033254170833333,
+        "p75": 4.20889,
+        "p90": 4.435866,
+        "p95": 4.559551849999999,
+        "p99": 4.84019485
+      },
+      "Mcycles": {
+        "mean": 20.27994588125,
+        "p75": 21.18172025,
+        "p90": 22.285124200000002,
+        "p95": 22.9406086,
+        "p99": 24.287924229999994
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.0373762083395714,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+      "checksums": "PASS",
+      "samples_sha256": "3fa7f117a57bb1719f6b88a7b02608a6aa18eb7fd0dc30f559693719f1960be3"
+    },
+    {
+      "name": "gecko-guard-m128-d2-s5-old",
+      "engine": "recomp",
+      "arm": "old",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 4.000061954166667,
+        "p75": 4.1865015,
+        "p90": 4.4072589,
+        "p95": 4.529712999999999,
+        "p99": 4.853217109999998
+      },
+      "Mcycles": {
+        "mean": 20.033483714583333,
+        "p75": 20.95924925,
+        "p90": 22.0927149,
+        "p95": 22.70999285,
+        "p99": 24.376242819999995
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.0321220494184535,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "e9b75cde36ab6cd62885830f7947e69a0b56abc28fb7de8fb2091d1efa5914c5",
+      "checksums": "PASS",
+      "samples_sha256": "d779c7a56f5a58fd750af71132f1f7a91ad8041699b381d3e46cabfc397fbf3f"
+    },
+    {
+      "name": "gecko-guard-m128-d2-s6-old",
+      "engine": "recomp",
+      "arm": "old",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.918157446875,
+        "p75": 4.10379875,
+        "p90": 4.318459,
+        "p95": 4.4528552999999995,
+        "p99": 4.72486028
+      },
+      "Mcycles": {
+        "mean": 19.7292151,
+        "p75": 20.6503055,
+        "p90": 21.7345169,
+        "p95": 22.435404449999997,
+        "p99": 23.79988074
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.0485718168425695,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "e9b75cde36ab6cd62885830f7947e69a0b56abc28fb7de8fb2091d1efa5914c5",
+      "checksums": "PASS",
+      "samples_sha256": "7a18cc2cbce7868f7c1e015dc8e3c7529864f5ee7e2782cbb5eb8ed7c6851898"
+    },
+    {
+      "name": "gecko-guard-m128-d2-s7-new",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.9928435552083332,
+        "p75": 4.17223975,
+        "p90": 4.3986673,
+        "p95": 4.518106649999999,
+        "p99": 4.7799819999999995
+      },
+      "Mcycles": {
+        "mean": 20.068666107291666,
+        "p75": 20.96819525,
+        "p90": 22.086517,
+        "p95": 22.6992464,
+        "p99": 24.016800569999997
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.03108302800706,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+      "checksums": "PASS",
+      "samples_sha256": "73b9f292533b42491e7cdb0057a44e572c34d2716bfcc0e5a58e33838cbc22f3"
+    }
+  ],
+  "limits": [
+    "One recording, not a new Dolphin comparison.",
+    "Small observed mean differences relative to between-run variation do not prove zero overhead.",
+    "Host throughput, not Switch/Horizon or native ARM performance."
+  ]
+}
