@@ -127,8 +127,8 @@ const char* const kFnNames[kNumFn] = {"skinning",  "calcview",  "fvs32",     "fv
                                       "cameramtx", "lightcopy", "lightslot", "memcpy", "fillmem", "envtexmtx"};
 // Verify's register check: the ABI state (void functions), or the ABI state plus r3, r4, f1 and f2 (the keyframe
 // readers: f1 is their result; the vanilla EABI translation writes back r3, r4 and f2 as well, and its callers reload
-// them, so the natives reproduce those too). The other volatile registers are not reproduced: the P+ translation, with
-// no EABI contract, writes back r0, r5, r6, f0-f11, CR0 and XER as well, which compiled callers never read.
+// them, so the natives reproduce those too). Full-context translations additionally compare every guest register
+// below; arbitrary mod callers may observe volatile registers as well as ABI results.
 // kAbiStateR3R4F1: the ABI state plus r3, r4 and f1 (the LightSetting copy: its callee writes back f1, not f2).
 enum Check : uint8_t { kAbiState, kAbiStateAndResults, kAbiStateR3R4F1 };
 constexpr Check kFnCheck[kNumFn] = {kAbiState,           kAbiState,           kAbiStateAndResults,
@@ -704,17 +704,17 @@ void Verify(Fn fn, CpuContext* ctx, void (*body)(CpuContext*), Writes writes, Na
     RestoreMarks(spans, savedMarks, origMarks, nativeMarks);
 }
 
-// Exercise MTX44Copy against the actual generated guest body, including aliased matrices and arbitrary float
+// Exercise retained leaf helpers against their actual generated guest bodies, including aliases and arbitrary float
 // bits. The scratch bytes and dirty marks are restored before the live call. This is diagnostic-only, like the
 // PSMTX fuzzer: G3D_CALC=2 BRAWL_HLE_FUZZ=N. A fixed seed makes failures reproducible across architectures.
 template <typename Writes, typename Native>
-void FuzzMtx44(const CpuContext& live, void (*body)(CpuContext*), Writes writes, Native native) {
-    static bool done = false;
-    if (done) return;
-    done = true;
+void FuzzLeaf(Fn fn, const CpuContext& live, void (*body)(CpuContext*), Writes writes, Native native) {
+    static bool done[kNumFn] = {};
+    if (done[fn]) return;
+    done[fn] = true;
     const char* value = std::getenv("BRAWL_HLE_FUZZ");
     const uint32_t trials = value ? static_cast<uint32_t>(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 10000)) : 0;
-    constexpr uint32_t scratch = 0x93FFD000u, bytes = 0x2000u;
+    constexpr uint32_t scratch = 0x93FE0000u, bytes = 0x10000u;
     if (trials == 0 || !LeanReady() || !PlainRange(scratch, bytes)) return;
     aurora_wait_for_frame_worker();
     AxDspHle::JoinMixWorker();
@@ -725,7 +725,7 @@ void FuzzMtx44(const CpuContext& live, void (*body)(CpuContext*), Writes writes,
     std::vector<uint8_t> saved, marks;
     Capture(range, saved);
     SaveMarks(spans, marks);
-    uint32_t seed = 0x62C04179u;
+    uint32_t seed = 0x62C04179u ^ static_cast<uint32_t>(fn);
     const auto next = [&]() {
         seed ^= seed << 13;
         seed ^= seed >> 17;
@@ -737,7 +737,8 @@ void FuzzMtx44(const CpuContext& live, void (*body)(CpuContext*), Writes writes,
         for (uint32_t i = 0; i < bytes; i += 4) Store32(Window() + Canonical(scratch + i), next());
         for (auto& r : c.gpr) r = next();
         for (auto& f : c.fpr) f.raw = (uint64_t{next()} << 32) | next();
-        c.gpr[1] = scratch + 0x1800u;
+        c.gpr[1] = scratch + 0xF000u;
+        c.gpr[2] = scratch + 0x9000u;
         c.gpr[4] = scratch + 0x100u;
         c.gpr[3] = scratch + 0xC0u + 4u * (next() % 33u);
         c.cr = next();
@@ -745,7 +746,33 @@ void FuzzMtx44(const CpuContext& live, void (*body)(CpuContext*), Writes writes,
         c.xer = next();
         c.lr = next();
         c.gqr[0] = trial % 8u == 0 ? 0x04000400u : 0u;
-        Verify(kMtx44Copy, &c, body, writes, native);
+        if (fn == kMemcpy) {
+            c.gpr[5] = trial % 129u;
+            if (trial % 4u == 0) c.gpr[4] += 0x40000000u; // cached/uncached alias ordering
+        } else if (fn == kLightSettingCopy) {
+            const uint32_t dst = scratch + 0x400u, src = scratch + 0x500u;
+            c.gpr[3] = dst;
+            c.gpr[4] = trial % 7u == 0 ? dst : src;
+            const uint32_t objects = next() % 5u, sets = next() % 5u;
+            Store32(Window() + Canonical(src), (objects << 16) | sets);
+            Store32(Window() + Canonical(dst), ((trial % 5u == 0 ? 0u : objects) << 16) |
+                                                   (trial % 6u == 0 ? 0u : sets));
+            for (uint32_t a = 0; a < 3; ++a) {
+                const uint32_t source = scratch + 0x2000u + 0x1000u * a;
+                uint32_t destination = scratch + 0x6000u + 0x1000u * a;
+                if (trial % 4u == 0) destination = source;
+                if (trial % 9u == 0) destination = source + 4u; // must decline partial overlaps
+                Store32(Window() + Canonical(src + 4u + 4u * a), source);
+                Store32(Window() + Canonical(dst + 4u + 4u * a), destination);
+            }
+        } else if (fn == kCameraMtx || fn == kEnvTexMtx) {
+            const uint32_t cam = scratch + 0x2000u;
+            c.gpr[3] = scratch + 0x400u;
+            Store32(Window() + Canonical(c.gpr[3]), trial % 7u == 0 ? 0u : cam);
+            Store32(Window() + Canonical(cam + 0x70u), next() | 8u); // current: no camera-update calls
+            c.gpr[4] = trial % 11u == 0 ? 0u : cam - 32u + 4u * (next() % 80u);
+        }
+        Verify(fn, &c, body, writes, native);
     }
     Restore(range, saved);
     size_t offset = 0;
@@ -754,7 +781,8 @@ void FuzzMtx44(const CpuContext& live, void (*body)(CpuContext*), Writes writes,
                     spans.items[i].blocks);
         offset += spans.items[i].blocks;
     }
-    RT_LOGF(RT_TAG_GX, "[g3dcalc-fuzz] mtx44copy: completed %u trials, seed 62C04179\n", trials);
+    RT_LOGF(RT_TAG_GX, "[g3dcalc-fuzz] %s: completed %u trials, seed %08X\n", kFnNames[fn], trials,
+            0x62C04179u ^ static_cast<uint32_t>(fn));
 }
 #endif  // MKW_LEAN_MEMORY
 
@@ -780,7 +808,8 @@ template <typename Writes, typename Native>
         }
         Bump(g_counters[fn].declined);
     } else if (s.mode == kVerify && !s.off[fn]) {
-        if (fn == kMtx44Copy) FuzzMtx44(*ctx, body, writes, native);
+        if (fn == kMtx44Copy || fn == kMemcpy || fn == kCameraMtx || fn == kEnvTexMtx || fn == kLightSettingCopy)
+            FuzzLeaf(fn, *ctx, body, writes, native);
         Verify(fn, ctx, body, writes, native);
         return;
     }

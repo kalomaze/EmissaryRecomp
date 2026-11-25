@@ -26,6 +26,8 @@ floating-point operations by default. `AXFX_FAST=1` and `AXFX_ASYNC=1` explicitl
 `AXFX_EXACT=1` and `BRAWL_HLE_VERIFY=1` override approximate audio processing.
 
 For differential validation, use `G3D_CALC=2 BRAWL_HLE_VERIFY=1 BRAWL_HLE_FUZZ=1000` with recorded replays and
-full-snapshot rollback checks. The fuzzers exercise the actual generated matrix bodies, including overlaps and
-unusual floating-point values. These are regression checks, not exhaustive proof for every mod. EABI-specialized
+full-snapshot rollback checks. The fuzzers exercise the actual generated matrix, memcpy, camera, environment-matrix and light-setting-copy
+bodies, including overlaps, cached/uncached aliases, empty counts and unusual floating-point values. Unsupported
+cases may fall back instead of running natively; trial counts are not native-comparison counts. These are
+regression checks, not exhaustive proof for every mod. EABI-specialized
 translations (`MKW_EABI_REGS=1`) and explicit approximate modes are outside the default full-context contract.
