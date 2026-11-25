@@ -93,7 +93,8 @@
         "Translator.Tests.InstructionSyncCodeGenTests.FullContextInstructionSyncInterpretsFromEntry(mod: False)",
         "Translator.Tests.InstructionSyncCodeGenTests.FullContextInstructionSyncInterpretsFromEntry(mod: True)"
       ]
-    }
+    },
+    "instruction_input": "PowerPC isync encoding 0x4c00012c decoded with PpcDecoder and lifted with PpcLifter before SSA/code generation; both base/mod cases pass."
   },
   "limits": [
     "Bounded P+ replay windows, not exhaustive foreign-mod compatibility.",

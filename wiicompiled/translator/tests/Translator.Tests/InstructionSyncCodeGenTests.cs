@@ -2,6 +2,8 @@ using Translator.Core.Analysis.Ssa;
 using Translator.Core.Analysis.Representation;
 using Translator.Core.CodeGen;
 using Translator.Core.Ir;
+using Translator.Core.Disassembly;
+using Translator.Core.Lifting;
 using Translator.Core.Representation;
 using Xunit;
 
@@ -19,7 +21,10 @@ public class InstructionSyncCodeGenTests
             new IrBasicBlock("0x80001000", new IrInstruction[]
             {
                 new IrAssign("r3", IrValue.Imm(77)),
-                new IrComment("isync @ 0x80001004 (no-op)"),
+                Assert.Single(new PpcLifter().Lift(new[]
+                {
+                    PpcDecoder.Decode(0x80001004, 0x4c00012cu) // isync
+                })).Ir.Single(),
                 new IrCall(string.Empty, "0x80002000", Array.Empty<IrValue>()),
                 new IrReturn(null)
             })
