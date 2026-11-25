@@ -1,0 +1,189 @@
+{
+  "binary_sha256": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+  "frames_per_run": 1200,
+  "rollback_trace_rows": 2397,
+  "fields_compared": [
+    "game_frame",
+    "rng",
+    "rng_other",
+    "libc_rng",
+    "gameplay_hash",
+    "fighters",
+    "input_hash",
+    "expected_input_hash"
+  ],
+  "mismatches": [],
+  "runs": {
+    "roster-b2-d0": {
+      "completion": {
+        "distance": 0,
+        "status": [
+          "run",
+          "scMelee",
+          "1447",
+          "2982"
+        ],
+        "complete_line": [
+          "[rollback] COMPLETE frames=1200 saves=1200 loads=0 advances=1200 desyncs=0 region_differences=0"
+        ]
+      },
+      "snapshot_operations": 1200,
+      "all_snapshot_operations_verified": true,
+      "nonzero_mismatch_counter_lines": []
+    },
+    "roster-b2-verify-d2": {
+      "completion": {
+        "distance": 2,
+        "status": [
+          "run",
+          "scMelee",
+          "1440",
+          "2567"
+        ],
+        "complete_line": [
+          "[rollback] COMPLETE frames=1200 saves=2397 loads=1197 advances=2397 desyncs=0 region_differences=1197"
+        ]
+      },
+      "snapshot_operations": 3594,
+      "all_snapshot_operations_verified": true,
+      "nonzero_mismatch_counter_lines": []
+    }
+  },
+  "coverage": [
+    {
+      "port": 0,
+      "x_range": [
+        -101.5114974975586,
+        0.0
+      ],
+      "y_range": [
+        -110.01000213623047,
+        206.6340789794922
+      ],
+      "damage_range": [
+        0.0,
+        2.0
+      ],
+      "stocks_observed": [
+        3,
+        4
+      ],
+      "status_ids_observed": [
+        0,
+        6,
+        14,
+        22,
+        24,
+        39,
+        42,
+        44,
+        51,
+        189,
+        190,
+        267,
+        274,
+        279,
+        281
+      ]
+    },
+    {
+      "port": 1,
+      "x_range": [
+        -14.242838859558105,
+        60.21271896362305
+      ],
+      "y_range": [
+        43.986602783203125,
+        80.41499328613281
+      ],
+      "damage_range": [
+        0.0,
+        47.217498779296875
+      ],
+      "stocks_observed": [
+        4
+      ],
+      "status_ids_observed": [
+        0,
+        1,
+        6,
+        17,
+        18,
+        22,
+        24,
+        26,
+        36,
+        39,
+        41,
+        42,
+        44,
+        51,
+        52,
+        68,
+        69,
+        73,
+        274
+      ]
+    }
+  ],
+  "artifacts": {
+    "roster-b2-d0/trace.csv": "d2d7a8fafeb07960d8b3c19b57c182a6fd429690f6df604644ab670e41ed6705",
+    "roster-b2-d0/trace.csv.snapshots.csv": "ca24fe4de98c6c4f71ae10d4e89e8672aef2ea70be19fa6dfa041c865fa34ad5",
+    "roster-b2-d0/inputs.brpad": "3f83a06a1904b8ce2888fd06aca66905f8424434fe5016889c4088b6b871b6c5",
+    "roster-b2-d0/runtime.log": "f0146384d79d07a3fc6d027a70478fb8ab39e00b04e90471b8cfa54710db2db9",
+    "roster-b2-verify-d2/trace.csv": "5ff7243a6c5024a3f6d11aa8e1e376d33493e8152304e3c39b562b96ebc6d869",
+    "roster-b2-verify-d2/trace.csv.snapshots.csv": "6cc7baae4999fc9281ccac1bf15e40366923dd821f78c22182c18b2b3281e64f",
+    "roster-b2-verify-d2/inputs.brpad": "3f83a06a1904b8ce2888fd06aca66905f8424434fe5016889c4088b6b871b6c5",
+    "roster-b2-verify-d2/runtime.log": "abc3f94342f22b716dd6f5211ebd94f4c50b1eaa501ea6af1c29f4716d16c94b",
+    "roster-b2-d0/css.png": "5c8a5473d3e6f98dc7ce8c848b1d40445a966f5e900452fd989f1ab5f1533d99",
+    "roster-b2-d0/stage.png": "fa7d01b6e31441910eab7695211ce55e684b1a5c83d7a4ad06ca97976e5e3247",
+    "roster-b2-d0/gameplay.png": "0e0141a6c0ae0fcb5327c783609691415d3aeb171c66dcd4c79dd91d3e64a5bd",
+    "roster-b2-d0/configuration.json": "1cbb9b49a6ffc40808a8f4b24cb1c484ed70256b999eeaa07831025c4f4b335c",
+    "roster-b2-d0/runtime-settings.json": "79552f0327861476b8dc4c6e5542b664955e472742c93146d1fff28c8dfb955a",
+    "roster-b2-verify-d2/css.png": "70ff32360f2d6c1e6db527757eff48ead1ac773d9b9267690cf6c821553dea52",
+    "roster-b2-verify-d2/stage.png": "fdb9f2facc61a94c174e1a7cfcc7c02c3808ce4f18342f519745ae0de31fdb3b",
+    "roster-b2-verify-d2/gameplay.png": "23087390ddc82f2fbec8b4601f793f8f4b4b9a7f05a4dd159e49229cf141fa62",
+    "roster-b2-verify-d2/configuration.json": "a4c231489e8d160bfb0d7f213e9aa4708b385d28702358e97228da5567ccf089",
+    "roster-b2-verify-d2/runtime-settings.json": "13caaf0670431d7d963df36fd1e9c1057d277e3fa90ec476306f02a81dee01d1"
+  },
+  "limitations": [
+    "One additional REX matchup/stage; not exhaustive roster or mod coverage.",
+    "Snapshot checks cover selected rollback regions, not all guest RAM or host-side state.",
+    "Repeated-save region differences remain unresolved.",
+    "No current native ARM validation or new timing evidence.",
+    "Runtime resource-open warnings are not an audiovisual correctness pass."
+  ],
+  "runtime_source_commit": "f6a159d",
+  "mod": "REX Release 0\u00bd Hotfix 1",
+  "matchup": [
+    "Mewtwo",
+    "Master Chief"
+  ],
+  "stage": "Dracula's Castle",
+  "driver_sha256": "753bbcb624efc04674e769201577a3f95b0395689d062f79aa3a803275788e7b",
+  "identification": "Pilot and full-run selection/gameplay screenshots, plus loaded fighter/module asset paths; stage UI names Dracula's Castle.",
+  "loaded_assets": {
+    "roster-b2-d0": [
+      "[OSReport] File Read  (SD): /rex_/././pf/module/Ft_Mewtwo.rel (size:152392 byte, adr:0x918fe260) at 1317",
+      "[OSReport] File Read  (SD): /rex_/././pf/module/ft_chief.rel (size:207492 byte, adr:0x91f3af60) at 1317",
+      "[OSReport] File Read  (SD): /rex_/././pf/module/st_mansion.rel (size:95736 byte, adr:0x9356fc60) at 0"
+    ],
+    "roster-b2-verify-d2": [
+      "[OSReport] File Read  (SD): /rex_/././pf/module/Ft_Mewtwo.rel (size:152392 byte, adr:0x918fe260) at 919",
+      "[OSReport] File Read  (SD): /rex_/././pf/module/ft_chief.rel (size:207492 byte, adr:0x91f3af60) at 919",
+      "[OSReport] File Read  (SD): /rex_/././pf/module/st_mansion.rel (size:95736 byte, adr:0x9356fc60) at 0"
+    ]
+  },
+  "last_verification_reports": {
+    "roster-b2-d0": [],
+    "roster-b2-verify-d2": [
+      "[mod] [gecko-verify] 4200 passes compared, 0 mismatched",
+      "[hle-verify] PSMTXCopy: calls 229376 compared 229376 fallbacks 0 skipped 0 mismatches 0",
+      "[audio] axfx verify AXFXReverbHiExpCallback: calls=20000 compared=19999 mismatches=0 native=19999 (processed=19999 skipped=0) fallbacks=0 unverifiable=0",
+      "[audio] axfx verify AXFXDelayCallback: calls=35000 compared=34999 mismatches=0 native=34999 (processed=34997 skipped=2) fallbacks=0 unverifiable=0",
+      "[hle-verify] PSMTXConcat: calls 2785280 compared 2785280 fallbacks 0 skipped 0 mismatches 0",
+      "[hle-verify] PSMTXInverse: calls 212992 compared 212992 fallbacks 0 skipped 0 mismatches 0",
+      "[hle-verify] PSMTXConcatArray: calls 212992 compared 212992 fallbacks 0 skipped 0 mismatches 0"
+    ]
+  }
+}

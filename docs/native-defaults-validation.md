@@ -8,6 +8,8 @@ The full-context mod build keeps code guards and falls back to translated bodies
 
 ## Correctness evidence
 
+Snapshot verification compares the incremental store against a full-copy reference of the **selected rollback regions**. It does not cover all guest RAM or all host-side runtime state. The repeated-save differences discussed below likewise refer to those selected regions. Gameplay checksums cover the recorded fighter/RNG/input fields; agreement does not establish equality of every guest-visible value.
+
 - Seven native tests pass in each of lean and flat builds, including cached/classic/verification interpreter and native-trampoline tests.
 - Safety checkpoint: recordings 001/064/128, 300 output frames each, one redo, on both x86 and ARM; original checksums pass, no reported native differential failures, and all 5,364 snapshot operations verify.
 - Expanded fuzzing: five calculation/copy helpers with 1,000 trials each, alongside the four existing PSMTX fuzzers. x86 recording 001 and ARM recordings 001/064/128 pass 120-frame one-redo windows and all 1,416 snapshot operations.
@@ -181,3 +183,12 @@ A 1,200-output-frame run adds signed-stick movement, A/B attacks, jumps, shieldi
 The corresponding one-redo run enables native/reference helper verification. All 2,397 trace rows (including resimulations) match their corresponding 0f frames on gameplay, fighter, RNG and input fields. All 4,794 snapshot save/load operations across both runs verify, and enabled helper checks report no nonzero mismatch counters. The runtime binary is unchanged from `f6a159d`. Resource-open warnings also remain in the log; this is not a claim of complete audiovisual correctness.
 
 Full-memory differences remain in all 1,197 repeated saves. Successful snapshot restoration and matching gameplay fields do not resolve those differences. This is stronger real-combat compatibility evidence, not complete rollback determinism, broad roster coverage, a timing comparison or native ARM validation. [Combat receipt](rex-combat-validation.json).
+
+
+### Additional REX fighters and stage
+
+Mewtwo versus Master Chief on Dracula's Castle completes a second 1,200-frame combat window at 0f and with one redo. Selection/gameplay screenshots and loaded `Ft_Mewtwo.rel`, `ft_chief.rel` and `st_mansion.rel` assets confirm the changed matchup and stage. The trace records damage on both fighters and a stock loss. An earlier alternate menu sequence failed to reach stage selection and is excluded from gameplay evidence.
+
+All 2,397 rollback trace rows match the corresponding 0f frames on recorded gameplay, fighter, RNG and input fields. All 4,794 snapshot operations verify against the full-copy reference of the selected regions. Enabled native/reference checks report no mismatch; the receipt includes their last reported counters. The runtime remains `f6a159d`.
+
+All 1,197 repeated saves still differ somewhere within the selected regions. These checks establish additional real-mod compatibility, not complete state determinism, audiovisual correctness or arbitrary-mod coverage. Current native ARM validation remains outstanding. [Roster/stage receipt](rex-roster-validation.json).
