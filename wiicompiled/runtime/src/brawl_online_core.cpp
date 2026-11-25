@@ -196,6 +196,9 @@ void SetResimulating(bool active) {
     if (s_active && !active) VI_HLE_NoteRollback();
     s_active = active;
     DetClock::SetRollbackResimulating(active);
+    // Keep rerun frame boundaries/readbacks, but do not display their stale images.
+    // The harness rollback path uses the same VI suppression.
+    VI_HLE_SetPresentSuppressed(active);
 }
 void ResetPacing() { DetClock::ResetPacing(); }
 void SetSpeed(double factor) { DetClock::SetSpeed(factor); }

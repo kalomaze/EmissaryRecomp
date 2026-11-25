@@ -256,3 +256,10 @@ A follow-up read watch, with snapshot-copy/comparison stacks filtered, observes 
 
 
 Inspection of the hash-verified private production translation further places this consumer in matrix processing: `801A4204` calls PSMTXConcat, PSMTXConcatArray and PSMTXInverse; its caller `801AE31C` also calls CalcView_LC (`801A3D68`). This supports a graphics-matrix explanation for the observed chain, but is not proof that all downstream consumers are graphics-only. The selected function hashes and direct-call inventory are recorded in the observation receipt; generated guest source remains private. No snapshot exclusions or runtime changes follow from this attribution.
+
+
+### Online-core presentation integration gap
+
+The in-process online core's `BrawlOnlineBridge::SetResimulating` callback previously updated deterministic-clock pacing but did not call `VI_HLE_SetPresentSuppressed`. The harness path in `brawl_rollback.cpp` already used that suppression. The callback now forwards its flag to VI, retaining unpresented frame finalization/readbacks while withholding rerun images from display. The core clears the flag on non-resimulated passes, exhausted/no-advance iterations, and session cleanup; no separate lifecycle flag was added.
+
+The earlier connected REX runs exercised real gameplay packets and rollback through the harness driver. They validate the recorded gameplay fields, not the in-process online core's presentation path. They therefore did not cover this missing integration. Phone flicker was reported by the separate Android investigation; this branch's correction must not be described as visually validated by those earlier desktop runs. Fresh online-core presentation capture and native ARM validation remain required.
