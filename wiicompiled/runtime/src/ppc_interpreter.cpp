@@ -637,7 +637,9 @@ Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddr
                                          RD(w), RA(w), RB(w));
             break;
         case 50: next = c->srr0; c->msr = c->srr1; break;  // rfi
-        case 150: break;  // isync
+        case 150:  // isync: publish pending code edits before translated/native calls.
+            GuestCodePatch::Sync();
+            break;
         case 528: {  // bcctr
             const uint32_t target = c->ctr & ~3u;
             if (BranchTaken(c, RD(w) | 0x04u, RA(w))) {
@@ -1080,7 +1082,8 @@ bool EndsBlock(uint32_t w) {
     if (op == 19) {
         const uint32_t xo = Bits(w, 1, 10);
         if (xo == 16 && (w & 1u) == 0 && (RD(w) & 0x14u) != 0x14u) return false;  // a Bclr op: leaves when taken
-        return xo == 16 || xo == 50 || xo == 528;
+        // isync must also leave the decoded block: subsequent instructions may have changed.
+        return xo == 16 || xo == 50 || xo == 150 || xo == 528;
     }
     return false;
 }

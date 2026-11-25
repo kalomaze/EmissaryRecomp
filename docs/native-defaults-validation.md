@@ -99,3 +99,11 @@ Post-fix x86 validation of `808aeb2`: recordings 001/064/128 pass 120-frame one-
 An exact-register candidate for `__fill_mem` passed three x86 120-frame one-redo recordings, 1,062 snapshot checks, and 2,000 randomized fill-memory trials per recording. A standalone test using the generated reference body also passed 32,896 full-context and destination/guard-byte cases on x86 and AArch64 under QEMU. Native ARM replay testing remains unavailable.
 
 The 16-run paired recording-128 experiment did not establish a consistent end-to-end benefit: 0f mean changed from 1.965455 to 1.981333 ms, and 1f from 3.986572 to 3.947026 ms, with substantial repeat variability. Most live fill calls still required checked-store fallback. The candidate was removed; the default remains translated fill-memory execution. [Experiment receipt](fillmem-experiment.json).
+
+## Interpreter instruction synchronization
+
+The interpreter previously treated `isync` as a no-op. An interpreted mod could perform a code-store/cache-synchronization sequence and then call a registered translated function while its guard flags still described the old code. A cached interpreter block could also retain decoded instructions after `isync` when the mod had just replaced those instructions.
+
+`isync` now synchronizes pending guest-code writes and ends the decoded block. The next block is resolved and validated after that boundary. Two regressions cover a patched guarded callee and a replacement instruction later in the same straight-line sequence. The CPU harness supplies the executable-write notification explicitly because its platform write hook is stubbed; this test does not validate that hook itself.
+
+Negative controls establish both requirements: removing synchronization fails the guarded-callee test in cached, classic and verifying modes; retaining synchronization but removing the block boundary fails self-modification in cached and verifying modes. With both changes, all seven tests pass in lean and flat x86 builds (14 tests), and all eight tests pass in each AArch64/QEMU configuration (16 tests, including snapshot-store tests). Full-game x86 rollback and performance validation are running; native ARM validation remains pending.

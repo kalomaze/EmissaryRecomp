@@ -86,6 +86,7 @@ uint32_t SoundHook(CpuContext*, uint32_t pc) { ++InterpreterTest::soundHooks; re
 }
 #if !defined(MKW_TEST_REAL_CODE_PATCH)
 namespace GuestCodePatch {
+void Sync() {}
 OriginalNativeTarget ResolveOriginalNativeTrampoline(uint32_t) { return {}; }
 static void TestContinuation(CpuContext* ctx) { ctx->gpr[3] = 0x55; }
 void (*ContinuationAt(uint32_t address))(CpuContext*) {
