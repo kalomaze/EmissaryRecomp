@@ -1,0 +1,80 @@
+{
+  "commit": "808aeb2cd3bad8e3f2319323cd77327fed8c78e0",
+  "platform": "x86_64 EPYC 9575F",
+  "binary_sha256": "e84c2a17420c0a8c3fdeeb117f15d3b7cabad6d442d68405883ba47e6de34081",
+  "rollback_distance": 2,
+  "output_frames_per_recording": 120,
+  "environment": {
+    "G3D_CALC": "2",
+    "BRAWL_HLE_VERIFY": "1",
+    "BRAWL_HLE_FUZZ": "1000",
+    "BRAWL_INTERP_CHECK": "1"
+  },
+  "recordings": [
+    {
+      "recording": "match-001-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-001/game.brep",
+        "source_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "snapshot_operations": 354,
+      "all_snapshot_operations_verified": true,
+      "reported_native_failures": 0,
+      "fuzz_completed": true,
+      "runtime_log_sha256": "708431c01e49dd7566e70f41cb180c5470dc1db3a6e59294f0bf4dcb71c60d5b",
+      "snapshot_csv_sha256": "f98a0421a6954a4ef8b366642df88045f4ba8e345a81d43fa00f9531e88b6bcd"
+    },
+    {
+      "recording": "match-064-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-064/game.brep",
+        "source_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "snapshot_operations": 354,
+      "all_snapshot_operations_verified": true,
+      "reported_native_failures": 0,
+      "fuzz_completed": true,
+      "runtime_log_sha256": "a5f29454e59d0460af52cd69b040b0ae4e65a63d30ee1836d2857e4a8b7fb7f3",
+      "snapshot_csv_sha256": "e143e5bc39bc6b29bf28e1a9612dfa0196a98c86cb0f990a3708e471f8ea49f8"
+    },
+    {
+      "recording": "match-128-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-128/game.brep",
+        "source_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "snapshot_operations": 354,
+      "all_snapshot_operations_verified": true,
+      "reported_native_failures": 0,
+      "fuzz_completed": true,
+      "runtime_log_sha256": "ea5c70f7c7ad7b093aa8fb3fb968cd356482cef71ff61c3ef8b019cbd8a28296",
+      "snapshot_csv_sha256": "bb316ec9787ee11dc2d0271f66f2fa9f55abad109a79d697957af6053879b783"
+    }
+  ],
+  "limitations": [
+    "Bounded replay windows and randomized checks are not exhaustive proof for arbitrary mods.",
+    "Native ARM validation of this commit remains pending.",
+    "These verification runs are not performance measurements."
+  ]
+}
