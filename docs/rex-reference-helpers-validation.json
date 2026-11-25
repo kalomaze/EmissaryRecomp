@@ -1,0 +1,59 @@
+{
+  "reference_rows": 597,
+  "native_rows": 597,
+  "compared_fields": [
+    "session_frame",
+    "game_frame",
+    "rng",
+    "rng_other",
+    "libc_rng",
+    "resimulation",
+    "gameplay_hash",
+    "fighters",
+    "input_hash",
+    "expected_input_hash"
+  ],
+  "different_rows": 0,
+  "snapshot_operations": 894,
+  "all_snapshot_operations_verified": true,
+  "scope": "Handwritten helper families disabled; compiled variants, cached interpreter and lean memory remain enabled.",
+  "runtime": {
+    "pid": 2935075,
+    "settings": {
+      "G3D_CALC": "0",
+      "G3D_NATIVE": "0",
+      "BRAWL_HLE_GECKO": "0",
+      "BRAWL_HLE_MTX": "0",
+      "BRAWL_HLE_TAN": "0",
+      "BRAWL_AXFX_NATIVE": "0",
+      "AXFX_ASYNC": "0",
+      "AXFX_EXACT": "1",
+      "BRAWL_SNAPSHOT_VERIFY": "1",
+      "BRAWL_ROLLBACK_DISTANCE": "2"
+    },
+    "binary_sha256": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa"
+  },
+  "complete": {
+    "distance": 2,
+    "status": [
+      "run",
+      "scMelee",
+      "540",
+      "1986"
+    ],
+    "complete_line": [
+      "[rollback] COMPLETE frames=300 saves=597 loads=297 advances=597 desyncs=0 region_differences=297"
+    ]
+  },
+  "artifacts": {
+    "reference-helpers-d2/trace.csv": "8384a5f278fdcb6fc1f00e9fb37ecb09fe16d4d756569b88c6ae70da84c343f5",
+    "reference-helpers-d2/trace.csv.snapshots.csv": "083c22f41a9e5d31b253627c0cb6b18aadf70a75f5599dbaedfbef3abfd3cd67",
+    "default-draw-d2/trace.csv": "7b8aff0cc5200e845037c0c415dd7d63b9fd7075891f29b81fcb18fc9de9470a"
+  },
+  "limitations": [
+    "One 300-output-frame REX matchup with limited inputs.",
+    "Full-memory differences persist; complete rollback determinism is not established.",
+    "Native comparator also used render attribution instrumentation; this is not a timing comparison.",
+    "No current-head native ARM validation."
+  ]
+}

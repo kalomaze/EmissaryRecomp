@@ -1,0 +1,182 @@
+{
+  "binary_sha256": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+  "frames_per_run": 1200,
+  "rollback_trace_rows": 2397,
+  "fields_compared": [
+    "game_frame",
+    "rng",
+    "rng_other",
+    "libc_rng",
+    "gameplay_hash",
+    "fighters",
+    "input_hash",
+    "expected_input_hash"
+  ],
+  "mismatches": [],
+  "runs": {
+    "combat-v1-d0": {
+      "completion": {
+        "distance": 0,
+        "status": [
+          "run",
+          "scMelee",
+          "1444",
+          "2883"
+        ],
+        "complete_line": [
+          "[rollback] COMPLETE frames=1200 saves=1200 loads=0 advances=1200 desyncs=0 region_differences=0"
+        ]
+      },
+      "snapshot_operations": 1200,
+      "all_snapshot_operations_verified": true,
+      "nonzero_mismatch_counter_lines": []
+    },
+    "combat-v1-verify-d2": {
+      "completion": {
+        "distance": 2,
+        "status": [
+          "run",
+          "scMelee",
+          "1440",
+          "2501"
+        ],
+        "complete_line": [
+          "[rollback] COMPLETE frames=1200 saves=2397 loads=1197 advances=2397 desyncs=0 region_differences=1197"
+        ]
+      },
+      "snapshot_operations": 3594,
+      "all_snapshot_operations_verified": true,
+      "nonzero_mismatch_counter_lines": []
+    }
+  },
+  "coverage": [
+    {
+      "port": 0,
+      "x_range": [
+        -119.45924377441406,
+        9.204400062561035
+      ],
+      "y_range": [
+        -140.00999450683594,
+        141.6340789794922
+      ],
+      "damage_range": [
+        0.0,
+        24.96000099182129
+      ],
+      "stocks_observed": [
+        3,
+        4
+      ],
+      "status_ids_observed": [
+        0,
+        6,
+        14,
+        17,
+        18,
+        21,
+        24,
+        34,
+        35,
+        36,
+        39,
+        41,
+        42,
+        44,
+        51,
+        69,
+        73,
+        189,
+        190,
+        267,
+        274,
+        279,
+        280
+      ]
+    },
+    {
+      "port": 1,
+      "x_range": [
+        -85.56028747558594,
+        68.0468978881836
+      ],
+      "y_range": [
+        0.009999999776482582,
+        0.009999999776482582
+      ],
+      "damage_range": [
+        0.0,
+        0.0
+      ],
+      "stocks_observed": [
+        4
+      ],
+      "status_ids_observed": [
+        0,
+        1,
+        26,
+        27,
+        34,
+        35,
+        36,
+        39,
+        42,
+        44,
+        52,
+        242,
+        274,
+        279
+      ]
+    }
+  ],
+  "artifacts": {
+    "combat-v1-d0/trace.csv": "984312bd8d7c9881fbe9c4219b1cdd1c4a81fe2f6c186a9ed4d0d2327aabf64b",
+    "combat-v1-d0/trace.csv.snapshots.csv": "35efd3c80b8e45a375f42772838d5af462c6ee8e6d43a6daaff009d0c63d5669",
+    "combat-v1-d0/inputs.brpad": "3f83a06a1904b8ce2888fd06aca66905f8424434fe5016889c4088b6b871b6c5",
+    "combat-v1-d0/runtime.log": "2638ac35a51884dac1c8cc822cf21e4f75bdc0168445913713ed32a728114593",
+    "combat-v1-verify-d2/trace.csv": "d68d31f0a2aefb088a1d26233388e642918c4a8f92193d5d724250349add4042",
+    "combat-v1-verify-d2/trace.csv.snapshots.csv": "e597a11646b6f8264b49037bfc9eb081bfe168d00f50c7d8eb7e8a1995d8a7e8",
+    "combat-v1-verify-d2/inputs.brpad": "3f83a06a1904b8ce2888fd06aca66905f8424434fe5016889c4088b6b871b6c5",
+    "combat-v1-verify-d2/runtime.log": "eafbfca06305ce63369ccb6efc205fb64d02e5d619823e37f2b87d924c0ea3ef"
+  },
+  "limitations": [
+    "One REX matchup/stage; scripted input is not broad roster coverage.",
+    "Full-memory repeated-save differences are separate from snapshot restoration and gameplay checksum agreement.",
+    "No claim of complete arbitrary-mod safety or native ARM validation.",
+    "Verification instrumentation is enabled; this is not a performance measurement.",
+    "Runtime also logs missing resource/open warnings; this does not establish complete audiovisual correctness."
+  ],
+  "driver_sha256": "edbdd46e64e07c8e6555ac085559e629c972b0de8b02687d81d737577974244c",
+  "runtime_settings": {
+    "G3D_CALC": "2",
+    "BRAWL_HLE_VERIFY": "1",
+    "BRAWL_INTERP_CHECK": "1",
+    "BRAWL_ROLLBACK_FRAMES": "1200",
+    "BRAWL_ROLLBACK_DISTANCE": "2",
+    "BRAWL_SNAPSHOT_VERIFY": "1"
+  },
+  "source_runtime_commit": "f6a159d",
+  "mod": "REX Release 0\u00bd Hotfix 1",
+  "input_description": "1200 frames: approach, A/B attacks, jump, shield, crouch and reversals; gfPadStatus signed sticks at offsets 0x30/0x31.",
+  "other_runtime_warnings": [
+    "[OSReport] \u001b[34m File Read  (DVD): Open failed (/item/NyarthShot/PkmNyarthShotBrres.pac) \u001b[00m ",
+    "[OSReport] SDStreamOpen Failed: /rex_/././pf/sfx/000_%s/item/ItmCommonBrres.sawnd",
+    "[OSReport] SDStreamOpen Failed: /rex_/././pf/sfx/027_%s/item/ItmCommonBrres.sawnd",
+    "[OSReport] SDStreamOpen Failed: /rex_/././pf/sfx/03B.sawnd",
+    "[OSReport] SDStreamOpen Failed: /rex_/././pf/sfx/03F.sawnd",
+    "[OSReport] SDStreamOpen Failed: /rex_/././pf/sfx/041.sawnd",
+    "[OSReport] SDStreamOpen Failed: /rex_/././pf/sfx/076.sawnd",
+    "[OSReport] SDStreamOpen Failed: /rex_/././pf/sfx/076_Assist.sawnd",
+    "[OSReport] SDStreamOpen Failed: /rex_/././pf/sfx/077.sawnd",
+    "[OSReport] SDStreamOpen Failed: /rex_/././pf/sfx/08F.sawnd",
+    "[OSReport] SDStreamOpen Failed: /rex_/././pf/sfx/0D5_%s/item/ItmCommonBrres.sawnd",
+    "[OSReport] SDStreamOpen Failed: /rex_/././pf/sfx/0D6_%s/item/ItmCommonBrres.sawnd",
+    "[OSReport] SDStreamOpen Failed: /rex_/././pf/sfx/0D7_%s/item/ItmCommonBrres.sawnd",
+    "[OSReport] SDStreamOpen Failed: /rex_/././pf/sfx/0D8_%s/item/ItmCommonBrres.sawnd",
+    "[OSReport] SDStreamOpen Failed: /rex_/././pf/sound/strm/X01.brstm",
+    "[OSReport] SDStreamOpen Failed: /rex_/././pf/sound/strm/Z57.brstm",
+    "[aurora] [2] [aurora] Could not raise the asynchronous presenter thread priority: setpriority() failed",
+    "[aurora] [3] [aurora::gfx::png] failed to open file: startup/smash_ball.png",
+    "[nand] NANDOpen: FAILED to open '/shared2/sys/SYSCONF' (host '/dev/shm/emissary-foreign-mods/rex-client/UserData/NAND/shared2/sys/SYSCONF', mode 1)"
+  ]
+}

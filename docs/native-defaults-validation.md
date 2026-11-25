@@ -165,3 +165,19 @@ A paired 16-capture batch compares `4bfba01` (before both Gecko changes) with `f
 | 1f | 3.900894 / 3.926366 | 4.731870 / 4.734326 | 0.152292 / 0.115571 |
 
 The measured mean differences are +0.004189 ms (+0.21%) and +0.025471 ms (+0.65%). They are small relative to between-run variation, but this batch does not establish zero overhead. Percentiles are averages of per-run percentiles. This covers one recording and is not a new Dolphin, Switch/Horizon or native ARM comparison. [Run statistics and identities](gecko-safety-timing.json).
+
+
+### REX control with handwritten helper families disabled
+
+A further 300-output-frame REX one-redo control disables the native Gecko, matrix, tangent, G3D and AXFX helper families. All 597 trace rows match the native comparator on the recorded gameplay, fighter, RNG and input fields; all 894 snapshot operations verify. Both runs still report 297 full-memory differences. This control does not disable compiled mod variants, cached interpretation, lean memory or the platform HLE, and does not establish full-memory determinism. The native comparator also enabled render attribution instrumentation; these are correctness observations, not timing results.
+
+This short, limited-input matchup is basic compatibility evidence. No REX-triggered native optimization fault has been established; the instruction-synchronization and continuation failures above were demonstrated by synthetic fixtures. Broader real combat and roster/stage coverage remain outstanding. [Control receipt](rex-reference-helpers-validation.json).
+
+
+### Longer REX combat window
+
+A 1,200-output-frame run adds signed-stick movement, A/B attacks, jumps, shielding, crouching and reversals using the actual `gfPadStatus` layout. The trace confirms movement, damage reaching about 24.96%, and a stock loss; this is more than a stationary compatibility check. It still covers only the existing matchup/stage.
+
+The corresponding one-redo run enables native/reference helper verification. All 2,397 trace rows (including resimulations) match their corresponding 0f frames on gameplay, fighter, RNG and input fields. All 4,794 snapshot save/load operations across both runs verify, and enabled helper checks report no nonzero mismatch counters. The runtime binary is unchanged from `f6a159d`. Resource-open warnings also remain in the log; this is not a claim of complete audiovisual correctness.
+
+Full-memory differences remain in all 1,197 repeated saves. Successful snapshot restoration and matching gameplay fields do not resolve those differences. This is stronger real-combat compatibility evidence, not complete rollback determinism, broad roster coverage, a timing comparison or native ARM validation. [Combat receipt](rex-combat-validation.json).
