@@ -1,0 +1,188 @@
+{
+  "runtime_source": "f6a159d",
+  "dolphin_version": "Brawl Online 0.2.8, preserved benchmark hooks",
+  "mod": "REX Release 0\u00bd Hotfix 1",
+  "matchup": "Ivysaur vs Sora, Final Destination",
+  "protocol": "Real Gekko gameplay session through delay bridge; harness performs setup rather than production matchmaking",
+  "scope": "Corrected RNG and fighter fields plus gameplay CRC, and client desync counters; not full RAM parity",
+  "runs": {
+    "connected-v8": {
+      "frames": 600,
+      "delay_ms_each_direction": 60,
+      "identities": {
+        "dolphin": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+        "recomp": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+        "launcher": "a57be7866702f16366d5d22874aa1c2c264c6b80ae8bae6893c58c0b7582635a"
+      },
+      "comparison": {
+        "reference_frames": 600,
+        "dolphin_trace_frames": 727,
+        "compared_frames": 600,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "native_counts": {
+        "frames": 600,
+        "saves": 889,
+        "loads": 74,
+        "advances": 888,
+        "desyncs": 0
+      },
+      "dolphin": {
+        "rollbacks": 78,
+        "frames_resimulated": 318,
+        "desyncs_detected": 0,
+        "input_delay": 0
+      },
+      "combat_coverage": false,
+      "activity": {
+        "0": {
+          "unique_positions": 47,
+          "unique_actions": 13,
+          "maximum_damage": 0.0,
+          "stocks": [
+            4
+          ]
+        },
+        "1": {
+          "unique_positions": 460,
+          "unique_actions": 9,
+          "maximum_damage": 0.0,
+          "stocks": [
+            4
+          ]
+        }
+      },
+      "artifact_sha256": {
+        "report.json": "91ed6a15e47f3e170eb4f78404ba8ca466cf08e861077cc8b1639758b929d2a7",
+        "recomp/trace.csv": "17de6127efdff030213844791c7341d959be21192dc728c4d9de4856e5cea05c",
+        "dolphin/trace.json": "e9819a3a8d9457a3fb716745b09a37d5777accf3689da0995efc33b8dd2446e4",
+        "dolphin/pads.json": "c21ee1ac0750e84f6bc3e0b2882ee23269b0f65a998633a743eb73276133826f"
+      }
+    },
+    "connected-combat-v9": {
+      "frames": 1200,
+      "delay_ms_each_direction": 60,
+      "identities": {
+        "dolphin": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+        "recomp": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+        "launcher": "a57be7866702f16366d5d22874aa1c2c264c6b80ae8bae6893c58c0b7582635a"
+      },
+      "comparison": {
+        "reference_frames": 1200,
+        "dolphin_trace_frames": 1327,
+        "compared_frames": 1200,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "native_counts": {
+        "frames": 1200,
+        "saves": 1844,
+        "loads": 147,
+        "advances": 1843,
+        "desyncs": 0
+      },
+      "dolphin": {
+        "rollbacks": 160,
+        "frames_resimulated": 646,
+        "desyncs_detected": 0,
+        "input_delay": 0
+      },
+      "combat_coverage": false,
+      "activity": [
+        {
+          "port": 0,
+          "positions": 278,
+          "actions": 19,
+          "max_damage": 0.0,
+          "stocks": [
+            4
+          ]
+        },
+        {
+          "port": 1,
+          "positions": 861,
+          "actions": 12,
+          "max_damage": 0.0,
+          "stocks": [
+            4
+          ]
+        }
+      ],
+      "artifact_sha256": {
+        "report.json": "a19399ba1271e7f29a236d9bc179b92387e3952db5cadf820bf62e7b8d828c6f",
+        "recomp/trace.csv": "2eeb04b6e9d6c1477c81b1641faf70471448341059a86d0bfcacc4e154fd8280",
+        "dolphin/trace.json": "149315cb3784983393359b933bbf77e4a40bea213437e2d386fb4a104319d494",
+        "dolphin/pads.json": "17155fb6d5aea98c9efcd155ceb3825701bb932d35ef7f1e80f3046d546504e3"
+      }
+    },
+    "connected-combat-v10": {
+      "passed": true,
+      "frames": 1200,
+      "delay_ms_each_direction": 60,
+      "identities": {
+        "dolphin": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+        "recomp": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+        "launcher": "a57be7866702f16366d5d22874aa1c2c264c6b80ae8bae6893c58c0b7582635a"
+      },
+      "comparison": {
+        "reference_frames": 1200,
+        "dolphin_trace_frames": 1327,
+        "compared_frames": 1200,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "native_counts": {
+        "frames": 1200,
+        "saves": 2150,
+        "loads": 235,
+        "advances": 2149,
+        "desyncs": 0
+      },
+      "dolphin": {
+        "rollbacks": 160,
+        "frames_resimulated": 645,
+        "desyncs_detected": 0,
+        "input_delay": 0
+      },
+      "combat_coverage": true,
+      "activity": [
+        {
+          "port": 0,
+          "positions": 712,
+          "actions": 22,
+          "max_damage": 37.36000061035156,
+          "stocks": [
+            4
+          ]
+        },
+        {
+          "port": 1,
+          "positions": 909,
+          "actions": 26,
+          "max_damage": 37.0,
+          "stocks": [
+            4
+          ]
+        }
+      ],
+      "controller": "Dolphin port 0 follows opponent using observed fighter positions and real controller scripts; native port 1 uses recorded tape. No gameplay state edits after synchronization.",
+      "controller_log_note": "game_frame field in controller-decisions.json records trace column 1 (application frame); comparison uses column 0, the game frame.",
+      "artifact_sha256": {
+        "report.json": "a62e4a0660367891b8260b702947602e91c3095dc636e394f918b209e2a8c934",
+        "recomp/trace.csv": "c6b444d34358ec7b4ac0c20d0d31429e7bbff763334486a91dd858c150d725b1",
+        "dolphin/trace.json": "0432c4613b32450f853cf9a04753c3d454fd242e593c42457e6b47fc3d2ae734",
+        "dolphin/pads.json": "bdd243dd546b2057b2ad18bec645579708b81c68d3333c94f0ce4fbaf01fc333",
+        "controller-decisions.json": "3a64277dcb69a2ca708e19b5c4b76ca2841a5f4a2afd0cb54f1d2446864f44a2",
+        "inputs.brpad": "e5b20bf6474579f821c283028cffd36a25f2f34af2f93bf6b62a6d2ebcb551f8"
+      },
+      "driver_sha256": "308cad2e1a39dae435bb550c27356326ef5a6bf759fb0e28dfa8bc3414232d91"
+    }
+  }
+}
