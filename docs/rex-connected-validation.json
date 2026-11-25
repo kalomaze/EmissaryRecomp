@@ -2,7 +2,7 @@
   "runtime_source": "f6a159d",
   "dolphin_version": "Brawl Online 0.2.8, preserved benchmark hooks",
   "mod": "REX Release 0\u00bd Hotfix 1",
-  "matchup": "Ivysaur vs Sora, Final Destination",
+  "matchup": "Per-run matchup specified; initial v8/v9/v10: Ivysaur vs Sora, Final Destination",
   "protocol": "Real Gekko gameplay session through delay bridge; harness performs setup rather than production matchmaking",
   "scope": "Corrected RNG and fighter fields plus gameplay CRC, and client desync counters; not full RAM parity",
   "runs": {
@@ -183,6 +183,82 @@
         "inputs.brpad": "e5b20bf6474579f821c283028cffd36a25f2f34af2f93bf6b62a6d2ebcb551f8"
       },
       "driver_sha256": "308cad2e1a39dae435bb550c27356326ef5a6bf759fb0e28dfa8bc3414232d91"
+    },
+    "connected-roster-b-v3": {
+      "passed": true,
+      "matchup": "Mewtwo vs Master Chief, Dracula\u2019s Castle",
+      "css_ids": [
+        46,
+        191
+      ],
+      "stage_id": 74,
+      "frames": 1200,
+      "delay_ms_each_direction": 60,
+      "identities": {
+        "dolphin": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+        "recomp": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+        "launcher": "a57be7866702f16366d5d22874aa1c2c264c6b80ae8bae6893c58c0b7582635a"
+      },
+      "comparison": {
+        "reference_frames": 1200,
+        "dolphin_trace_frames": 1327,
+        "compared_frames": 1200,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "native_counts": {
+        "frames": 1200,
+        "saves": 2239,
+        "loads": 241,
+        "advances": 2238,
+        "desyncs": 0
+      },
+      "dolphin": {
+        "rollbacks": 160,
+        "frames_resimulated": 668,
+        "desyncs_detected": 0,
+        "input_delay": 0
+      },
+      "activity": [
+        {
+          "port": 0,
+          "positions": 476,
+          "actions": 20,
+          "max_damage": 0.0,
+          "stocks": [
+            3,
+            4
+          ]
+        },
+        {
+          "port": 1,
+          "positions": 477,
+          "actions": 23,
+          "max_damage": 25.0,
+          "stocks": [
+            4
+          ]
+        }
+      ],
+      "combat_coverage": true,
+      "identity_evidence": [
+        "Dolphin selected.png and stage-selection.png visually inspected",
+        "Native runtime opens Ft_Mewtwo.rel, ft_chief.rel, st_mansion.rel"
+      ],
+      "excluded_attempts": "roster-b-v1/v2 failed cursor selection before gameplay; neither is a desync result",
+      "artifact_sha256": {
+        "report.json": "333dd2c75fe8f360a87fede92f5d46c8a5f0521c0e3fa0f0866b1f8ffccc4f38",
+        "recomp/trace.csv": "6293b043a118535f1513afbf3c6f876a26e860bea3b46cce1b3d9fc3cd654c2f",
+        "dolphin/trace.json": "1d7a2a16f640d449535c7480b8710d207fcff6661e52e437eb2a52ccdb0bf249",
+        "dolphin/pads.json": "a0dec115a064295436707fa437277801ad54e7235bf1648d2d8eb591cab87bb6",
+        "dolphin/selected.png": "0bd5815a9ad33e16e9b6f3379c78d508c1c8f6615461e8402369c2bbd503c7ea",
+        "dolphin/stage-selection.png": "1ce63e457b57b80ea033da99500567be3c3e7191240ee16fce91ec6ab51e4f81",
+        "controller-decisions.json": "24e0997a4c96fe3930314061f0c42d602c617132ff2a796a6caf3ea09e2598a0",
+        "inputs.brpad": "e5b20bf6474579f821c283028cffd36a25f2f34af2f93bf6b62a6d2ebcb551f8"
+      },
+      "driver_sha256": "8112452cf84db8028df5019cf14bb6b02ca5f128967390f9963d8f9475b47fd7"
     }
   }
 }
