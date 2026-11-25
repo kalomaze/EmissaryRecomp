@@ -259,6 +259,82 @@
         "inputs.brpad": "e5b20bf6474579f821c283028cffd36a25f2f34af2f93bf6b62a6d2ebcb551f8"
       },
       "driver_sha256": "8112452cf84db8028df5019cf14bb6b02ca5f128967390f9963d8f9475b47fd7"
+    },
+    "connected-roster-c-v1": {
+      "passed": true,
+      "matchup": "Sceptile vs Nu-13, Midgar",
+      "css_ids": [
+        98,
+        78
+      ],
+      "stage_id": 65,
+      "frames": 1200,
+      "delay_ms_each_direction": 60,
+      "identities": {
+        "dolphin": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+        "recomp": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+        "launcher": "a57be7866702f16366d5d22874aa1c2c264c6b80ae8bae6893c58c0b7582635a"
+      },
+      "comparison": {
+        "reference_frames": 1200,
+        "dolphin_trace_frames": 1327,
+        "compared_frames": 1200,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "native_counts": {
+        "frames": 1200,
+        "saves": 2079,
+        "loads": 219,
+        "advances": 2078,
+        "desyncs": 0
+      },
+      "dolphin": {
+        "rollbacks": 160,
+        "frames_resimulated": 646,
+        "desyncs_detected": 0,
+        "input_delay": 0
+      },
+      "activity": [
+        {
+          "port": 0,
+          "positions": 880,
+          "actions": 25,
+          "max_damage": 36.0,
+          "stocks": [
+            3,
+            4
+          ]
+        },
+        {
+          "port": 1,
+          "positions": 489,
+          "actions": 22,
+          "max_damage": 22.0,
+          "stocks": [
+            3,
+            4
+          ]
+        }
+      ],
+      "combat_coverage": true,
+      "identity_evidence": [
+        "Dolphin selected.png and stage-selection.png visually inspected",
+        "Native runtime opens ft_sceptile.rel, ft_nu.rel, st_palutena.rel and Midgar.param"
+      ],
+      "artifact_sha256": {
+        "report.json": "516aea1f599f159737be56e6cc9341066563b748b9eaebeb541d33187c5b23da",
+        "recomp/trace.csv": "bdc3e7dcf253f1e825c10f15d21b436077bdd54180609cfa63bec6ef89e35768",
+        "dolphin/trace.json": "26786deb604bd0ed896bc7186a2712e8994c57f92a0f81850df9d3cbfc8fd9eb",
+        "dolphin/pads.json": "c22a1b55afc3ee366855462845d19f23f342f3f2bd72cb91ec28a3b3888f8f4c",
+        "dolphin/selected.png": "0d8ee96c1752f076a84b1048720b4c4a09d27e7f68c26337b87a1a6904e3becc",
+        "dolphin/stage-selection.png": "8823b8216c94fc1294790717b9d47af8143eda04e59acded36b3f77a06864360",
+        "controller-decisions.json": "e14fbd9c00202600f8edf0e98a6b6ed9a6ae7bc8c0362b8164407f27f8e3084a",
+        "inputs.brpad": "e5b20bf6474579f821c283028cffd36a25f2f34af2f93bf6b62a6d2ebcb551f8"
+      },
+      "driver_sha256": "9eaaf7783976b2fe9964040ec3a4ad0a5c4f280f2f063e74ac6045dd55ef1c9a"
     }
   }
 }

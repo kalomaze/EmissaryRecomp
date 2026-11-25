@@ -1,0 +1,181 @@
+{
+  "binary_sha256": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+  "frames_per_run": 1200,
+  "rollback_trace_rows": 2397,
+  "fields_compared": [
+    "game_frame",
+    "rng",
+    "rng_other",
+    "libc_rng",
+    "gameplay_hash",
+    "fighters",
+    "input_hash",
+    "expected_input_hash"
+  ],
+  "mismatches": [],
+  "runs": {
+    "combat-v1-d0": {
+      "completion": {
+        "distance": 0,
+        "status": [
+          "run",
+          "scMelee",
+          "1444",
+          "2883"
+        ],
+        "complete_line": [
+          "[rollback] COMPLETE frames=1200 saves=1200 loads=0 advances=1200 desyncs=0 region_differences=0"
+        ]
+      },
+      "snapshot_operations": 1200,
+      "all_snapshot_operations_verified": true,
+      "nonzero_mismatch_counter_lines": []
+    },
+    "combat-reference-classic-d2": {
+      "completion": {
+        "distance": 2,
+        "status": [
+          "run",
+          "scMelee",
+          "1446",
+          "2911"
+        ],
+        "complete_line": [
+          "[rollback] COMPLETE frames=1200 saves=2397 loads=1197 advances=2397 desyncs=0 region_differences=1197"
+        ]
+      },
+      "snapshot_operations": 3594,
+      "all_snapshot_operations_verified": true,
+      "nonzero_mismatch_counter_lines": []
+    }
+  },
+  "coverage": [
+    {
+      "port": 0,
+      "x_range": [
+        -119.45924377441406,
+        9.204400062561035
+      ],
+      "y_range": [
+        -140.00999450683594,
+        141.6340789794922
+      ],
+      "damage_range": [
+        0.0,
+        24.96000099182129
+      ],
+      "stocks_observed": [
+        3,
+        4
+      ],
+      "status_ids_observed": [
+        0,
+        6,
+        14,
+        17,
+        18,
+        21,
+        24,
+        34,
+        35,
+        36,
+        39,
+        41,
+        42,
+        44,
+        51,
+        69,
+        73,
+        189,
+        190,
+        267,
+        274,
+        279,
+        280
+      ]
+    },
+    {
+      "port": 1,
+      "x_range": [
+        -85.56028747558594,
+        68.0468978881836
+      ],
+      "y_range": [
+        0.009999999776482582,
+        0.009999999776482582
+      ],
+      "damage_range": [
+        0.0,
+        0.0
+      ],
+      "stocks_observed": [
+        4
+      ],
+      "status_ids_observed": [
+        0,
+        1,
+        26,
+        27,
+        34,
+        35,
+        36,
+        39,
+        42,
+        44,
+        52,
+        242,
+        274,
+        279
+      ]
+    }
+  ],
+  "artifacts": {
+    "combat-v1-d0/trace.csv": "984312bd8d7c9881fbe9c4219b1cdd1c4a81fe2f6c186a9ed4d0d2327aabf64b",
+    "combat-v1-d0/trace.csv.snapshots.csv": "35efd3c80b8e45a375f42772838d5af462c6ee8e6d43a6daaff009d0c63d5669",
+    "combat-v1-d0/inputs.brpad": "3f83a06a1904b8ce2888fd06aca66905f8424434fe5016889c4088b6b871b6c5",
+    "combat-v1-d0/runtime.log": "2638ac35a51884dac1c8cc822cf21e4f75bdc0168445913713ed32a728114593",
+    "combat-reference-classic-d2/trace.csv": "bb83df980fdde7e9b0852150496546770e49c5311d75afe86beff6bdddcafffb",
+    "combat-reference-classic-d2/trace.csv.snapshots.csv": "644247f202e3de64a53191aaf582576e4a58a028dd8ba6e3153df458d11a8a36",
+    "combat-reference-classic-d2/inputs.brpad": "3f83a06a1904b8ce2888fd06aca66905f8424434fe5016889c4088b6b871b6c5",
+    "combat-reference-classic-d2/runtime.log": "72ce376c5e74638594bba0c82591feedce754b7aff92a7ffe546559c98720438",
+    "combat-reference-classic-d2/runtime-settings.json": "81529a672ac9f870dbb31a9311322223e16dcf6f35225c75d51d2e5da5d56c78",
+    "rex-combat-reference-classic-diff.txt": "a1f58a0d911244691f506c9b9b2f3a4b28bfb1aeda219efdf5f77a5741e4c690"
+  },
+  "limitations": [
+    "One REX matchup/stage; scripted input is not broad roster coverage.",
+    "Repeated-save differences within selected rollback regions are separate from verified snapshot restoration and gameplay checksum agreement.",
+    "No claim of complete arbitrary-mod safety or native ARM validation.",
+    "Verification instrumentation is enabled; this is not a performance measurement."
+  ],
+  "runtime_settings": {
+    "binary_sha256": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+    "settings": {
+      "G3D_CALC": "0",
+      "G3D_NATIVE": "0",
+      "BRAWL_HLE_VERIFY": null,
+      "BRAWL_INTERP_CHECK": null,
+      "BRAWL_INTERP": "classic",
+      "BRAWL_NO_CODE_VARIANTS": "1",
+      "BRAWL_HLE_GECKO": "0",
+      "BRAWL_HLE_MTX": "0",
+      "BRAWL_HLE_TAN": "0",
+      "BRAWL_AXFX_NATIVE": "0",
+      "AXFX_ASYNC": "0",
+      "AXFX_EXACT": "1",
+      "BRAWL_ROLLBACK_FRAMES": "1200",
+      "BRAWL_ROLLBACK_DISTANCE": "2",
+      "BRAWL_SNAPSHOT_VERIFY": "1",
+      "BRAWL_RESIM_SKIP": null,
+      "BRAWL_RESIM_HIDE": null,
+      "BRAWL_RESIM_DIFF": "/dev/shm/emissary-foreign-mods/rex-combat-reference-classic-diff.txt"
+    },
+    "pid": 2955364,
+    "identity_source": "Live /proc executable and environment"
+  },
+  "repeated_save_differences": {
+    "resaves": 1197,
+    "differing": 1197,
+    "changed_32byte_granules": 66
+  },
+  "scope": "Recomp-only reference control, not connected Dolphin parity. Lean memory and platform HLE remain enabled."
+}

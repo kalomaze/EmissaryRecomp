@@ -213,3 +213,15 @@ Comparison covers three RNG words, each fighter's instance/damage/stocks/positio
 
 
 A second connected matchup, Mewtwo versus Master Chief on Dracula's Castle, also matches all 1,200 corrected frames with no missing frames, mismatches or reported client desyncs. Screenshots and loaded `Ft_Mewtwo.rel`, `ft_chief.rel` and `st_mansion.rel` assets confirm the selection. Master Chief reaches 25% damage; Mewtwo loses one stock. Dolphin performs 160 rollbacks and 668 resimulated frames; recomp performs 241 loads and 2,238 total advances. The runtime, delay bridge and comparison scope are unchanged. Two preceding attempts stopped at stage selection because the cursor target lay near a tile border; neither reached gameplay. This extends connected x86 coverage to a second matchup and stage, with the same full-state and native ARM limitations. Details are in the connected-run receipt above.
+
+
+### Classic interpreter control for repeated-save differences
+
+An additional 1,200-frame recomp-only control disables compiled mod variants and the handwritten Gecko, matrix, tangent, G3D and AXFX helpers, and selects the classic interpreter. A live process environment/executable receipt confirms these settings. Lean memory and platform HLE remain enabled. Reanalysis of the retained artifacts reproduces the original result: all 2,397 trace rows match the optimized 0f reference on recorded gameplay, fighter, RNG and input fields, and all 3,594 snapshot operations in the control verify against the selected-region full-copy reference.
+
+All 1,197 repeated saves still differ somewhere in those selected regions, covering 66 changed 32-byte granules. Thus the disabled helpers, compiled variants and interpreter cache are not necessary for these differences to occur. This does not establish that every difference is harmless, exclude contributions from shared runtime behavior, or prove restoration of all host state. It is separate from the connected Dolphin parity tests above. [Control settings, results and artifact hashes](rex-classic-control-validation.json).
+
+
+### Third connected REX matchup
+
+Sceptile versus Nu-13 on Midgar matches all 1,200 corrected frames against Dolphin 0.2.8, with no missing frames, mismatches or reported client desyncs. Both fighters take damage (36% and 22% maxima) and each loses a stock. Dolphin performs 160 rollbacks and 646 resimulated frames; recomp performs 219 loads and 2,078 total advances. Selection screenshots and loaded character/stage assets confirm the matchup. The runtime, 60 ms delay in each direction, controller-driven combat and bounded comparison fields are unchanged. This completes connected tests of the three REX matchups previously tested in the recomp-only harness; it does not establish broader roster, full-state, or native ARM parity. See the [connected-run receipt](rex-connected-validation.json).
