@@ -806,6 +806,20 @@ public sealed partial class CxxLinearCodeGenerator
             code = ApplyGuardedGqrFunctionVersioning(code, implementationName, gqrEntryGuards);
         }
 
+        // A mod can replace instructions after isync within this function. Merely
+        // synchronizing entry guards cannot make an already-running host body see
+        // those edits. Full-context entries therefore interpret the whole function.
+        // Explicit EABI/state-free modes retain their separate, weaker contract.
+        if (!eabiConformantBody && !emitStateFreeLeafVariant && ownEabiVariant is null &&
+            func.Blocks.SelectMany(static block => block.Instructions).OfType<IrComment>()
+                .Any(static comment => comment.Text.StartsWith("isync @ ", StringComparison.Ordinal)))
+        {
+            code = "#include \"ppc_interpreter.h\"\n" + ReplaceFunctionBody(code, implementationName,
+                $"{{\n    PpcInterpreter::Run(ctx, 0x{entryPoint:X8}u);\n}}");
+            emittedDirectCallTargets.Clear();
+            emittedLocalLabelAddresses.Clear();
+        }
+
         return new CxxEmissionResult(
             code,
             guestAbiContract,

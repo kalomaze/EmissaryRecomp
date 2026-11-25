@@ -1,0 +1,103 @@
+{
+  "parent_commit": "01cf811",
+  "binary_sha256": "d4b4677c02857d5c9aa0fe4dfbe4852000a2d5e769decb4a177b7c8b4d8e9133",
+  "recordings": [
+    {
+      "recording": "match-001-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-001/game.brep",
+        "source_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "runtime_log_sha256": "d44d93128bbb761edd186ddc1958601291e85e83e2243778b7226498b898ee69",
+      "snapshot_csv_sha256": "108fba612dea10a40d0c88616a9852eda2136b437b8674e31dc532bb9e1387d5"
+    },
+    {
+      "recording": "match-064-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-064/game.brep",
+        "source_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "runtime_log_sha256": "8677aa4a11c3e6917f0cc5185b2381f19ad7875b991cdd6ec057cea5ae183396",
+      "snapshot_csv_sha256": "a29605e42a9cd1be889380105b2f6c31d8b67d6221d5b883599ac76bbd27f4f3"
+    },
+    {
+      "recording": "match-128-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-128/game.brep",
+        "source_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "runtime_log_sha256": "75ff5108c22b69b9af7ac3ae40c9351f6c97bc23a362ad19864f2151f4442645",
+      "snapshot_csv_sha256": "787eec5618aba53671e0b732ccce8e628fdace28628523268c00e1033beb72a2"
+    }
+  ],
+  "generator_tests": {
+    "new_tests_passed": 2,
+    "candidate_passed": 237,
+    "candidate_failed": 11,
+    "candidate_skipped": 4,
+    "comparison": {
+      "baseline_failures": [
+        "Translator.Tests.CodeGenTests.CodeGenerator_DoesNotElideFprStackRestoresAcrossGuestCalls",
+        "Translator.Tests.CodeGenTests.CodeGenerator_DoesNotElidePsqStackLoadWhenValueIsUsedBeforeScalarRestore",
+        "Translator.Tests.GpuFifoBurstCodeGenTests.CallSplitsTheRun",
+        "Translator.Tests.GqrPrologueHoistingCodeGenTests.EachUsedIndexGetsItsOwnLocalAndUnusedIndicesGetNone",
+        "Translator.Tests.GqrPrologueHoistingCodeGenTests.GenericSprWriterTargetingAGqrForcesAReload",
+        "Translator.Tests.GqrPrologueHoistingCodeGenTests.GenericSprWriterTargetingAnUnrelatedSprDoesNotReload",
+        "Translator.Tests.GqrPrologueHoistingCodeGenTests.MtsprToADifferentIndexDoesNotReloadTheOther",
+        "Translator.Tests.GqrPrologueHoistingCodeGenTests.MtsprToTheGraphicsQuantizationRegisterReloadsTheLocal",
+        "Translator.Tests.GqrPrologueHoistingCodeGenTests.RuntimeHelperCallsDoNotForceAReload",
+        "Translator.Tests.InstructionSyncCodeGenTests.FullContextInstructionSyncInterpretsFromEntry(mod: False)",
+        "Translator.Tests.InstructionSyncCodeGenTests.FullContextInstructionSyncInterpretsFromEntry(mod: True)",
+        "Translator.Tests.LocalCodeGenOptimizationTests.PairedStackRestoreIsKeptWhenConsumedBeforeScalarRestore",
+        "Translator.Tests.ResolvedMemoryLeafCacheCodeGenTests.AddressBasesUsedOnlyByResolvedOperationsStayCached"
+      ],
+      "candidate_failures": [
+        "Translator.Tests.CodeGenTests.CodeGenerator_DoesNotElideFprStackRestoresAcrossGuestCalls",
+        "Translator.Tests.CodeGenTests.CodeGenerator_DoesNotElidePsqStackLoadWhenValueIsUsedBeforeScalarRestore",
+        "Translator.Tests.GpuFifoBurstCodeGenTests.CallSplitsTheRun",
+        "Translator.Tests.GqrPrologueHoistingCodeGenTests.EachUsedIndexGetsItsOwnLocalAndUnusedIndicesGetNone",
+        "Translator.Tests.GqrPrologueHoistingCodeGenTests.GenericSprWriterTargetingAGqrForcesAReload",
+        "Translator.Tests.GqrPrologueHoistingCodeGenTests.GenericSprWriterTargetingAnUnrelatedSprDoesNotReload",
+        "Translator.Tests.GqrPrologueHoistingCodeGenTests.MtsprToADifferentIndexDoesNotReloadTheOther",
+        "Translator.Tests.GqrPrologueHoistingCodeGenTests.MtsprToTheGraphicsQuantizationRegisterReloadsTheLocal",
+        "Translator.Tests.GqrPrologueHoistingCodeGenTests.RuntimeHelperCallsDoNotForceAReload",
+        "Translator.Tests.LocalCodeGenOptimizationTests.PairedStackRestoreIsKeptWhenConsumedBeforeScalarRestore",
+        "Translator.Tests.ResolvedMemoryLeafCacheCodeGenTests.AddressBasesUsedOnlyByResolvedOperationsStayCached"
+      ],
+      "candidate_only_failures": [],
+      "fixed": [
+        "Translator.Tests.InstructionSyncCodeGenTests.FullContextInstructionSyncInterpretsFromEntry(mod: False)",
+        "Translator.Tests.InstructionSyncCodeGenTests.FullContextInstructionSyncInterpretsFromEntry(mod: True)"
+      ]
+    }
+  },
+  "limits": [
+    "Bounded P+ replay windows, not exhaustive foreign-mod compatibility.",
+    "Native ARM execution and timing comparison remain pending.",
+    "Explicit EABI and state-free translation modes retain their separate weaker contract."
+  ]
+}
