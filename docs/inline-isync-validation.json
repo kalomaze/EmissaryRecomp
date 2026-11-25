@@ -97,7 +97,485 @@
   },
   "limits": [
     "Bounded P+ replay windows, not exhaustive foreign-mod compatibility.",
-    "Native ARM execution and timing comparison remain pending.",
+    "Native ARM execution remains pending. Timing evidence covers only recording 128.",
     "Explicit EABI and state-free translation modes retain their separate weaker contract."
-  ]
+  ],
+  "timing": {
+    "all_16_reproduced": true,
+    "summary": [
+      {
+        "rollback": "0f",
+        "old": {
+          "mean_ms": 1.96418494453125,
+          "stdev_ms": 0.03594109964961219
+        },
+        "new": {
+          "mean_ms": 1.9682556895833332,
+          "stdev_ms": 0.030600745297199236
+        }
+      },
+      {
+        "rollback": "1f",
+        "old": {
+          "mean_ms": 3.9580971632812503,
+          "stdev_ms": 0.027809153112516024
+        },
+        "new": {
+          "mean_ms": 3.968096704427083,
+          "stdev_ms": 0.026710932834880016
+        }
+      }
+    ],
+    "runs": [
+      {
+        "name": "inline-isync-m128-d0-s0-old",
+        "engine": "recomp",
+        "arm": "old",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 0,
+        "wall_ms": {
+          "mean": 1.92452285625,
+          "p75": 2.0181875,
+          "p90": 2.1362813000000003,
+          "p95": 2.2246691999999997,
+          "p99": 2.3914839199999998
+        },
+        "Mcycles": {
+          "mean": 9.716678461458333,
+          "p75": 10.184772500000001,
+          "p90": 10.787419900000002,
+          "p95": 11.2358493,
+          "p99": 12.079147939999999
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.051837892053789,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "6ad03048ec036d2999396e4fd808a7c90444e592b2f53776ee4251f8a4cb2429",
+        "checksums": "PASS",
+        "samples_sha256": "0ae2732b3b854d2cfa45538a52ea5f8c6f23fae0efdbde6c24b5d6a3375c7967"
+      },
+      {
+        "name": "inline-isync-m128-d0-s1-new",
+        "engine": "recomp",
+        "arm": "new",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 0,
+        "wall_ms": {
+          "mean": 2.0021405072916663,
+          "p75": 2.0892014999999997,
+          "p90": 2.2262851,
+          "p95": 2.3156833,
+          "p99": 2.47671682
+        },
+        "Mcycles": {
+          "mean": 10.051279816666666,
+          "p75": 10.488632500000001,
+          "p90": 11.168197300000001,
+          "p95": 11.643180399999999,
+          "p99": 12.46439322
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.038442422254168,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "d4b4677c02857d5c9aa0fe4dfbe4852000a2d5e769decb4a177b7c8b4d8e9133",
+        "checksums": "PASS",
+        "samples_sha256": "439e57a7e10bf8f52d48b83034bbae3647dc92c7301ac43c35382c19b479034c"
+      },
+      {
+        "name": "inline-isync-m128-d0-s2-new",
+        "engine": "recomp",
+        "arm": "new",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 0,
+        "wall_ms": {
+          "mean": 1.9564404614583333,
+          "p75": 2.0433417499999997,
+          "p90": 2.1680223,
+          "p95": 2.2451721499999997,
+          "p99": 2.4115602899999993
+        },
+        "Mcycles": {
+          "mean": 9.810409372916668,
+          "p75": 10.24981375,
+          "p90": 10.8720289,
+          "p95": 11.27637405,
+          "p99": 12.111694829999996
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.0374318252782615,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "d4b4677c02857d5c9aa0fe4dfbe4852000a2d5e769decb4a177b7c8b4d8e9133",
+        "checksums": "PASS",
+        "samples_sha256": "6e349d976176b701a9ad8a67a19b1995589896dffa694a0c0c268969ef8e229c"
+      },
+      {
+        "name": "inline-isync-m128-d0-s3-old",
+        "engine": "recomp",
+        "arm": "old",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 0,
+        "wall_ms": {
+          "mean": 1.983618265625,
+          "p75": 2.07396675,
+          "p90": 2.1897311999999998,
+          "p95": 2.2808331,
+          "p99": 2.4381477
+        },
+        "Mcycles": {
+          "mean": 9.974683283333333,
+          "p75": 10.433947,
+          "p90": 11.0138893,
+          "p95": 11.471291699999998,
+          "p99": 12.2592106
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.040945254346405,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "6ad03048ec036d2999396e4fd808a7c90444e592b2f53776ee4251f8a4cb2429",
+        "checksums": "PASS",
+        "samples_sha256": "fb9d986a558ac824d47a0c28fed71712f134facc6058a0f07c50d5704a053cff"
+      },
+      {
+        "name": "inline-isync-m128-d0-s4-new",
+        "engine": "recomp",
+        "arm": "new",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 0,
+        "wall_ms": {
+          "mean": 1.982498384375,
+          "p75": 2.07778775,
+          "p90": 2.1938042,
+          "p95": 2.2828768,
+          "p99": 2.422169179999999
+        },
+        "Mcycles": {
+          "mean": 9.953643272916667,
+          "p75": 10.4341885,
+          "p90": 11.0048677,
+          "p95": 11.48378275,
+          "p99": 12.183258619999997
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.035588584691996,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "d4b4677c02857d5c9aa0fe4dfbe4852000a2d5e769decb4a177b7c8b4d8e9133",
+        "checksums": "PASS",
+        "samples_sha256": "8cbe4ec14dc43fd11528553cfdb379f9ee6e6ff594dc8822391ffdb1f6a2d7b6"
+      },
+      {
+        "name": "inline-isync-m128-d0-s5-old",
+        "engine": "recomp",
+        "arm": "old",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 0,
+        "wall_ms": {
+          "mean": 2.00362466875,
+          "p75": 2.09397675,
+          "p90": 2.2151541999999997,
+          "p95": 2.3034530999999996,
+          "p99": 2.4528364
+        },
+        "Mcycles": {
+          "mean": 10.039842402083334,
+          "p75": 10.488255500000001,
+          "p90": 11.0918135,
+          "p95": 11.5572635,
+          "p99": 12.29505301
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.035503751339764,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "6ad03048ec036d2999396e4fd808a7c90444e592b2f53776ee4251f8a4cb2429",
+        "checksums": "PASS",
+        "samples_sha256": "15221dd682102723f89c563d087db1c8535ad9c43d79b228ab737243fe1ce646"
+      },
+      {
+        "name": "inline-isync-m128-d0-s6-old",
+        "engine": "recomp",
+        "arm": "old",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 0,
+        "wall_ms": {
+          "mean": 1.9449739874999998,
+          "p75": 2.04084575,
+          "p90": 2.1564281,
+          "p95": 2.2413025499999994,
+          "p99": 2.4497679
+        },
+        "Mcycles": {
+          "mean": 9.781892879166666,
+          "p75": 10.2686615,
+          "p90": 10.8494302,
+          "p95": 11.275943799999999,
+          "p99": 12.30004335
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.0339349971943275,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "6ad03048ec036d2999396e4fd808a7c90444e592b2f53776ee4251f8a4cb2429",
+        "checksums": "PASS",
+        "samples_sha256": "c426c44bcaeed63fdc43d8d9b35a63de970bad35b875309030c82bdc7bc972ff"
+      },
+      {
+        "name": "inline-isync-m128-d0-s7-new",
+        "engine": "recomp",
+        "arm": "new",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 0,
+        "wall_ms": {
+          "mean": 1.9319434052083333,
+          "p75": 2.027055,
+          "p90": 2.1454177000000003,
+          "p95": 2.2507356,
+          "p99": 2.44307632
+        },
+        "Mcycles": {
+          "mean": 9.724567158333333,
+          "p75": 10.19947625,
+          "p90": 10.8041629,
+          "p95": 11.3443287,
+          "p99": 12.316279159999999
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.051409593121854,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "d4b4677c02857d5c9aa0fe4dfbe4852000a2d5e769decb4a177b7c8b4d8e9133",
+        "checksums": "PASS",
+        "samples_sha256": "1a8ad927b4627f38fec5bc7aec92ba4900c11251621009332a0a1a42054eefae"
+      },
+      {
+        "name": "inline-isync-m128-d2-s0-old",
+        "engine": "recomp",
+        "arm": "old",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 2,
+        "wall_ms": {
+          "mean": 3.981918975,
+          "p75": 4.1570605,
+          "p90": 4.3793731000000005,
+          "p95": 4.50512305,
+          "p99": 4.79339782
+        },
+        "Mcycles": {
+          "mean": 20.022596408333335,
+          "p75": 20.89123175,
+          "p90": 22.0412943,
+          "p95": 22.67176585,
+          "p99": 24.069862789999995
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.035282955315317,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "6ad03048ec036d2999396e4fd808a7c90444e592b2f53776ee4251f8a4cb2429",
+        "checksums": "PASS",
+        "samples_sha256": "b427a512ef2690b1efdf93d7c39b7864efeec40bc9e4d7ce0a3e31b49eb57913"
+      },
+      {
+        "name": "inline-isync-m128-d2-s1-new",
+        "engine": "recomp",
+        "arm": "new",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 2,
+        "wall_ms": {
+          "mean": 4.000986960416666,
+          "p75": 4.18132375,
+          "p90": 4.4039043,
+          "p95": 4.534777,
+          "p99": 4.80256929
+        },
+        "Mcycles": {
+          "mean": 20.06434645208333,
+          "p75": 20.975345750000002,
+          "p90": 22.0867636,
+          "p95": 22.7698286,
+          "p99": 24.15565077
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.030724819609738,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "d4b4677c02857d5c9aa0fe4dfbe4852000a2d5e769decb4a177b7c8b4d8e9133",
+        "checksums": "PASS",
+        "samples_sha256": "5b5b9c79422d0fa29857da1a2c89ddfb18e79aa5d5ca3a72e555d74f65b091c6"
+      },
+      {
+        "name": "inline-isync-m128-d2-s2-new",
+        "engine": "recomp",
+        "arm": "new",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 2,
+        "wall_ms": {
+          "mean": 3.9400336677083336,
+          "p75": 4.1158695,
+          "p90": 4.340161,
+          "p95": 4.4835806,
+          "p99": 4.76815711
+        },
+        "Mcycles": {
+          "mean": 19.752807148958333,
+          "p75": 20.647330750000002,
+          "p90": 21.8089449,
+          "p95": 22.56209445,
+          "p99": 23.935263589999998
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.034143506119285,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "d4b4677c02857d5c9aa0fe4dfbe4852000a2d5e769decb4a177b7c8b4d8e9133",
+        "checksums": "PASS",
+        "samples_sha256": "5d49d817248839ffe30f65db4af49aea16150a5238114cbb9a2f081755b2e7fb"
+      },
+      {
+        "name": "inline-isync-m128-d2-s3-old",
+        "engine": "recomp",
+        "arm": "old",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 2,
+        "wall_ms": {
+          "mean": 3.9471315666666666,
+          "p75": 4.1232625,
+          "p90": 4.346698,
+          "p95": 4.45966185,
+          "p99": 4.78314755
+        },
+        "Mcycles": {
+          "mean": 19.820711612500002,
+          "p75": 20.70725,
+          "p90": 21.830973,
+          "p95": 22.4193016,
+          "p99": 24.06292328
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.03282047689321,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "6ad03048ec036d2999396e4fd808a7c90444e592b2f53776ee4251f8a4cb2429",
+        "checksums": "PASS",
+        "samples_sha256": "6cf55c5869131d9a880afbd8b171af428dbe976df4de8ffaae1d7113b2b42a2f"
+      },
+      {
+        "name": "inline-isync-m128-d2-s4-new",
+        "engine": "recomp",
+        "arm": "new",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 2,
+        "wall_ms": {
+          "mean": 3.954293015625,
+          "p75": 4.18855775,
+          "p90": 4.4122671,
+          "p95": 4.524355299999999,
+          "p99": 4.8483737499999995
+        },
+        "Mcycles": {
+          "mean": 19.84599767395833,
+          "p75": 20.9977935,
+          "p90": 22.1721353,
+          "p95": 22.7618704,
+          "p99": 24.38490414
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.036614996118311,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "d4b4677c02857d5c9aa0fe4dfbe4852000a2d5e769decb4a177b7c8b4d8e9133",
+        "checksums": "PASS",
+        "samples_sha256": "89c6f59cb81b78db82e28b07d007873f0faaabc01b4b0cf829f52864c01f9bdf"
+      },
+      {
+        "name": "inline-isync-m128-d2-s5-old",
+        "engine": "recomp",
+        "arm": "old",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 2,
+        "wall_ms": {
+          "mean": 3.979505029166667,
+          "p75": 4.1587130000000005,
+          "p90": 4.3909973,
+          "p95": 4.51887715,
+          "p99": 4.804943369999998
+        },
+        "Mcycles": {
+          "mean": 20.005986163541667,
+          "p75": 20.907357500000003,
+          "p90": 22.06737,
+          "p95": 22.715329849999996,
+          "p99": 24.159317679999994
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.031858142101905,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "6ad03048ec036d2999396e4fd808a7c90444e592b2f53776ee4251f8a4cb2429",
+        "checksums": "PASS",
+        "samples_sha256": "9df4592ec4d0542b815232c78e636bd2acffa36c411ca3e4847b3b4075858942"
+      },
+      {
+        "name": "inline-isync-m128-d2-s6-old",
+        "engine": "recomp",
+        "arm": "old",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 2,
+        "wall_ms": {
+          "mean": 3.9238330822916665,
+          "p75": 4.1074605,
+          "p90": 4.3166675,
+          "p95": 4.449558,
+          "p99": 4.7453004199999995
+        },
+        "Mcycles": {
+          "mean": 19.692734335416667,
+          "p75": 20.59876175,
+          "p90": 21.668671200000002,
+          "p95": 22.3867541,
+          "p99": 23.854845029999996
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.035283420872391,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "6ad03048ec036d2999396e4fd808a7c90444e592b2f53776ee4251f8a4cb2429",
+        "checksums": "PASS",
+        "samples_sha256": "54fd49f469f5c72c962ef2495aec204aab11bd667cce61d39bf2223a307e5138"
+      },
+      {
+        "name": "inline-isync-m128-d2-s7-new",
+        "engine": "recomp",
+        "arm": "new",
+        "match": "128",
+        "phase": "unpaced",
+        "distance": 2,
+        "wall_ms": {
+          "mean": 3.977073173958333,
+          "p75": 4.1618085,
+          "p90": 4.4044563000000005,
+          "p95": 4.55307935,
+          "p99": 4.832863289999999
+        },
+        "Mcycles": {
+          "mean": 19.987905689583332,
+          "p75": 20.91405225,
+          "p90": 22.1430674,
+          "p95": 22.91586945,
+          "p99": 24.336045889999994
+        },
+        "intervals": 960,
+        "max_counter_rate_GHz": 5.037234729080211,
+        "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "binary_sha256": "d4b4677c02857d5c9aa0fe4dfbe4852000a2d5e769decb4a177b7c8b4d8e9133",
+        "checksums": "PASS",
+        "samples_sha256": "461850c04f7069f916c172ef606476660efcba2a2e706951ddf50f6df06c9188"
+      }
+    ],
+    "scope": "Recording 128 only, four repeats per build/depth, counterbalanced; 960 interior marker intervals per run; lean, compiled mods, no PGO."
+  }
 }
