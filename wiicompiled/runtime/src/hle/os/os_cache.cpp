@@ -9,6 +9,7 @@
 #include <aurora/aurora.h>
 
 #include "abi_bridge.h"
+#include "guest_code_patch.h"
 #include "memory.h"
 #include "hle_stubs.h"
 #include "ppc_runtime.h"
@@ -154,10 +155,16 @@ PPC_NATIVE_OVERRIDE_VOID(801D7748, DCFlushRangeNoSync_HLE, (uint32_t addr, uint3
 
 // ----------------------------------------------------------------------------
 // CPU Cache Maintenance Stubs (DC/IC/LC)
-// These are safe to no-op because the host CPU handles caching.
+// Cache enable/disable has no host equivalent. Instruction invalidation must
+// still publish pending guest-code changes to translated/native entry guards.
 // ----------------------------------------------------------------------------
 extern "C" void Cache_Maintenance_Stub()
 {
+}
+
+extern "C" void ICInvalidate_HLE()
+{
+    GuestCodePatch::Sync();
 }
 
 namespace {
@@ -277,8 +284,8 @@ extern "C" void LCQueueWait_HLE_801a1988(CpuContext*)
 
 PPC_NATIVE_OVERRIDE_VOID(801d76a8, Cache_Maintenance_Stub, (), ()); // DCEnable
 PPC_NATIVE_OVERRIDE_VOID(801d77a0, DCZeroRange_HLE, (CpuContext* ctx), (ctx)); // DCZeroRange
-PPC_NATIVE_OVERRIDE_VOID(801d77cc, Cache_Maintenance_Stub, (), ()); // ICInvalidateRange
-PPC_NATIVE_OVERRIDE_VOID(801d7800, Cache_Maintenance_Stub, (), ()); // ICFlashInvalidate
+PPC_NATIVE_OVERRIDE_VOID(801d77cc, ICInvalidate_HLE, (), ()); // ICInvalidateRange
+PPC_NATIVE_OVERRIDE_VOID(801d7800, ICInvalidate_HLE, (), ()); // ICFlashInvalidate
 PPC_NATIVE_OVERRIDE_VOID(801d7810, Cache_Maintenance_Stub, (), ()); // ICEnable
 PPC_NATIVE_OVERRIDE_VOID(801d7928, Cache_Maintenance_Stub, (), ()); // LCDisable
 PPC_NATIVE_OVERRIDE_VOID(801d7c40, Cache_Maintenance_Stub, (), ()); // OS____CacheInit

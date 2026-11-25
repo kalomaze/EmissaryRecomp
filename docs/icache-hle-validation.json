@@ -1,0 +1,62 @@
+{
+  "parent_commit": "a522376",
+  "binary_sha256": "6ad03048ec036d2999396e4fd808a7c90444e592b2f53776ee4251f8a4cb2429",
+  "recordings": [
+    {
+      "recording": "match-001-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-001/game.brep",
+        "source_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "runtime_log_sha256": "c426a757caa6dcc4470af06e01ceb2bbc2eb163e0dca592f471d914d0efb2317",
+      "snapshot_csv_sha256": "dfd47b2a49c7a0aea428b5b81c6588565adc6e7d62318beb6a4c9986d629f426"
+    },
+    {
+      "recording": "match-064-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-064/game.brep",
+        "source_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "runtime_log_sha256": "9a7e368add6387c44b71f4c4f80c56fe9e9710c3c0f792f53020facf9b2d21cb",
+      "snapshot_csv_sha256": "07556216788030149db702016e62553dbd243f1acf0f72584e576dc7d5619b02"
+    },
+    {
+      "recording": "match-128-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-128/game.brep",
+        "source_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "runtime_log_sha256": "b8db7e65a6b88f674255be84ecf000638509a6dcbacc362efbb99b89244b736d",
+      "snapshot_csv_sha256": "74eb8442152ce7a122e496c2fc08f8f498ae31e4c05e991a5c2ed7ee4f48d6fd"
+    }
+  ],
+  "limits": [
+    "These bounded replay windows do not establish exhaustive mod compatibility.",
+    "Native ARM validation remains pending.",
+    "Compiled inline isync remains a separate translation audit item."
+  ]
+}
