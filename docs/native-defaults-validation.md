@@ -192,3 +192,10 @@ Mewtwo versus Master Chief on Dracula's Castle completes a second 1,200-frame co
 All 2,397 rollback trace rows match the corresponding 0f frames on recorded gameplay, fighter, RNG and input fields. All 4,794 snapshot operations verify against the full-copy reference of the selected regions. Enabled native/reference checks report no mismatch; the receipt includes their last reported counters. The runtime remains `f6a159d`.
 
 All 1,197 repeated saves still differ somewhere within the selected regions. These checks establish additional real-mod compatibility, not complete state determinism, audiovisual correctness or arbitrary-mod coverage. Current native ARM validation remains outstanding. [Roster/stage receipt](rex-roster-validation.json).
+
+
+### Third REX matchup
+
+Sceptile versus Nu-13 on Midgar completes 1,200 output frames at 0f and with one redo. Screenshots identify both fighters and the stage; loaded `ft_sceptile.rel`, `ft_nu.rel`, `st_palutena.rel` and `Midgar.param` assets support that identification. This window records movement, action changes and a stock loss, but no damage exchanges, so it is not additional evidence of damage handling.
+
+All 2,397 rollback trace rows match their corresponding 0f frames on recorded gameplay, fighter, RNG and input fields. All 4,794 snapshot operations verify for the selected rollback regions. Enabled helper comparisons report no mismatches, and the log contains no reported out-of-declared-range verification writes or nonzero unverifiable counters. All 1,197 repeated saves still have region differences. These unresolved differences and pending native ARM validation limit the result. [Third-match receipt](rex-roster-c-validation.json).
