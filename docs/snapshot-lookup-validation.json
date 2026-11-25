@@ -1,0 +1,335 @@
+{
+  "control_commit": "6afee6a",
+  "units": "host wall ms per output frame; restore breakdown in microseconds",
+  "summary": {
+    "0f": {
+      "old": {
+        "mean": 1.98863138203125,
+        "p99": 2.4563013225,
+        "run_means": [
+          1.9610981739583333,
+          1.9949246635416666,
+          1.99823651875,
+          2.000266171875
+        ]
+      },
+      "new": {
+        "mean": 1.9970243239583334,
+        "p99": 2.4682632599999996,
+        "run_means": [
+          2.016172016666667,
+          1.9940919822916667,
+          2.0229844739583336,
+          1.9548488229166665
+        ]
+      },
+      "mean_reduction_percent": -0.422046137002563
+    },
+    "1f": {
+      "old": {
+        "mean": 3.9700351463541668,
+        "p99": 4.767615527499999,
+        "run_means": [
+          4.085616429166667,
+          4.03375126875,
+          3.803281960416667,
+          3.957490927083333
+        ]
+      },
+      "new": {
+        "mean": 3.8977310442708335,
+        "p99": 4.688847407499999,
+        "run_means": [
+          3.7946732874999998,
+          3.7665111802083335,
+          4.013928066666667,
+          4.015811642708333
+        ]
+      },
+      "mean_reduction_percent": 1.8212458937481357
+    }
+  },
+  "load_us": {
+    "old": 122.9595265625,
+    "new": 101.7928609375
+  },
+  "index_us": {
+    "old": 66.39514817708334,
+    "new": 46.83132109375
+  },
+  "runs": [
+    {
+      "name": "sparse-snapshot-m128-d0-s0-old",
+      "distance": 0,
+      "arm": "old",
+      "wall_ms": {
+        "mean": 1.9610981739583333,
+        "p75": 2.04839175,
+        "p90": 2.1761203,
+        "p95": 2.2564512,
+        "p99": 2.43268286
+      },
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "cd68bdc2db4a215efec03d505594f8caf493d68476d28c7c6ee453cec2de74fe",
+      "checksums": "PASS"
+    },
+    {
+      "name": "sparse-snapshot-m128-d0-s1-new",
+      "distance": 0,
+      "arm": "new",
+      "wall_ms": {
+        "mean": 2.016172016666667,
+        "p75": 2.10178075,
+        "p90": 2.2259693,
+        "p95": 2.3132181,
+        "p99": 2.4700126399999998
+      },
+      "binary_sha256": "3b4d153c2b88eefa51d4423595efebb5c923421be4947784b07d818177d3b63b",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "9fd1885a116b5215cfbee78e79055c4df2b0564e48253d002b18fee9d6013f4c",
+      "checksums": "PASS"
+    },
+    {
+      "name": "sparse-snapshot-m128-d0-s2-new",
+      "distance": 0,
+      "arm": "new",
+      "wall_ms": {
+        "mean": 1.9940919822916667,
+        "p75": 2.083624,
+        "p90": 2.2049064,
+        "p95": 2.3003451,
+        "p99": 2.4714312699999996
+      },
+      "binary_sha256": "3b4d153c2b88eefa51d4423595efebb5c923421be4947784b07d818177d3b63b",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "48cb919572e70a66aba935116b306e1ed6b80e3f00288d731e643e10618d2629",
+      "checksums": "PASS"
+    },
+    {
+      "name": "sparse-snapshot-m128-d0-s3-old",
+      "distance": 0,
+      "arm": "old",
+      "wall_ms": {
+        "mean": 1.9949246635416666,
+        "p75": 2.0781565,
+        "p90": 2.203693,
+        "p95": 2.2875921000000004,
+        "p99": 2.45989633
+      },
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "df68638b7cdb31bf36ef70624bd63f76e6ca6f1877535939c52f08fd116d3513",
+      "checksums": "PASS"
+    },
+    {
+      "name": "sparse-snapshot-m128-d0-s4-new",
+      "distance": 0,
+      "arm": "new",
+      "wall_ms": {
+        "mean": 2.0229844739583336,
+        "p75": 2.1117607499999997,
+        "p90": 2.2342181,
+        "p95": 2.3234526,
+        "p99": 2.4732692999999997
+      },
+      "binary_sha256": "3b4d153c2b88eefa51d4423595efebb5c923421be4947784b07d818177d3b63b",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "224ac20e1e419c93d047c96a998d3f1640e96bec4e8c11346bbe93abff03f824",
+      "checksums": "PASS"
+    },
+    {
+      "name": "sparse-snapshot-m128-d0-s5-old",
+      "distance": 0,
+      "arm": "old",
+      "wall_ms": {
+        "mean": 1.99823651875,
+        "p75": 2.0870594999999996,
+        "p90": 2.2025073,
+        "p95": 2.28778105,
+        "p99": 2.4667856699999997
+      },
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "5f3f256acfb5d266ad8cf75ae29c69120a018cc9d53b54ff28b8302f454d2c59",
+      "checksums": "PASS"
+    },
+    {
+      "name": "sparse-snapshot-m128-d0-s6-old",
+      "distance": 0,
+      "arm": "old",
+      "wall_ms": {
+        "mean": 2.000266171875,
+        "p75": 2.0904772499999997,
+        "p90": 2.2113701999999997,
+        "p95": 2.2883287500000002,
+        "p99": 2.4658404299999996
+      },
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "2e9840221cfb9912d7120032c4364391395140f1f8dbcc7e5a6ca1e497c439b0",
+      "checksums": "PASS"
+    },
+    {
+      "name": "sparse-snapshot-m128-d0-s7-new",
+      "distance": 0,
+      "arm": "new",
+      "wall_ms": {
+        "mean": 1.9548488229166665,
+        "p75": 2.0452702499999997,
+        "p90": 2.1811453,
+        "p95": 2.26309255,
+        "p99": 2.458339829999999
+      },
+      "binary_sha256": "3b4d153c2b88eefa51d4423595efebb5c923421be4947784b07d818177d3b63b",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "e868e91cd0da1ddcda87e71eca584373d77deb673e1576d4d2e2b69da3ce2f14",
+      "checksums": "PASS"
+    },
+    {
+      "name": "sparse-snapshot-m128-d2-s0-old",
+      "distance": 2,
+      "arm": "old",
+      "wall_ms": {
+        "mean": 4.085616429166667,
+        "p75": 4.2713405,
+        "p90": 4.4842901,
+        "p95": 4.6232600999999995,
+        "p99": 4.888322789999999
+      },
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "691f1a750ca94fda6668c913eca43cb33f96ad7436b0b024053cdc05d63255fe",
+      "checksums": "PASS"
+    },
+    {
+      "name": "sparse-snapshot-m128-d2-s1-new",
+      "distance": 2,
+      "arm": "new",
+      "wall_ms": {
+        "mean": 3.7946732874999998,
+        "p75": 3.965057,
+        "p90": 4.1646455,
+        "p95": 4.29338715,
+        "p99": 4.51814486
+      },
+      "binary_sha256": "3b4d153c2b88eefa51d4423595efebb5c923421be4947784b07d818177d3b63b",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "74d2ed42dbbcde8775ae13dde36f8ac99a2961d94ab1a450bfed84e8c30d3fc1",
+      "checksums": "PASS"
+    },
+    {
+      "name": "sparse-snapshot-m128-d2-s2-new",
+      "distance": 2,
+      "arm": "new",
+      "wall_ms": {
+        "mean": 3.7665111802083335,
+        "p75": 3.9300105,
+        "p90": 4.1117099,
+        "p95": 4.2605903,
+        "p99": 4.552486709999999
+      },
+      "binary_sha256": "3b4d153c2b88eefa51d4423595efebb5c923421be4947784b07d818177d3b63b",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "6c6831e81514003716ba318f02efcc6098cedf022746c2b1568bb95c402d28bf",
+      "checksums": "PASS"
+    },
+    {
+      "name": "sparse-snapshot-m128-d2-s3-old",
+      "distance": 2,
+      "arm": "old",
+      "wall_ms": {
+        "mean": 4.03375126875,
+        "p75": 4.21625875,
+        "p90": 4.4486431,
+        "p95": 4.5782833,
+        "p99": 4.816326999999999
+      },
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "946c76af58fee0d2a3cc47a0882151532ece60b7984441a8b9428a703855a1f5",
+      "checksums": "PASS"
+    },
+    {
+      "name": "sparse-snapshot-m128-d2-s4-new",
+      "distance": 2,
+      "arm": "new",
+      "wall_ms": {
+        "mean": 4.013928066666667,
+        "p75": 4.191009,
+        "p90": 4.4140801,
+        "p95": 4.54043205,
+        "p99": 4.859883289999999
+      },
+      "binary_sha256": "3b4d153c2b88eefa51d4423595efebb5c923421be4947784b07d818177d3b63b",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "7980ad28c4159f31c098808fce035fe1efa32d7895e28a44d8f93cd30b2a4eee",
+      "checksums": "PASS"
+    },
+    {
+      "name": "sparse-snapshot-m128-d2-s5-old",
+      "distance": 2,
+      "arm": "old",
+      "wall_ms": {
+        "mean": 3.803281960416667,
+        "p75": 3.96805575,
+        "p90": 4.1413444,
+        "p95": 4.26968555,
+        "p99": 4.565651999999999
+      },
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "9b48fcdb2b78c9b8c45dedb0d583b64b653285d647bd8b2e2a7424b908cb05ee",
+      "checksums": "PASS"
+    },
+    {
+      "name": "sparse-snapshot-m128-d2-s6-old",
+      "distance": 2,
+      "arm": "old",
+      "wall_ms": {
+        "mean": 3.957490927083333,
+        "p75": 4.1454345,
+        "p90": 4.3579897,
+        "p95": 4.5099421500000005,
+        "p99": 4.800160319999999
+      },
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "d6690e0105922fa8cdc9285bf5f361d1b65e59e605373e5a6b75e4aedc86cc87",
+      "checksums": "PASS"
+    },
+    {
+      "name": "sparse-snapshot-m128-d2-s7-new",
+      "distance": 2,
+      "arm": "new",
+      "wall_ms": {
+        "mean": 4.015811642708333,
+        "p75": 4.1916955,
+        "p90": 4.4080365,
+        "p95": 4.5441509,
+        "p99": 4.824874769999998
+      },
+      "binary_sha256": "3b4d153c2b88eefa51d4423595efebb5c923421be4947784b07d818177d3b63b",
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "samples_sha256": "7334b9ee19923b31ff6d7abc51ddc853088e00001c3e8b7717ab42fe821ed040",
+      "checksums": "PASS"
+    }
+  ],
+  "correctness": {
+    "x86_verified_recordings": 3,
+    "frames_each": 300,
+    "snapshot_operations_verified": 2682,
+    "snapshot_tests": [
+      "x86 default",
+      "x86 lean",
+      "AArch64 QEMU default",
+      "AArch64 QEMU lean"
+    ],
+    "native_arm_replays": "pending"
+  },
+  "limits": [
+    "One recording in paired timing cohort; other recordings need matched timing confirmation.",
+    "Run-to-run variation is larger than the aggregate frame-time difference.",
+    "Emulated ARM tests do not establish native ARM graphics, timing, or end-to-end rollback behavior."
+  ]
+}

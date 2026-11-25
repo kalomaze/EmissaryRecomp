@@ -31,6 +31,32 @@ static void TestOnlyLaterWritesNeedRestoring() {
     assert(live == frame1 && store.lastRestoreReadBytes == 7);
 }
 
+static void TestSparseSourceLookup() {
+    SnapshotStore store;
+    std::vector<uint8_t> live(1025 * SnapshotStore::BlockSize - 3);
+    const auto read = [&](size_t at, uint8_t* out, size_t size) { std::memcpy(out, live.data() + at, size); };
+    const auto write = [&](size_t at, const uint8_t* in, size_t size) { std::memcpy(live.data() + at, in, size); };
+    store.Save(0, live.size(), read);
+    std::vector<uint32_t> dense;
+    for (uint32_t block = 0; block < 1024; ++block) {
+        dense.push_back(block);
+        live[block * SnapshotStore::BlockSize] = uint8_t(block % 251 + 1);
+    }
+    store.Save(1, live.size(), read, &dense, 0);
+    live[0] = 12;
+    std::vector<uint32_t> first{0};
+    store.Save(2, live.size(), read, &first, 1);
+    const auto expected = live;
+    // Source 0 is in the target, 511/1023 in its dense predecessor, and the
+    // partial final block only in the base image. Exercise hits and misses.
+    std::vector<uint32_t> dirty{0, 511, 1023, 1024};
+    for (auto block : dirty) live[block * SnapshotStore::BlockSize] ^= 0xff;
+    store.Restore(2, 2, dirty, read, write);
+    assert(live == expected);
+    store.Restore(2, 2, {}, read, write);
+    assert(live == expected && store.lastRestoreReadBytes == 0);
+}
+
 static void TestHistoryAgainstFullImages() {
     SnapshotStore store;
     std::mt19937 random(0x70a11bac);
@@ -221,6 +247,7 @@ int main() {
     TestBatchCallbacksAndFailures();
     TestEvictedSourcesAndSlotReuse();
     TestOnlyLaterWritesNeedRestoring();
+    TestSparseSourceLookup();
     TestHistoryAgainstFullImages();
     TestConsumedMarksAcrossSnapshotBoundaries();
     std::cout << "snapshot store: ok\n";

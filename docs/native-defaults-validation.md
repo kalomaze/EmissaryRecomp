@@ -73,3 +73,13 @@ A fresh matched 24-capture batch tests `6afee6a` using the same host, affinity, 
 | 1f | p99 | 6.447443 | 4.717122 | 26.84% |
 
 Recording 128 remains slower at 1f: Dolphin 3.899161 ms, recomp 4.036787 ms (3.53% more time). The aggregate 1f lead remains small; this second batch does not meet the requirement to win every tested recording. Differences between batches do not isolate the cost of the guard fixes. Detailed results: [current-head timing](native-defaults-timing-current.json).
+
+## Sparse snapshot source lookup
+
+Snapshot restore now uses binary search in sorted delta indices when few blocks still need a source, retaining the scan for dense cases. Both paths select the newest saved source at or before the target; unresolved blocks still come from the base image. No guest-state checks or snapshot coverage are removed.
+
+The candidate matches every source decision in a captured 1,197-restore workload. Existing randomized history/eviction tests and a targeted sparse-hit/base-fallback test pass on x86 and as AArch64 binaries under QEMU, in default and lean configurations. Three x86 recordings (001/064/128, 300 frames each, one redo) pass checksums and native differential checks with all 2,682 snapshot operations verified.
+
+In a 16-capture paired experiment on recording 128, mean restore time falls from 122.96 to 101.79 microseconds. Mean 1f frame time is 3.970035 versus 3.897731 ms; 0f is 1.988631 versus 1.997024 ms. Restore cost improves in every candidate repeat, but total frame-time variation exceeds the small aggregate difference. This is evidence for the narrower lookup optimization, not proof of an across-the-board Dolphin win. [Paired evidence](snapshot-lookup-validation.json).
+
+The two preceding guard fixes also pass all seven native/interpreter tests in both lean and flat AArch64 builds under QEMU (14 tests). Native ARM replay and timing validation remains pending because the GB10 endpoint refuses SSH. The emulated results are additional CPU evidence, not a replacement for native validation.

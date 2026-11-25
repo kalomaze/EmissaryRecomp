@@ -2,6 +2,7 @@
 #include "brawl_snapshot_jobs.h"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -186,11 +187,24 @@ public:
         size_t remaining=c.flagged.size();
         for(size_t index=target;;index=(index+Capacity-1)%Capacity) {
             const auto& slot=c.slots[index];
-            for(size_t i=0;i<slot.count;++i) {
-                const uint32_t key=slot.indices[i];
-                if(!c.needsSource[key])continue;
-                c.needsSource[key]=0;--remaining;
-                c.restoreKeys.push_back(key);c.restoreSources.push_back({index,i});
+            // Once only a few sources remain, search the sorted delta indices
+            // instead of scanning every saved block in each older snapshot.
+            if(remaining*(std::bit_width(slot.count)+1)<slot.count) {
+                std::erase_if(c.flagged,[&](uint32_t key){return !c.needsSource[key];});
+                for(uint32_t key:c.flagged) {
+                    const auto* begin=slot.indices.get();
+                    const auto* found=std::lower_bound(begin,begin+slot.count,key);
+                    if(found==begin+slot.count || *found!=key)continue;
+                    c.needsSource[key]=0;--remaining;
+                    c.restoreKeys.push_back(key);c.restoreSources.push_back({index,size_t(found-begin)});
+                }
+            } else {
+                for(size_t i=0;i<slot.count;++i) {
+                    const uint32_t key=slot.indices[i];
+                    if(!c.needsSource[key])continue;
+                    c.needsSource[key]=0;--remaining;
+                    c.restoreKeys.push_back(key);c.restoreSources.push_back({index,i});
+                }
             }
             if(!remaining || index==c.Oldest())break;
         }
