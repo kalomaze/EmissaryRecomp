@@ -253,3 +253,6 @@ The debugger intentionally quits after 24 observations, so the driver's subseque
 
 
 A follow-up read watch, with snapshot-copy/comparison stacks filtered, observes a memory-to-locked-cache load through `8015D8B4`, `801A4204`, `801AE31C` and `801B21E8`. The 24 accepted watch stops also include stores; the `PPC_WriteSpr` memcpy return sites distinguish load (`EF998B`) from store (`EF98D6`) in this binary. These observations must not all be counted as guest reads. The region has a guest consumer and is not established as dead data, so it remains in snapshot coverage. The bounded trace does not resolve downstream gameplay/rendering relevance or other address aliases. Counts and artifact identities are included in the writer receipt above.
+
+
+Inspection of the hash-verified private production translation further places this consumer in matrix processing: `801A4204` calls PSMTXConcat, PSMTXConcatArray and PSMTXInverse; its caller `801AE31C` also calls CalcView_LC (`801A3D68`). This supports a graphics-matrix explanation for the observed chain, but is not proof that all downstream consumers are graphics-only. The selected function hashes and direct-call inventory are recorded in the observation receipt; generated guest source remains private. No snapshot exclusions or runtime changes follow from this attribution.

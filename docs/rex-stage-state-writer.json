@@ -42,5 +42,72 @@
       "watch-stage-reader-filtered.gdb": "9c4d044fd0d62b772f1424d552c14de71b704d6edff825d04cb15c2e6d3a9f38",
       "watch-stage-reader-filtered-driver.py": "ee85f1e2ad0e108a3666eab449139f0a814a95e9d2698b9bb104e1300e50955d"
     }
+  },
+  "consumer_source_audit": {
+    "method": "Extract selected functions from private production source bundle; verify per-entry SHA-256 before inspection. Guest code remains private.",
+    "functions": {
+      "0x801ae31c": {
+        "sha256": "8b7c7e5eb6233205798200800088cefd0deeeeeb08138fb8d606c2abb0e5d20f",
+        "direct_calls": [
+          "8015D804",
+          "8015D874",
+          "801A3A44",
+          "801A3D68",
+          "801A4204",
+          "801AAB18",
+          "801D7718"
+        ]
+      },
+      "0x801b21e8": {
+        "sha256": "d01f0cea7f02a477eea371f59ca4fb3f51e00e9f2a15cc841f04b90b4d95dbd5",
+        "direct_calls": [
+          "8018EDF8",
+          "80197A40",
+          "80197AFC",
+          "801A64B0",
+          "801AB3C4",
+          "801AE08C",
+          "801AE2E8",
+          "801AE31C",
+          "801AF9F4",
+          "801B17E0",
+          "801B6AE8"
+        ]
+      },
+      "0x801a4204": {
+        "sha256": "33f2fefab4938dbe890303b4334f3e2f80c6c70b9d950a21d0a99d1ec1e6e005",
+        "direct_calls": [
+          "8015D8B4",
+          "8015D8BC",
+          "801627CC",
+          "8018EDF8",
+          "801D76BC",
+          "801D7AE4",
+          "801E0CC0",
+          "801EC1B8",
+          "801EC284",
+          "801EC41C",
+          "803F1338"
+        ]
+      },
+      "0x801ae08c": {
+        "sha256": "9f087cb678a79122c69300a38aa9d58d174e9aae38c506930b780e87ff0c9fb8",
+        "direct_calls": [
+          "8015D804",
+          "8015D874",
+          "8015D8C0",
+          "801A4E50",
+          "801A5414",
+          "801AB384",
+          "801D76BC"
+        ]
+      },
+      "0x8015d8b4": {
+        "sha256": "cce5b089bab3d65194aaf340a63d7a4d9cf5c27281ce7d76686fa93eebc120eb",
+        "direct_calls": []
+      }
+    },
+    "finding": "801A4204 calls PSMTXConcat, PSMTXConcatArray and PSMTXInverse; caller 801AE31C also calls CalcView_LC at801A3D68. This supports matrix-processing attribution.",
+    "limit": "Call-graph evidence does not prove every downstream consumer is graphics-only or resolve other differing granules."
   }
 }
