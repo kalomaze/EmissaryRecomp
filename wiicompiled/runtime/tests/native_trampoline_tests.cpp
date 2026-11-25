@@ -7,9 +7,9 @@
 #include <iterator>
 #include <utility>
 
-extern "C" const uint32_t g_mkwGuardedFunctionCount = 3;
-extern "C" const uint32_t g_mkwGuardedFunctionStarts[] = {0x80007000, 0x80007020, 0x80007040};
-extern "C" { uint8_t g_mkwGuestCodePatched[3] = {}; }
+extern "C" const uint32_t g_mkwGuardedFunctionCount = 4;
+extern "C" const uint32_t g_mkwGuardedFunctionStarts[] = {0x80007000, 0x80007020, 0x80007040, 0x80007060};
+extern "C" { uint8_t g_mkwGuestCodePatched[4] = {}; }
 extern "C" const uint32_t g_mkwInlinedLeafCount = 1;
 extern "C" const uint32_t g_mkwInlinedLeaves[] = {1, 0};
 
@@ -41,7 +41,7 @@ static void TestOriginalTrampoline() {
     TranslatedFunctionRegistry::Register(std::move(info));
     TranslatedFunctionRegistry::Finalize();
     GuestCodePatch::RegisterOriginalNative(original, OriginalNative);
-    GuestCodePatch::Protect(original, original + sizeof(body), "original trampoline test");
+    GuestCodePatch::Protect(original, 0x80007060, "original trampoline test");
     Memory::Write32(original, branch(original, wrapper));
     Memory::Write32(trampoline, body[0]);
     Memory::Write32(trampoline + 4, branch(trampoline + 4, original + 4));
@@ -73,6 +73,28 @@ static void TestOriginalTrampoline() {
     assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == nullptr);
     Memory::Write32(trampoline + 4, branch(trampoline + 4, original + 4));
     assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == OriginalNative);
+    // Ordinary writes invalidate inline dependencies at the same Sync boundary as
+    // translated calls. Restoring that leaf must allow the original shortcut again.
+    const uint32_t leafWord = Memory::Read32(0x80007020);
+    Memory::Write32(0x80007020, 0x60000000);
+    assert(GuestCodePatch::NoteWrite(0x80007020));
+    GuestCodePatch::Sync();
+    assert(g_mkwGuestCodePatched[0] && g_mkwGuestCodePatched[1]);
+    assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == nullptr);
+    Memory::Write32(0x80007020, leafWord);
+    GuestCodePatch::ResetPristine(0x80007020, 0x80007040);
+    assert(!g_mkwGuestCodePatched[1]);
+    assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == OriginalNative);
+
+    // Relinking the leaf must not erase a pending write to another function on
+    // that page, or replace the neighbor's pristine bytes with its patched bytes.
+    Memory::Write32(0x80007040, 0x60000000);
+    assert(GuestCodePatch::NoteWrite(0x80007040));
+    assert(!g_mkwGuestCodePatched[2]);
+    GuestCodePatch::ResetPristine(0x80007020, 0x80007040);
+    GuestCodePatch::Sync();
+    assert(g_mkwGuestCodePatched[2]);
+
     // An unchanged native body may embed a leaf which a mod replaces separately.
     // The entry detour is allowed, but must not hide this dependency invalidation.
     GuestCodePatch::InterpretReplacedModule(0x80007020, 0x80007040, "inlined leaf replacement test");

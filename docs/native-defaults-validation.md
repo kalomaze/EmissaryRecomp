@@ -52,3 +52,11 @@ A synthetic replacement regression failed in cached, classic and verification in
 Three x86 one-redo replays (001/064/128, 120 output frames each) also pass original recording checksums and native differential checks, with all 1,062 snapshot operations verified. Tested binary SHA-256: `d53de4dd4f2346d1b90fc770f5b217ac8455d952a6d182e26d064a489dfb7dc3`. These are correctness runs, not new performance measurements.
 
 ARM verification of this additional change is pending: the previously used GB10 SSH endpoint refused connections during validation. Earlier ARM results above apply to the earlier safety checkpoint and helper fuzzers.
+
+## Partial-page code restoration regression
+
+Code protection and module relinking previously refreshed pristine bytes for an entire page even when only part of that page belonged to the requested range. That could adopt a neighboring patch as pristine, and a partial-page reset could discard a pending notification for neighboring code. Pristine refreshes now preserve bytes outside the range on already-known pages; partial-page resets retain a pending comparison. Baked-word restoration is also limited to the requested range.
+
+Regression coverage includes an ordinary code write plus `Sync`, rejecting the native trampoline while its inline dependency is patched, restoring that dependency with `ResetPristine`, accepting the trampoline again, and detecting a pending patch to another function on the same page after the reset. All seven tests pass in lean and flat x86 builds. This additional change still requires ARM validation.
+
+Three x86 one-redo recordings (001/064/128, 120 frames each) pass original checksums with no reported native differential failures, and all 1,062 snapshot operations verify. Tested binary SHA-256: `32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a`. These runs do not establish a performance change.

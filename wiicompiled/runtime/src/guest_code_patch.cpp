@@ -400,14 +400,20 @@ void HoldBakedLocked(uint32_t start, uint32_t end);
 void SnapshotLocked(uint32_t start, uint32_t end) {
     for (uint32_t page = start & ~(kPage - 1); page < end; page += kPage) {
         auto& slot = g_pristine[page];
-        if (!slot) slot = std::make_unique<std::array<uint8_t, kPage>>();
+        const bool fresh = !slot;
+        if (fresh) slot = std::make_unique<std::array<uint8_t, kPage>>();
         g_seen.erase(page);
-        if (Memory::Contains(page, kPage)) std::memcpy(slot->data(), Memory::GetPointer(page, kPage), kPage);
+        // A module relink can share an edge page with unrelated patched code. Only
+        // refresh the requested bytes; never bless neighboring patches as pristine.
+        const uint32_t first = fresh ? page : std::max(start, page);
+        const uint32_t last = fresh ? page + kPage : std::min(end, page + kPage);
+        if (Memory::Contains(first, last - first))
+            std::memcpy(slot->data() + first - page, Memory::GetPointer(first, last - first), last - first);
     }
     // The pristine state of baked code is the baked word: what the translation was made from. Once the code handler
     // has run (released), freshly linked code gets the words in memory too, as the handler would write them again
     // at its next pass: memory then equals the pristine copy, so a different word the handler writes is noticed.
-    ForEachBaked(start & ~(kPage - 1), end, [](uint32_t address, uint32_t stored) {
+    ForEachBaked(start, end, [](uint32_t address, uint32_t stored) {
         const auto found = g_pristine.find(address & ~(kPage - 1));
         if (found != g_pristine.end()) std::memcpy(found->second->data() + (address & (kPage - 1)), &stored, 4);
         if (g_bakedReleased && Memory::Contains(address, 4)) std::memcpy(Memory::GetPointer(address, 4), &stored, 4);
@@ -756,7 +762,14 @@ void ResetPristine(uint32_t start, uint32_t end) {
         }
         RemarkInliningCallersIn(start, end);
         for (uint32_t page = start & ~(kPage - 1); page < end; page += kPage) {
-            g_dirty.erase(page);
+            if (page < start || end - page < kPage) {
+                // Resetting this range must not discard unprocessed writes to its
+                // neighbors. Recompare the edge page against the preserved bytes.
+                g_dirty.insert(page);
+                g_anyDirty.store(true, std::memory_order_release);
+            } else {
+                g_dirty.erase(page);
+            }
             const uint32_t index = page / kPage;
             g_pendingPages[index / 32].fetch_and(~(1u << (index % 32)), std::memory_order_relaxed);
             DirtyVariantsOnPageLocked(page);  // the relink copied code without the write trap
