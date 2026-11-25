@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string_view>
 #include "brawl_dirty_memory.h"
+#include "brawl_mark_observer.h"
 #include "brawl_write_watch.h"
 #include "brawl_snapshot_store.h"
 #include <iostream>
@@ -53,6 +54,32 @@ static void TestSingleLoads() {
 // as the multiplier in ps_muls0. Exercise the actual interpreter/registry
 // boundary, including a paired value and the scalar f1 return.
 static void ReturnScale(CpuContext* ctx) { ctx->fpr[1].d = 0.5; }
+// A verifier must see code-write marks even when no rollback snapshot tracks the page yet.
+static void TestObservedCodeMarks() {
+#if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
+    constexpr uint32_t code = 0x80070000u;
+    constexpr uint32_t block = (code & 0x3FFFFFFFu) >> 6;
+    assert(BrawlDirtyMemory::trackedPages[block >> 10].load() == 0);
+    Memory::Write32(code, 0x38600001); // li r3,1
+    Memory::Write32(code + 4, 0x4e800020); // blr
+    const auto run = [&](uint32_t expected) {
+        CpuContext ctx{};
+        ctx.lr = 0x80006000;
+        PpcInterpreter::Run(&ctx, code);
+        assert(ctx.gpr[3] == expected);
+    };
+    run(1); // warm the code cache before the observed write
+    {
+        const BrawlDirtyMemory::ScopedMarkObservation observeMarks;
+        Memory::Write32(code, 0x38600002); // code modified by a Gecko C0 call
+        run(2);
+        run(2);
+        assert(BrawlDirtyMemory::leanBlocks[block] != 0);
+    }
+    run(2);
+#endif
+}
+
 // Discontiguous followed branches need independent code checks. Exercise both
 // the common inline checks and every overflow check, with edits in each segment
 // and epoch/consume invalidation after the cache has been warmed.
@@ -415,6 +442,7 @@ int main() {
     TranslatedFunctionRegistry::Finalize();
     TestOnlineHooksAndContinuation();
     TestSnapshotCodeRestoration();
+    TestObservedCodeMarks();
     TestDiscontiguousCodeChecks();
     TestCompactedJumpSources();
     TestSequencePairs();

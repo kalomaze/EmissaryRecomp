@@ -76,19 +76,20 @@ namespace {
 
 constexpr uint32_t kSamples = 96;           // per AX frame (both callbacks loop 96 times)
 
-// AXFX_EXACT=1: the reverb's samples loop replays Broadway's float operations exactly (Process), so guest memory
-// matches the translated original bit for bit; BRAWL_HLE_VERIFY, which compares against it, implies it, and so must
-// any cross-build MEM1/MEM2 comparison (det-hash images). Otherwise the fast loop runs (ProcessFast): audio never
-// feeds gameplay (rollback and replay checksums are GameplayHash), so the reverb only has to sound right.
+// Audio buffers and delay lines are guest memory: arbitrary mods can read them.
+// Use Broadway-exact processing by default. Approximate host-float processing
+// requires AXFX_FAST=1; AXFX_EXACT=1 and verification always take precedence.
 bool ExactAudio() {
     static const bool exact = [] {
         const char* exactEnv = std::getenv("AXFX_EXACT");
+        const char* fastEnv = std::getenv("AXFX_FAST");
         const char* verifyEnv = std::getenv("BRAWL_HLE_VERIFY");
         const bool asked = exactEnv && std::strcmp(exactEnv, "1") == 0;
+        const bool fast = fastEnv && std::strcmp(fastEnv, "1") == 0;
         const bool verify = verifyEnv && *verifyEnv && std::strcmp(verifyEnv, "0") != 0;
-        RT_LOGF(RT_TAG_AUDIO, "axfx: %s reverb%s\n", asked || verify ? "exact (Broadway float)" : "fast (host float)",
+        RT_LOGF(RT_TAG_AUDIO, "axfx: %s reverb%s\n", asked || verify || !fast ? "exact (Broadway float)" : "fast (host float)",
                 verify && !asked ? " for BRAWL_HLE_VERIFY" : "");
-        return asked || verify;
+        return asked || verify || !fast;
     }();
     return exact;
 }
@@ -478,8 +479,8 @@ struct Plan {
 // earlier sample wrote, provided its lines 1 and 2 are at least 96 long (required for an asynchronous call).
 //
 // AXFX_ASYNC selects the mode:
-// - 0: off. The default where the translation is not vanilla's EABI one (P+).
-// - 1: on. Vanilla's default.
+// - 0: off (default). Mods may access effect buffers outside the known join sites.
+// - 1: on (explicit opt-in for a workload whose access paths have been audited).
 // - check: no worker. Each job runs at its join. From its hand-over until then its written ranges hold a poison
 //   pattern, so any early reader gets garbage, and every range it touches is checked unchanged at the join, so any
 //   writer is counted ("[audio] axfx async check").
@@ -704,7 +705,7 @@ void Process(Plan& p) {
     std::memcpy(p.f, f, sizeof(f));
 }
 
-// ---- The fast samples loop (the default; AXFX_EXACT=1 runs Process) ----
+// ---- Approximate samples loop (explicit AXFX_FAST=1 only) ----
 // The same algorithm, operations and order in plain host single precision, with subnormals flushed to zero for the
 // call (no denormal stalls while a tail decays to silence) and a saturating float-to-int output. For single-precision
 // operands Broadway's fmuls/fadds/fsubs (an exact double product or sum, then one rounding to single) equal IEEE single
@@ -951,7 +952,7 @@ void ProcessFast(Plan& p) {
     std::memcpy(p.f, regs, sizeof(regs));
 }
 
-// ---- The fast samples loop in explicit vectors (the default) ----
+// ---- Approximate samples loop in explicit vectors ----
 // ProcessFast's Step<8> is fully unrolled by the compiler and stays scalar (IBS: 1% of its ops 8-wide), and any line
 // position wrapping within the next 8 samples sends it to Step<1>, sample by sample. ProcessFastV runs the same
 // per-sample operations, operand for operand (so the same IEEE single results, under the same flush-to-zero setting:
@@ -2396,7 +2397,9 @@ namespace Async {
 Mode GetMode() {
     static const Mode mode = [] {
         const Config& config = GetConfig();
-        Mode m = func_801D7AE4_eabi != nullptr ? Mode::kOn : Mode::kOff;  // vanilla's EABI translation: on; P+: off
+        // Mod code may inspect or write effect buffers between the known join sites.
+        // An EABI build alone does not establish that no such code can run.
+        Mode m = Mode::kOff;
         const char* v = std::getenv("AXFX_ASYNC");
         if (v != nullptr && *v != '\0')
             m = std::strcmp(v, "0") == 0 ? Mode::kOff : (std::strcmp(v, "check") == 0 ? Mode::kCheck : Mode::kOn);
@@ -3031,6 +3034,11 @@ void Dispatch(CpuContext* ctx, Stats& stats, void (*wrapper)(CpuContext*), void 
     // A mod that patched this function's guest code gets it run in the interpreter, as the translated guard does.
     // Translated or interpreted guest code may touch anything a pending job does: join first (also below).
     static const int64_t guard = GuardIndexOf(Address);
+    if (guard < 0) [[unlikely]] {
+        Async::Join();
+        original(ctx);
+        return;
+    }
     if (guard >= 0 && g_mkwGuestCodePatched[guard]) [[unlikely]] {
         Async::Join();
         wrapper(ctx);

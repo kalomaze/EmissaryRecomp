@@ -4,7 +4,9 @@
 // G3D_NATIVE=2 checks every native DrawResMdlDirectly call against the translated one, in the same frame: the native
 // path runs first with the recorder suppressing GPU effects (guest texture-object writes are journaled and restored),
 // then the translated function runs for real while recorded. The two event streams, and the
-// G3DState bytes each leaves in guest memory, must be identical. The recorder sits at the GX HLE entry points both
+// G3DState bytes each leaves in guest memory, and complete CPU register results must be identical. This does not
+// check every guest memory write (notably dead stack bytes), so a pass alone cannot certify arbitrary-mod safety.
+// Native drawing is opt-in because it currently fails the register comparison. The recorder sits at the GX HLE entry points both
 // paths reach: guest FIFO writes, GXCallDisplayList, and the GX calls nw4r g3d makes.
 #include <cstdint>
 #include <cstring>

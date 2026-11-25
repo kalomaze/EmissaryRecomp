@@ -14,6 +14,7 @@
 #include "brawl_online_core.h"
 #include "brawl_rollback.h"
 #include "brawl_dirty_memory.h"
+#include "brawl_mark_observer.h"
 #include "brawl_online_ipc.h"
 
 // Guest comparisons must preserve unordered results. P+ disables Dreamland's
@@ -1626,7 +1627,7 @@ struct BlockCache {
         for (uint32_t s = 0; s < b.segments; ++s)
             for (uint32_t m = b.segment[s].firstMark; m <= b.segment[s].lastMark; ++m) {
                 if (!marks[m].load(std::memory_order_relaxed)) continue;
-                if (!tracked) {
+                if (!tracked && BrawlDirtyMemory::markObservers == 0) {
                     marks[m].store(0, std::memory_order_relaxed);
                     std::atomic_thread_fence(std::memory_order_seq_cst);
                     ++claims;

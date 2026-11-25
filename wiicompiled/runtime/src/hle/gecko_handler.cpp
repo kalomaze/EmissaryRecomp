@@ -26,6 +26,7 @@
 #include "abi_bridge.h"
 #include "audio/ax_dsp.h"
 #include "brawl_dirty_memory.h"
+#include "brawl_mark_observer.h"
 #include "memory.h"
 #include "ppc_interpreter.h"
 #include "runtime_log.h"
@@ -806,6 +807,7 @@ void VerifyPass(CpuContext* ctx) {
     // The AX mix worker stores each AI frame into guest memory from its own thread, and only this thread starts a
     // mix (as hle/g3d_calc.cpp's verification): idle, it cannot land between the captures below.
     AxDspHle::JoinMixWorker();
+    const BrawlDirtyMemory::ScopedMarkObservation observeMarks;
 #if MKW_LEAN_MEMORY
     capture(before, marksBefore);
 #else

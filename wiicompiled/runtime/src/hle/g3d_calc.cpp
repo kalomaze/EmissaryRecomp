@@ -9,12 +9,11 @@
 // world-matrix arrays. So each native writes exactly the guest bytes its translated original writes, the dead stack
 // below r1 included (its own frame, saved registers and stack temporaries, and its callees' frames: it reaches every
 // callee through the callee's guarded wrapper with the original's r1 and return address), leaves exactly the same
-// rollback dirty marks, and leaves r1, r2, r13, the non-volatile registers and LR as the original does. The void
-// functions' volatile registers are not reproduced (as for the native draw, g3d_native.cpp): compiled callers never
-// read them. The keyframe readers return a float in f1; their vanilla (EABI) translated callers reload r3, r4, f1 and
-// f2 from the context, so those natives write back those four with the original's values, and no other volatile
-// register (the P+ translation also writes back r0, r5, r6, f0-f11, CR0 and XER, scratch to every caller). Floating point
-// uses the translated code's own helpers (isa/ppc_isa_float.h), or one host FMA per lane where those compute the same
+// rollback dirty marks and every observable register in context translations. A mod may inspect volatile
+// registers after a call. Skinning, CalcView_LC, the FVS readers and the light slot setter do not yet preserve those
+// and use translated
+// execution. EABI-specialized translations keep their ABI call contract. Floating point uses the translated
+// helpers or host operations only where they compute the same
 // bits (no NaN result), with the helpers' path for anything else.
 //
 // MKW_NATIVE_BODY (abi_bridge.h) makes the translator's wrapper func_X tail-call the native after its guest code guard
@@ -39,6 +38,7 @@
 #include "memory.h"
 #include "ppc_runtime.h"
 #include "runtime_log.h"
+#include <aurora/aurora.h>
 
 #include <algorithm>
 #include <array>
@@ -173,6 +173,10 @@ struct Settings {
             calcViewFull = list.find(",cvfull,") == std::string::npos;
         }
         if (const char* v = std::getenv("G3D_CALC_CVGENERIC")) calcViewGeneric = v[0] == '1';
+        // Mod code can observe volatile registers. These implementations do not reproduce them yet.
+        // An empty G3D_CALC_OFF must not accidentally enable them.
+        off[kSkinning] = off[kCalcViewLC] = off[kKeyFVS32] = off[kKeyFVS48] = true;
+        off[kKeyFVS96] = off[kLightSlot] = true;
     }
 };
 const Settings& Config() {
@@ -523,6 +527,8 @@ template <typename Writes, typename Native>
 void Verify(Fn fn, CpuContext* ctx, void (*body)(CpuContext*), Writes writes, Native native) {
     thread_local std::vector<uint8_t> savedMarks, origMarks, nativeMarks, before, afterOrig, afterNative,
         marginBefore, marginAfter;
+    // Retire EFB downloads before capturing guest bytes, dirty marks, or CPU state.
+    aurora_wait_for_frame_worker();
     Counters& n = g_counters[fn];
     Ranges ranges;
     if (!LeanReady() || !writes(*ctx, ranges) || !ranges.Add(ctx->gpr[1] - 0x800u, 0x808u)) {
@@ -588,10 +594,36 @@ void Verify(Fn fn, CpuContext* ctx, void (*body)(CpuContext*), Writes writes, Na
     SaveMarks(spans, nativeMarks);
     Capture(ranges, afterNative);
     if (watch != 0) std::memcpy(watched[2], Window() + Canonical(watch), 64);
-    char what[160] = "";
+    char what[600] = "";
     bool same = kFnCheck[fn] == kAbiStateAndResults ? SameAbiStateAndResults(orig, *ctx, what, sizeof(what))
               : kFnCheck[fn] == kAbiStateR3R4F1     ? SameAbiStateR3R4F1(orig, *ctx, what, sizeof(what))
                                                     : SameAbiState(orig, *ctx, what, sizeof(what));
+    // Context translations expose the entire register file to arbitrary mod callers.
+    // EABI-specialized translations retain their existing ABI-state comparison.
+    if (same && !EabiTranslation()) {
+        const CpuContext& o = orig;
+        const CpuContext& v = *ctx;
+        size_t at = 0;
+        const auto add = [&](const char* format, auto... values) {
+            if (at < sizeof(what)) at += static_cast<size_t>(std::snprintf(what + at, sizeof(what) - at, format, values...));
+        };
+        add("%s", "VOL ");
+        const size_t empty = at;
+        for (uint32_t r = 0; r < 32; ++r)
+            if (v.gpr[r] != o.gpr[r]) add("r%u %08X/%08X ", r, o.gpr[r], v.gpr[r]);
+        for (uint32_t f = 0; f < 32; ++f)
+            if (v.fpr[f].raw != o.fpr[f].raw)
+                add("f%u %016llX/%016llX ", f, static_cast<unsigned long long>(o.fpr[f].raw),
+                    static_cast<unsigned long long>(v.fpr[f].raw));
+        if (v.cr != o.cr) add("cr %08X/%08X ", o.cr, v.cr);
+        if (v.ctr != o.ctr) add("ctr %08X/%08X ", o.ctr, v.ctr);
+        if (v.xer != o.xer) add("xer %08X/%08X ", o.xer, v.xer);
+        if (v.fpscr != o.fpscr) add("fpscr %08X/%08X ", o.fpscr, v.fpscr);
+        for (uint32_t q = 0; q < 8; ++q)
+            if (v.gqr[q] != o.gqr[q]) add("gqr%u %08X/%08X ", q, o.gqr[q], v.gqr[q]);
+        if (at == empty) what[0] = '\0';
+        else same = false;
+    }
     if (same && afterNative != afterOrig) {
         same = false;
         size_t at = 0;
@@ -671,6 +703,59 @@ void Verify(Fn fn, CpuContext* ctx, void (*body)(CpuContext*), Writes writes, Na
     Restore(ranges, afterOrig);
     RestoreMarks(spans, savedMarks, origMarks, nativeMarks);
 }
+
+// Exercise MTX44Copy against the actual generated guest body, including aliased matrices and arbitrary float
+// bits. The scratch bytes and dirty marks are restored before the live call. This is diagnostic-only, like the
+// PSMTX fuzzer: G3D_CALC=2 BRAWL_HLE_FUZZ=N. A fixed seed makes failures reproducible across architectures.
+template <typename Writes, typename Native>
+void FuzzMtx44(const CpuContext& live, void (*body)(CpuContext*), Writes writes, Native native) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    const char* value = std::getenv("BRAWL_HLE_FUZZ");
+    const uint32_t trials = value ? static_cast<uint32_t>(std::min<unsigned long>(std::strtoul(value, nullptr, 10), 10000)) : 0;
+    constexpr uint32_t scratch = 0x93FFD000u, bytes = 0x2000u;
+    if (trials == 0 || !LeanReady() || !PlainRange(scratch, bytes)) return;
+    aurora_wait_for_frame_worker();
+    AxDspHle::JoinMixWorker();
+    Ranges range;
+    range.Add(scratch, bytes);
+    MarkSpans spans;
+    LocalSpans(range, spans);
+    std::vector<uint8_t> saved, marks;
+    Capture(range, saved);
+    SaveMarks(spans, marks);
+    uint32_t seed = 0x62C04179u;
+    const auto next = [&]() {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        return seed;
+    };
+    for (uint32_t trial = 0; trial < trials; ++trial) {
+        CpuContext c = live;
+        for (uint32_t i = 0; i < bytes; i += 4) Store32(Window() + Canonical(scratch + i), next());
+        for (auto& r : c.gpr) r = next();
+        for (auto& f : c.fpr) f.raw = (uint64_t{next()} << 32) | next();
+        c.gpr[1] = scratch + 0x1800u;
+        c.gpr[4] = scratch + 0x100u;
+        c.gpr[3] = scratch + 0xC0u + 4u * (next() % 33u);
+        c.cr = next();
+        c.ctr = next();
+        c.xer = next();
+        c.lr = next();
+        c.gqr[0] = trial % 8u == 0 ? 0x04000400u : 0u;
+        Verify(kMtx44Copy, &c, body, writes, native);
+    }
+    Restore(range, saved);
+    size_t offset = 0;
+    for (int i = 0; i < spans.count; ++i) {
+        std::memcpy(BrawlDirtyMemory::leanBlocks + spans.items[i].firstBlock, marks.data() + offset,
+                    spans.items[i].blocks);
+        offset += spans.items[i].blocks;
+    }
+    RT_LOGF(RT_TAG_GX, "[g3dcalc-fuzz] mtx44copy: completed %u trials, seed 62C04179\n", trials);
+}
 #endif  // MKW_LEAN_MEMORY
 
 // Dispatch for one native: counts, G3D_CALC / G3D_CALC_OFF, verify.
@@ -695,6 +780,7 @@ template <typename Writes, typename Native>
         }
         Bump(g_counters[fn].declined);
     } else if (s.mode == kVerify && !s.off[fn]) {
+        if (fn == kMtx44Copy) FuzzMtx44(*ctx, body, writes, native);
         Verify(fn, ctx, body, writes, native);
         return;
     }
@@ -1510,15 +1596,16 @@ inline void CopyPsqRows(uint8_t* d, const uint8_t* s, uint32_t rows) {
 }
 
 // math::MTX44Copy (0x80162C04, frameless): eight psq_l, then eight psq_st (all loads first, so an overlap reads the
-// source as it was). Per lane the psq_st rule; the stores' marks are the pairs from dst to dst + 56. Writes back f1 and
-// f2 (psq_l's pairs at src + 8 and src + 16), as the vanilla translation does.
+// source as it was). Per lane the psq_st rule; the stores' marks are the pairs from dst to dst + 56. Leaves all eight
+// loaded pairs in f0-f7, including registers a mod caller may inspect.
 bool Mtx44CopyNative(CpuContext* ctx) {
     const uint32_t dst = ctx->gpr[3], src = ctx->gpr[4];
     if (ctx->gqr[0] != 0 || !LeanReady() || !OneView(src, 64u) || !PlainRange(dst, 64u)) return false;
     uint8_t* const m = Window();
     const uint8_t* const s = m + Canonical(src);
     const I4 rows[4] = {LoadWords(s), LoadWords(s + 16), LoadWords(s + 32), LoadWords(s + 48)};
-    const double f1 = PpcLoadPairPsqFloatFromHostInline(s + 8), f2 = PpcLoadPairPsqFloatFromHostInline(s + 16);
+    double pair[8];
+    for (uint32_t k = 0; k < 8; ++k) pair[k] = PpcLoadPairPsqFloatFromHostInline(s + 8u * k);
     const uint32_t c = Canonical(dst);
     for (uint32_t row = 0; row < 4; ++row) {
         const B16 b = GuestBytes(PsqStoreRule(rows[row]));
@@ -1526,62 +1613,65 @@ bool Mtx44CopyNative(CpuContext* ctx) {
     }
     MarkPair(c);
     MarkPair(c + 56u);
-    PpcSetPairedFprInline(ctx->fpr[1], f1);
-    PpcSetPairedFprInline(ctx->fpr[2], f2);
+    for (uint32_t k = 0; k < 8; ++k) PpcSetPairedFprInline(ctx->fpr[k], pair[k]);
     return true;
 }
 
 // Camera::GetCameraMtx (0x801A7DBC; r3 = Camera (by reference), r4 = output): a 16-byte frame (back chain, LR, r31,
 // r30); with an output and a camera (lwz r3): UpdateCameraMtx (0x801A81D4, through its wrapper with the original's r1,
 // LR, r3 and CR) unless the matrix is current (flags @ +0x70 bit 3), then PSMTXCopy (inlined) of the camera matrix (@
-// +0) to the output: six psq_l/psq_st pairs, each pair's load before its store, so overlapping ranges (or a callee that
-// left the output not plain) take the translated helpers pair by pair. Writes back r3 (the camera data), r4 (the
-// output), f1 and f2 (psq_l's pairs at +8 and +16) as the vanilla translation does; nothing without an output/camera.
+// +0) to the output. The native declines camera updates, and copies an already-current matrix with the same
+// interleaved psq loads/stores and complete register results as the context translation.
 bool CameraMtxNative(CpuContext* ctx) {
     static const int32_t kGuardCopy = GuardIndex(0x801EC184u);
     const uint32_t r1 = ctx->gpr[1], lr = ctx->lr, handle = ctx->gpr[3], out = ctx->gpr[4];
     if (ctx->gqr[0] != 0 || !LeanReady() || !CalleeUnpatched(kGuardCopy)) return false;
     const uint32_t sp = r1 - 16u;
-    const bool eabi = EabiTranslation();  // kFnEabiDeadSaveBytes: the callers' EABI entry saved r31/r30 as 0
+    if (!PlainRange(sp, 24u) || !OneView(handle, 4u) || Overlap(handle, 4u, sp, 24u)) return false;
+    if (out != 0) {
+        const uint32_t camera = GuestLoad32(handle);
+        if (!PlainRange(out, 48u) || Overlap(out, 48u, sp, 24u)) return false;
+        if (camera != 0 && (!OneView(camera, 0x74u) || Overlap(camera, 0x74u, sp, 24u) ||
+                            (GuestLoad32(camera + 0x70u) & 8u) == 0))
+            return false;
+        // Camera updates may call modded descendants that alter this frame or its saved registers. Keep that
+        // path in translated execution; the native handles already-current matrices without guest callees.
+    }
+    const bool eabi = EabiTranslation();
     MemoryInline::FlatWriteRam32(sp, r1);
     MemoryInline::FlatWriteRam32(sp + 20u, lr);
     MemoryInline::FlatWriteRam32(sp + 12u, eabi ? 0u : ctx->gpr[31]);
     MemoryInline::FlatWriteRam32(sp + 8u, eabi ? 0u : ctx->gpr[30]);
-    if (out == 0) return true;
-    const uint32_t cam = GuestLoad32(handle);
-    if (cam == 0) return true;
-    if ((GuestLoad32(cam + 0x70u) & 8u) == 0) {
-        uint32_t cr = ctx->cr;
-        SetCRResident(cr, ctx->xer, 0, static_cast<int32_t>(0), static_cast<int32_t>(0));  // rlwinm. of flags & 8
+    uint32_t cr = ctx->cr;
+    if (out == 0 || GuestLoad32(handle) == 0) {  // cmpwi of the output, then of the camera: equal
+        SetCRResident(cr, ctx->xer, 0, static_cast<int32_t>(0), static_cast<int32_t>(0));
         ctx->cr = cr;
-        ctx->gpr[1] = sp;
-        ctx->lr = 0x801A7DF8u;
-        if (func_801A81D4_eabi != nullptr)  // UpdateCameraMtx (r3: the handle), the entry the original calls
-            func_801A81D4_eabi(ctx, sp, handle);
-        else
-            func_801A81D4(ctx);
-        ctx->gpr[1] = r1;
-        ctx->lr = lr;
+        ctx->gpr[0] = lr;
+        return true;
     }
+    const uint32_t cam = GuestLoad32(handle);
+    const uint32_t current = GuestLoad32(cam + 0x70u) & 8u;
+    SetCRResident(cr, ctx->xer, 0, static_cast<int32_t>(current), static_cast<int32_t>(0));  // rlwinm. of flags & 8
+    ctx->cr = cr;
     if ((cam == out || !Overlap(cam, 48u, out, 48u)) && OneView(cam, 48u) && PlainRange(out, 48u)) {
         uint8_t* const m = Window();
         const uint8_t* const s = m + Canonical(cam);
-        const double f1 = PpcLoadPairPsqFloatFromHostInline(s + 8), f2 = PpcLoadPairPsqFloatFromHostInline(s + 16);
+        double pair[6];
+        for (uint32_t k = 0; k < 6; ++k) pair[k] = PpcLoadPairPsqFloatFromHostInline(s + 8u * k);
         const uint32_t c = Canonical(out);
         CopyPsqRows(m + c, s, 3);
         MarkPair(c);
         MarkPair(c + 40u);
-        PpcSetPairedFprInline(ctx->fpr[1], f1);
-        PpcSetPairedFprInline(ctx->fpr[2], f2);
+        for (uint32_t k = 0; k < 6; ++k) PpcSetPairedFprInline(ctx->fpr[k], pair[k]);
     } else {
         double pair[6];
         for (uint32_t k = 0; k < 6; ++k) {
             pair[k] = PPC_PsqLGqrInline<0u, 0u>(ctx, 0u, cam + 8u * k);
             PPC_PsqStGqrInline<0u, 0u>(ctx, 0u, out + 8u * k, pair[k]);
         }
-        PpcSetPairedFprInline(ctx->fpr[1], pair[1]);
-        PpcSetPairedFprInline(ctx->fpr[2], pair[2]);
+        for (uint32_t k = 0; k < 6; ++k) PpcSetPairedFprInline(ctx->fpr[k], pair[k]);
     }
+    ctx->gpr[0] = lr;
     ctx->gpr[3] = cam;
     ctx->gpr[4] = out;
     return true;
@@ -1591,19 +1681,32 @@ bool CameraMtxNative(CpuContext* ctx) {
 // entry: a 16-byte frame (back chain, LR, r31, r30); with an output and a camera, PSMTXIdentity (inlined: lfs 0.0
 // and 1.0 from r2-23492/-23496 and six psq_st of their paired forms, the translation's helpers in its order), then
 // six stfs of camera fields (0xCC, 0xD4, -0xD0, 0xD8) and constants (r2-24512, r2-24504), each lfs'd and stored with
-// FlatWriteFloat32's conversion. Writes back r3 (the output), f1 and f2 (the last lfs of each) as the translation.
+// FlatWriteFloat32's conversion. Leaves r0 (the LR reload), cr0 (its compare of the output, then of the camera), r3
+// (the output) and f0-f2 (the last lfs of each) as the original does; without an output or a camera, r0 and cr0 only.
 bool EnvTexMtxNative(CpuContext* ctx) {
     static const int32_t kGuardIdentity = GuardIndex(0x801EC158u);
     const uint32_t r1 = ctx->gpr[1], r2 = ctx->gpr[2], out = ctx->gpr[4];
     if (ctx->gqr[0] != 0 || !LeanReady() || !CalleeUnpatched(kGuardIdentity) || (out != 0 && !PlainRange(out, 48u)))
         return false;
     const uint32_t sp = r1 - 16u;
+    const uint32_t handle = ctx->gpr[3];
+    if (!PlainRange(sp, 24u) || !OneView(handle, 4u) || Overlap(handle, 4u, sp, 24u)) return false;
+    const uint32_t camera = out == 0 ? 0u : GuestLoad32(handle);
+    if (out != 0 && Overlap(out, 48u, sp, 24u)) return false;
+    if (camera != 0 && (!OneView(camera, 220u) || Overlap(camera, 220u, sp, 24u) ||
+                        !OneView(r2 - 24512u, 1024u) || Overlap(r2 - 24512u, 1024u, sp, 24u)))
+        return false;
     MemoryInline::FlatWriteRam32(sp, r1);
     MemoryInline::FlatWriteRam32(sp + 20u, ctx->lr);
     MemoryInline::FlatWriteRam32(sp + 12u, ctx->gpr[31]);
     MemoryInline::FlatWriteRam32(sp + 8u, ctx->gpr[30]);
-    if (out == 0) return true;
-    const uint32_t cam = GuestLoad32(ctx->gpr[3]);
+    ctx->gpr[0] = ctx->lr;
+    const uint32_t cam = out == 0 ? 0u : GuestLoad32(ctx->gpr[3]);
+    {
+        uint32_t cr = ctx->cr;
+        SetCRResident(cr, ctx->xer, 0, static_cast<int32_t>(cam), static_cast<int32_t>(0));  // 0 when no output
+        ctx->cr = cr;
+    }
     if (cam == 0) return true;
     uint8_t* const o = Window() + Canonical(out);
     // Fast form. The twelve words the sequence below leaves: the identity's pairs are (1.0, z) at +0 and +40, (z, z)
@@ -1630,6 +1733,7 @@ bool EnvTexMtxNative(CpuContext* ctx) {
             ctx->gpr[3] = out;
             ctx->fpr[1].d = PpcBitCastToDoubleInline(PpcConvertToDoubleBitsInline(k0));
             ctx->fpr[2].d = PpcBitCastToDoubleInline(PpcConvertToDoubleBitsInline(c3));
+            ctx->fpr[0].d = PpcBitCastToDoubleInline(PpcConvertToDoubleBitsInline(k1));
             return true;
         }
     }
@@ -1652,6 +1756,7 @@ bool EnvTexMtxNative(CpuContext* ctx) {
     MemoryInline::FlatWriteFloat32(out + 40u, last1);
     MemoryInline::FlatWriteFloat32(out + 44u, last0);
     ctx->gpr[3] = out;
+    ctx->fpr[0].d = last0;
     ctx->fpr[1].d = last1;
     ctx->fpr[2].d = f2;
     return true;
@@ -1666,14 +1771,19 @@ bool EnvTexMtxWrites(const CpuContext& ctx, Ranges& ranges) { return ctx.gpr[4] 
 // frame: back chain, LR, _savegpr_27. The native copies the same bytes in the same per-element order (stores that
 // could see each other's bytes keep their order) when the destination arrays are plain lean memory and overlap no
 // source array or either header (an identical array is a self copy: same bytes, same marks), else declines; marks
-// per element are its first and last store starts' pairs (dense, under 64 bytes apart). Writes back r3, r4 (as the
-// original leaves it: the last light set's destination, else the last ambient source, else r4) and f1 (the callee's
-// write-back: the last enabled object's bytes 60-67 as a double).
+// per element are its first and last store starts' pairs (dense, under 64 bytes apart). Leaves the register file as
+// the original does: r0 its LR reload, r3 the result, r4 the last light set's destination (else the last ambient
+// source, else r4), r5 the last light set's source (else the last object's source, or 2 when Copy32ByteBlocks copied
+// it, else the destination's object count), r6 and r7 the set loop's offset and count, r11 the entry r1, cr0 the last
+// unsigned compare, and from the last copied object Copy32ByteBlocks' f0, f1 (bytes 52-59 and 60-67 as doubles) and
+// ctr 0.
 bool LightSettingCopyNative(CpuContext* ctx) {
     static const int32_t kGuardBlocks = GuardIndex(0x8019DFACu);
     if (!LeanReady() || !CalleeUnpatched(kGuardBlocks)) return false;
     const uint32_t r1 = ctx->gpr[1], dst = ctx->gpr[3], src = ctx->gpr[4];
     if (!OneView(dst, 16u) || !OneView(src, 16u)) return false;
+    if (!PlainRange(r1 - 32u, 40u) || Overlap(dst, 16u, r1 - 32u, 40u) ||
+        Overlap(src, 16u, r1 - 32u, 40u)) return false;
     const uint32_t numObj = GuestLoad16(src), numSet = GuestLoad16(src + 2u);
     const bool fits = !(GuestLoad16(dst) < numObj) && !(GuestLoad16(dst + 2u) < numSet);
     const uint32_t objD = GuestLoad32(dst + 4u), objS = GuestLoad32(src + 4u);
@@ -1686,7 +1796,8 @@ bool LightSettingCopyNative(CpuContext* ctx) {
         for (int a = 0; a < 3; ++a) {
             if (bytes[a] == 0) continue;
             if (!PlainRange(dAt[a], bytes[a]) || !OneView(sAt[a], bytes[a]) || Overlap(dAt[a], bytes[a], dst, 16u) ||
-                Overlap(dAt[a], bytes[a], src, 16u))
+                Overlap(dAt[a], bytes[a], src, 16u) || Overlap(dAt[a], bytes[a], r1 - 32u, 40u) ||
+                Overlap(sAt[a], bytes[a], r1 - 32u, 40u))
                 return false;
             for (int b = 0; b < 3; ++b)
                 if (!(a == b && dAt[a] == sAt[b]) && Overlap(dAt[a], bytes[a], sAt[b], bytes[b])) return false;
@@ -1698,23 +1809,31 @@ bool LightSettingCopyNative(CpuContext* ctx) {
     MemoryInline::FlatWriteRam32(sp + 36u, ctx->lr);
     for (uint32_t reg = 27; reg < 32; ++reg) MemoryInline::FlatWriteRam32(sp + 12u + 4u * (reg - 27u), ctx->gpr[reg]);
     if (!fits) {
+        ctx->gpr[0] = ctx->lr;
         ctx->gpr[3] = 0;
+        ctx->gpr[5] = GuestLoad16(dst);
+        ctx->gpr[11] = r1;
+        SetCRResident(ctx->cr, ctx->xer, 0, uint32_t{0}, uint32_t{1});  // the failed count compare: less than
         return true;
     }
     uint8_t* const m = Window();
     uint32_t r4 = ctx->gpr[4];
     bool copied = false;
-    uint64_t lastF1 = 0;
+    uint64_t lastF0 = 0, lastF1 = 0;
+    uint32_t r5 = GuestLoad16(dst);
     for (uint32_t i = 0; i < numObj; ++i) {
         const uint32_t so = objS + 68u * i, dO = objD + 68u * i;
         const uint32_t flags = GuestLoad32(so);
+        r5 = so;
         if ((flags & 4u) != 0) {
             if (dO != so) {
                 Store32(m + Canonical(dO), flags);
                 std::memcpy(m + Canonical(dO + 4u), m + Canonical(so + 4u), 64);
                 MarkPair(Canonical(dO));
                 MarkPair(Canonical(dO + 60u));
+                std::memcpy(&lastF0, m + Canonical(so + 52u), 8);
                 std::memcpy(&lastF1, m + Canonical(so + 60u), 8);
+                r5 = 2;
                 copied = true;
             }
         } else {
@@ -1733,10 +1852,21 @@ bool LightSettingCopyNative(CpuContext* ctx) {
         MarkPair(Canonical(d));
         MarkPair(Canonical(d + 11u));
         r4 = d;
+        r5 = setS + 12u * j;
     }
+    ctx->gpr[0] = ctx->lr;
     ctx->gpr[3] = 1;
     ctx->gpr[4] = r4;
-    if (copied) ctx->fpr[1].raw = __builtin_bswap64(lastF1);
+    ctx->gpr[5] = r5;
+    ctx->gpr[6] = 12u * numSet;
+    ctx->gpr[7] = numSet;
+    ctx->gpr[11] = r1;
+    SetCRResident(ctx->cr, ctx->xer, 0, numSet, numSet);  // the set loop's exit compare
+    if (copied) {
+        ctx->fpr[0].raw = __builtin_bswap64(lastF0);
+        ctx->fpr[1].raw = __builtin_bswap64(lastF1);
+        ctx->ctr = 0;
+    }
     return true;
 }
 

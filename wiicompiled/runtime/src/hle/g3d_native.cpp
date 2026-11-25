@@ -1929,11 +1929,9 @@ std::string FirstDifference(const RecBytes& a, const RecBytes& b) {
 }
 
 void Verify(CpuContext* ctx, uint32_t mdl, ModelInfo& info) {
-    // The translated call needs its arguments back after the native one's translated callees used the volatile
-    // registers.
-    uint32_t gpr[13];
-    std::memcpy(gpr, ctx->gpr, sizeof(gpr));
-    const uint32_t cr = ctx->cr, xer = ctx->xer, ctr = ctx->ctr, lr = ctx->lr;
+    // Both passes need the same complete register input, including FPRs and GQRs. Arbitrary mod callers can
+    // observe the volatile results too; equal GX command streams alone do not establish native equivalence.
+    const CpuContext input = *ctx;
     Snapshot before, afterNative, afterGuest;
     before.Take();
     s_verifyGuestBytes.clear();
@@ -1947,16 +1945,14 @@ void Verify(CpuContext* ctx, uint32_t mdl, ModelInfo& info) {
     RecBytes nativeRec;
     nativeRec.swap(s_rec);
     afterNative.Take();
+    const CpuContext nativeCpu = *ctx;
     for (auto& byte : s_verifyGuestBytes) {
         byte.native = Memory::Read8(byte.address);
         Memory::Write8(byte.address, byte.before);
     }
     before.Restore();
-    std::memcpy(ctx->gpr, gpr, sizeof(gpr));
-    ctx->cr = cr;
-    ctx->xer = xer;
-    ctx->ctr = ctr;
-    ctx->lr = lr;
+    *ctx = input;
+    MkwApplyHostNiMode(ctx->fpscr);
     s_rec.clear();
     s_recMarks.clear();
     s_recLoadMarks.clear();
@@ -1966,11 +1962,12 @@ void Verify(CpuContext* ctx, uint32_t mdl, ModelInfo& info) {
     g_recOn = false;
     afterGuest.Take();
     const bool eventsEqual = nativeRec == s_rec;
+    const bool registersEqual = std::memcmp(&nativeCpu, ctx, sizeof(CpuContext)) == 0;
     const bool guestWritesEqual = std::all_of(s_verifyGuestBytes.begin(), s_verifyGuestBytes.end(),
         [](const VerifyGuestByte& byte) { return Memory::Read8(byte.address) == byte.native; });
     const bool stateEqual = guestWritesEqual &&
         afterNative.bss == afterGuest.bss && afterNative.sbss == afterGuest.sbss && afterNative.seed == afterGuest.seed;
-    if (eventsEqual && stateEqual) {
+    if (eventsEqual && stateEqual && registersEqual) {
         ++s_stats.verifiedOk;
         return;
     }
@@ -1978,6 +1975,7 @@ void Verify(CpuContext* ctx, uint32_t mdl, ModelInfo& info) {
     static int logged = 0;
     if (info.mismatches++ < 3 && logged++ < 120) {
         std::string what = eventsEqual ? std::string("events equal") : FirstDifference(nativeRec, s_rec);
+        if (!registersEqual) what += "\n    CPU register contract differs (including volatile registers)";
         if (!guestWritesEqual) what += "\n    guest HLE writes differ";
         if (!stateEqual) {
             for (size_t i = 0; i < afterNative.bss.size(); i += 4)
@@ -2054,11 +2052,12 @@ bool DrawResMdlDirectlyHook(CpuContext* ctx) {
 
 struct Install {
     Install() {
-        // On by default (G3D_NATIVE=0: the translated draw path; 2: verify against it). Exact: verify mode found 0
-        // mismatches over whole vanilla Training runs, 42.7 calls a frame, and a call it does not handle,
-        // or whose subtree a mod patched, runs the translated function.
+        // Opt-in: the native reproduces drawing commands, but not all volatile registers or guest stack writes.
+        // An arbitrary mod wrapper can observe those differences even when the draw body is pristine. Body
+        // guards alone cannot establish the caller's contract. Keep translated execution as the default until
+        // the native preserves that state too. Mode 2 checks registers and graphics state, but not all guest memory.
         const char* v = std::getenv("G3D_NATIVE");
-        s_mode = v != nullptr ? std::atoi(v) : 1;
+        s_mode = v != nullptr ? std::atoi(v) : 0;
         s_log = std::getenv("G3D_NATIVE_LOG") != nullptr;
         if (const char* async = std::getenv("G3D_NATIVE_ASYNC")) s_async = std::atoi(async);
         if (const char* carry = std::getenv("G3D_NATIVE_CARRY")) s_carry = carry[0] != '0';
