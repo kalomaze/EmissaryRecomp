@@ -7,11 +7,11 @@
 #include <iterator>
 #include <utility>
 
-extern "C" const uint32_t g_mkwGuardedFunctionCount = 2;
-extern "C" const uint32_t g_mkwGuardedFunctionStarts[] = {0x80007000, 0x80007020};
-extern "C" { uint8_t g_mkwGuestCodePatched[2] = {}; }
-extern "C" const uint32_t g_mkwInlinedLeafCount = 0;
-extern "C" const uint32_t g_mkwInlinedLeaves[] = {0, 0};
+extern "C" const uint32_t g_mkwGuardedFunctionCount = 3;
+extern "C" const uint32_t g_mkwGuardedFunctionStarts[] = {0x80007000, 0x80007020, 0x80007040};
+extern "C" { uint8_t g_mkwGuestCodePatched[3] = {}; }
+extern "C" const uint32_t g_mkwInlinedLeafCount = 1;
+extern "C" const uint32_t g_mkwInlinedLeaves[] = {1, 0};
 
 extern "C" const uint32_t g_mkwCodeVariantCount = 0;
 extern "C" const MkwCodeVariant g_mkwCodeVariants[1] = {};
@@ -73,6 +73,16 @@ static void TestOriginalTrampoline() {
     assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == nullptr);
     Memory::Write32(trampoline + 4, branch(trampoline + 4, original + 4));
     assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == OriginalNative);
+    // An unchanged native body may embed a leaf which a mod replaces separately.
+    // The entry detour is allowed, but must not hide this dependency invalidation.
+    GuestCodePatch::InterpretReplacedModule(0x80007020, 0x80007040, "inlined leaf replacement test");
+    assert(g_mkwGuestCodePatched[0] && g_mkwGuestCodePatched[1]);
+    assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == nullptr);
+    ctx.gpr[1] = 0x8000f000;
+    ctx.gpr[3] = 1;
+    ctx.lr = ctx.gpr[30];
+    PpcInterpreter::Run(&ctx, wrapper);
+    assert(originalCalls == 1 && ctx.gpr[3] == 112 && ctx.gpr[1] == 0x8000f000);
     GuestCodePatch::InterpretReplacedModule(original, original + sizeof(body), "replacement test");
     assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == nullptr);
 }

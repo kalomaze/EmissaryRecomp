@@ -471,6 +471,21 @@ OriginalNativeTarget ResolveOriginalNativeTrampoline(uint32_t trampoline) {
     const int64_t index = FunctionIndex(original);
     if (index < 0 || index + 1 >= g_mkwGuardedFunctionCount || g_mkwGuardedFunctionStarts[index] != original ||
         std::find(g_forced.begin(), g_forced.end(), static_cast<uint32_t>(index)) != g_forced.end()) return {};
+    // The entry detour makes this function's own patched bit unusable here. Its inlined
+    // dependencies must still be pristine: otherwise this shortcut would bypass the
+    // interpreter fallback installed by MarkInliningCallers. Index the immutable table
+    // once rather than scanning every generated inline edge on every trampoline call.
+    static const auto inlinedDependencies = [] {
+        std::unordered_map<uint32_t, std::vector<uint32_t>> byCaller;
+        for (uint32_t i = 0; i < g_mkwInlinedLeafCount; ++i)
+            byCaller[g_mkwInlinedLeaves[2u * i + 1u]].push_back(g_mkwInlinedLeaves[2u * i]);
+        return byCaller;
+    }();
+    if (const auto dependencies = inlinedDependencies.find(static_cast<uint32_t>(index));
+        dependencies != inlinedDependencies.end()) {
+        for (const uint32_t leaf : dependencies->second)
+            if (g_mkwGuestCodePatched[leaf]) return {};
+    }
     for (const auto& redirect : g_redirects) {
         const uint32_t start = redirect.start.load(std::memory_order_acquire);
         if (start != 0 && original >= start && original < redirect.end.load(std::memory_order_relaxed)) return {};

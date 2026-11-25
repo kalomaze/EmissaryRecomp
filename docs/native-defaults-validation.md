@@ -42,3 +42,13 @@ Binary SHA-256:
 - Recomp: `39a1057a77563f0883d0c4fb3007d78e5ad893bacafd3ccb822b65dec1234f02`
 
 Detailed accepted-run statistics and input/sample hashes: [native-defaults-timing.json](native-defaults-timing.json). The recomp timing binary is the safety checkpoint; c66c5f0 changes only opt-in diagnostics and documentation.
+
+## Trampoline dependency regression
+
+The original-body trampoline shortcut must also respect invalidation of inlined callees. Checking the original body's bytes alone is insufficient: replacing a separately located leaf marks its translated callers for interpreter fallback while leaving their body bytes unchanged. The trampoline resolver now checks the generated inline dependencies' patched flags before accepting the native continuation.
+
+A synthetic replacement regression failed in cached, classic and verification interpreter modes before the fix. After the fix, all seven native/interpreter tests pass in both lean and flat x86 builds. The regression checks that the shortcut is declined and that the mod wrapper still executes through interpreter fallback. This covers dependency invalidation delivered through the existing code-patch machinery; it does not establish exhaustive compatibility with arbitrary mods.
+
+Three x86 one-redo replays (001/064/128, 120 output frames each) also pass original recording checksums and native differential checks, with all 1,062 snapshot operations verified. Tested binary SHA-256: `d53de4dd4f2346d1b90fc770f5b217ac8455d952a6d182e26d064a489dfb7dc3`. These are correctness runs, not new performance measurements.
+
+ARM verification of this additional change is pending: the previously used GB10 SSH endpoint refused connections during validation. Earlier ARM results above apply to the earlier safety checkpoint and helper fuzzers.
