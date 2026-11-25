@@ -141,30 +141,32 @@ saves in `build/native/UserData`. Rerun it to resume. Options for `build.cmake`:
 - `-DGAME=<folder>` uses an extracted disc other than `Disc/DATA` (give it to `extract.cmake` too)
 - `-DCMAKE_BUILD_TYPE=Debug` or `RelWithDebInfo` builds with debug symbols (the default is `Release`)
 - `-DMKW_HOST_ISA=v1` (SSE2) or `v2` (SSE4.2) builds for x86-64 processors older than the default `v3` (AVX2)
-- `-DMKW_FLAT_MEMORY=OFF` uses ordinary memory instead of reserving a fixed 4 GiB address range
+- New build directories use lean memory: one masked 1 GiB guest-memory window.
+- `-DMKW_FLAT_MEMORY=ON -DMKW_LEAN_MEMORY=OFF` selects the fixed-address 4 GiB mapping instead.
+- `-DMKW_FLAT_MEMORY=OFF -DMKW_LEAN_MEMORY=OFF` selects ordinary memory.
 
 ### Experimental optimizations
 
-This branch carries performance work that is still experimental. All of it is compiled in, but the plain build above
-uses flat memory, and most of it only takes effect in a lean-memory build. A build with everything that is safe for
-mods (Linux shell; on Windows, set `$env:MKW_EABI_REGS` instead and quote the `-D` arguments the same way):
+The plain build above uses lean memory, with bit-exact floating point and rollback dirty tracking enabled.
+CMake preserves options in existing build directories. To switch an older flat-memory build to the new default:
 
 ```sh
-cmake -DMKW_FLAT_MEMORY=OFF "-DNATIVE_ARGS=-DMKW_LEAN_MEMORY=ON" -P build.cmake
+cmake -DMKW_FLAT_MEMORY=OFF -DMKW_LEAN_MEMORY=ON -P build.cmake
 ```
 
-Vanilla Brawl only, with the remaining build-time options:
+The additional experimental options below are opt-in. Vanilla Brawl only, with the remaining build-time options
+(Linux shell; on Windows, set `$env:MKW_EABI_REGS` instead and quote the `-D` arguments the same way):
 
 ```sh
 MKW_EABI_REGS=1 cmake -DMKW_FLAT_MEMORY=OFF \
   "-DNATIVE_ARGS=-DMKW_LEAN_MEMORY=ON;-DMKW_FAST_FLOAT=ON;-DMKW_LEAN_DIRTY_MARKS=OFF" -P build.cmake
 ```
 
-Build-time switches (`build.cmake` passes `MKW_FLAT_MEMORY` itself; the others go in `NATIVE_ARGS`, separated by `;`):
+Build-time switches (`build.cmake` passes `MKW_FLAT_MEMORY` and `MKW_LEAN_MEMORY` directly; the others go in `NATIVE_ARGS`, separated by `;`):
 
 | Switch | Default | What it does |
 |---|---|---|
-| `-DMKW_FLAT_MEMORY=OFF` + `-DMKW_LEAN_MEMORY=ON` | off (on for Switch) | Guest memory as one masked 1 GiB window. The native library code and the lean code generation need it. |
+| `-DMKW_FLAT_MEMORY=OFF` + `-DMKW_LEAN_MEMORY=ON` | on | Guest memory as one masked 1 GiB window. The native library code and the lean code generation need it. |
 | `MKW_EABI_REGS=1` (environment, at translation) | off | Passes arguments between translated functions in host registers. Vanilla only: mods that patch code (Project+) break it. |
 | `-DMKW_FAST_FLOAT=ON` | off | Host float instructions instead of bit-exact Gekko float emulation. Gameplay matched in testing, but results are no longer bit-identical to a Wii or Dolphin. |
 | `-DMKW_LEAN_DIRTY_MARKS=OFF` | on | Drops rollback's per-store dirty marks. Only for builds that never use rollback. |

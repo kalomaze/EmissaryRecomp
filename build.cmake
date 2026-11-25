@@ -11,7 +11,7 @@ foreach(var BUILD_DIR GAME EXTRACT JOBS CODE_VARIANTS BRAWL_ONLINE BRAWL_ONLINE_
         list(APPEND args "--${option}=${${var}}")
     endif()
 endforeach()
-foreach(var CMAKE_BUILD_TYPE MKW_HOST_ISA MKW_FLAT_MEMORY)  # the native configure's, like -DNATIVE_ARGS="-DA=1;-DB=2"
+foreach(var CMAKE_BUILD_TYPE MKW_HOST_ISA MKW_FLAT_MEMORY MKW_LEAN_MEMORY)  # the native configure's, like -DNATIVE_ARGS="-DA=1;-DB=2"
     if(DEFINED ${var})
         list(APPEND NATIVE_ARGS "-D${var}=${${var}}")
     endif()

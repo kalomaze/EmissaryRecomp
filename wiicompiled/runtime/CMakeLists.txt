@@ -80,19 +80,19 @@ else()
     set(MKW_BASELINE_ARCH_FLAG "")
 endif()
 
-option(MKW_FLAT_MEMORY "Use fixed-address 4 GiB mapping and OS page protections for guest accesses" ON)
+option(MKW_FLAT_MEMORY "Use fixed-address 4 GiB mapping and OS page protections for guest accesses" OFF)
 if(MKW_PLATFORM_SWITCH AND MKW_FLAT_MEMORY)
     # Horizon has no fixed-address mappings or page-fault handlers for user code.
     set(MKW_FLAT_MEMORY OFF CACHE BOOL "Use fixed-address 4 GiB mapping and OS page protections for guest accesses" FORCE)
 endif()
 
 # MKW_LEAN_MEMORY (include/memory_access.h): every guest access goes to one masked 1 GiB window, with no page table
-# and no fault handler. Horizon's default: src/memory.cpp reserves the window there and backs only the guest regions
-# and the runtime's tables in it (src/platform/horizon.c). Other builds may also define it in CMAKE_CXX_FLAGS.
-if(MKW_PLATFORM_SWITCH)
-    set(MKW_LEAN_MEMORY_DEFAULT ON)
-else()
+# and no fault handler. The default on desktop and Horizon; the latter backs only the guest regions
+# and the runtime's tables in it (src/platform/horizon.c). An explicit flat-memory build defaults lean memory off.
+if(MKW_FLAT_MEMORY)
     set(MKW_LEAN_MEMORY_DEFAULT OFF)
+else()
+    set(MKW_LEAN_MEMORY_DEFAULT ON)
 endif()
 option(MKW_LEAN_MEMORY "Use one masked 1 GiB window for guest memory (needs MKW_FLAT_MEMORY=OFF)" ${MKW_LEAN_MEMORY_DEFAULT})
 if(MKW_LEAN_MEMORY AND MKW_FLAT_MEMORY)
