@@ -4,6 +4,7 @@
 #include "guest_code_patch.h"
 #include "guest_native_trampoline.h"
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <utility>
@@ -20,6 +21,13 @@ extern "C" const uint32_t g_mkwCodeVariantGuards[1] = {};
 extern "C" const uint32_t g_mkwCodeVariantWords[1] = {};
 extern "C" const uint32_t g_mkwCodeVariantRegionCount = 0;
 extern "C" const uint32_t g_mkwCodeVariantRegions[1] = {};
+
+extern "C" void BrawlGecko_CodeHandler(CpuContext*);
+// This fixture exercises the native 04 store and exit, without verifier/audio
+// or the 8A/8C copy helper. Unexpected calls must fail the test.
+extern "C" void func_800018A8_body(CpuContext*) { std::abort(); }
+extern "C" void func_80001E88(CpuContext*) { std::abort(); }
+namespace AxDspHle { void JoinMixWorker() { std::abort(); } }
 
 static unsigned originalCalls = 0;
 static void OriginalNative(CpuContext* ctx) {
@@ -87,6 +95,36 @@ static void TestOriginalTrampoline() {
     patchCtx.gpr[3] = 10;
     GuardedCallee(&patchCtx);
     assert(patchCtx.gpr[3] == 12);
+    Memory::Write32(0x80007040u, 0x38630001u);
+    GuestCodePatch::ResetPristine(0x80007040u, 0x80007060u);
+
+    // A Gecko 04 code patches a guarded function, then the caller invokes that
+    // function directly. The handler's native exit must execute the original
+    // isync, not leave the pending write for a later unrelated interpreter call.
+    // Exit words from projects/brawl/gecko/codehandler.bin, 0x80001944..1988.
+    const uint32_t geckoExit[] = {
+        0x7fa803a6u, 0x60000000u, 0xc8410098u, 0xc86100a0u, 0x7f2000a6u,
+        0x800100acu, 0x7c0803a6u, 0x8001000cu, 0x7c0ff120u, 0x80010010u,
+        0x7c0903a6u, 0x80010014u, 0x7c0103a6u, 0xb8610018u, 0x80010008u,
+        0x382100a8u, 0x4c00012cu, 0x4e800020u};
+    for (unsigned i = 0; i < std::size(geckoExit); ++i)
+        Memory::Write32(0x80001944u + 4*i, geckoExit[i]);
+    const uint32_t codes[] = {0x00d0c0deu, 0x00d0c0deu, 0x04007040u,
+                               0x38630002u, 0xf0000000u, 0};
+    for (unsigned i = 0; i < std::size(codes); ++i)
+        Memory::Write32(0x80006000u + 4*i, codes[i]);
+    Memory::Write32(0x80001804u, 0x80006000u);
+    CpuContext geckoCtx{};
+    geckoCtx.gpr[1] = 0x8000f000u;
+    geckoCtx.gpr[3] = 10;
+    geckoCtx.lr = 0x80007800u;
+    assert(GuestCodePatch::NoteWrite(0x80007040u)); // stubbed platform hook
+    BrawlGecko_CodeHandler(&geckoCtx);
+    assert(geckoCtx.gpr[1] == 0x8000f000u && geckoCtx.lr == 0x80007800u);
+    assert(Memory::Read32(0x80007040u) == 0x38630002u);
+    assert(g_mkwGuestCodePatched[2]);
+    GuardedCallee(&geckoCtx);
+    assert(geckoCtx.gpr[3] == 12);
     Memory::Write32(0x80007040u, 0x38630001u);
     GuestCodePatch::ResetPristine(0x80007040u, 0x80007060u);
 

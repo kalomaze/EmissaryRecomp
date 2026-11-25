@@ -129,3 +129,14 @@ The paired 16-run recording-128 timing comparison passes checksum/work-count gat
 Gameplay rollback and the online-core snapshot callback now synchronize pending executable writes after restoring guest bytes, before resimulation resumes. Ordinary save states already had this boundary. Without it, a host restore can replace a guarded callee's instructions while its translated entry still sees the old guard state.
 
 A focused host-copy regression fails without synchronization in cached, classic and verifying interpreter modes and passes with it. The CPU harness explicitly supplies the executable-write notification because its platform hook is stubbed. All 14 x86 lean/flat checks and 16 AArch64/QEMU checks pass. The combined production build passes three 120-frame one-redo recordings and 1,062 snapshot checks. These recordings cover gameplay rollback, not direct execution of the online-core callback. This fix synchronizes restored instruction bytes; it does not establish restoration of every host-side module or patch metadata structure. Native ARM and REX gameplay remain pending. [Validation receipt](restore-code-guard-validation.json).
+
+
+### Gecko exit synchronization and REX
+
+The native Gecko handler previously restored registers in C++ and returned without executing the guest exit's `isync` at `0x80001984`. It now resumes the interpreter at `0x80001944`, preserving the exit instructions and synchronizing code written by the pass before its caller resumes. This also allows the exit itself to reflect guest edits.
+
+A focused regression writes a guarded callee through a Gecko 04 code and immediately calls it. The old exit fails in cached, classic and verifying interpreter modes; the fixed exit passes those modes with both lean and flat memory on x86 and AArch64 under QEMU. The CPU harness explicitly supplies the platform's pending executable-write notification.
+
+REX Release 0½ Hotfix 1 boots into gameplay. With this fix, a 300-output-frame one-redo run completed 297 resimulations and verified all 894 snapshot save/load operations. The last Gecko report records 2,400 comparisons with zero mismatches; no native/reference mismatch was reported by the enabled differential checks. Full-memory replay differences persist in 297 repeated saves, even though the earlier 0f/1f runs agreed on all recorded gameplay, fighter, RNG and input fields. These memory differences remain unresolved, so this is not a claim of complete REX rollback determinism. Native ARM remains pending; QEMU results are CPU-level evidence only. [Validation receipt](gecko-exit-validation.json).
+
+The same production binary also passes the 120-frame one-redo replay checks for Project+ recordings 001, 064 and 128, with all 1,062 snapshot operations verified and no reported native/reference mismatch.

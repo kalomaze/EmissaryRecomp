@@ -720,24 +720,11 @@ L_2120:
     if (!bt(kEq0)) r[16] = r[5];
     goto L_198C;
 
-L_1944:  // the caller's registers back from the frame
-    f2.d = MemoryInline::FlatReadFloat64(r[1] + 152);
-    f3.d = MemoryInline::FlatReadFloat64(r[1] + 160);
-    r[25] = ctx->msr;
-    {
-        const uint32_t lr = FlatRead32(r[1] + 172);
-        r[0] = FlatRead32(r[1] + 12);
-        cr = r[0];
-        r[0] = FlatRead32(r[1] + 16);
-        ctr = r[0];
-        r[0] = FlatRead32(r[1] + 20);
-        xer = r[0];
-        for (int i = 3; i < 32; ++i) r[i] = FlatRead32(r[1] + 24 + 4 * static_cast<uint32_t>(i - 3));
-        r[0] = FlatRead32(r[1] + 8);
-        r[1] += 168;
-        writeBack();
-        ctx->lr = lr;
-    }
+L_1944:
+    // The exit restores the caller and executes isync at 0x80001984. Run it
+    // through the interpreter so code written by this pass is synchronized,
+    // including changes to the handler's exit instructions themselves.
+    return bail(0x80001944u);
 }
 
 // BRAWL_GECKO_STATS: one line per 600 passes.

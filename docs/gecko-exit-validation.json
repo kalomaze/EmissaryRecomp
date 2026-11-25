@@ -1,0 +1,78 @@
+{
+  "parent_commit": "4bfba01",
+  "binary_sha256": "6fb0ca94de5e148c61b45efbb112b2363cf37a0ddabf4c754b1340a78530d2ce",
+  "fix": "Interpret Gecko exit from 0x80001944, including instruction synchronization at 0x80001984.",
+  "regression": {
+    "case": "Gecko 04 patches guarded callee, immediately invoke callee after native handler returns",
+    "old_exit": "fails cached, classic and verifying modes at pending guard assertion",
+    "fixed_exit": "passes all three modes with lean and flat memory on x86 and AArch64/QEMU",
+    "platform_hook": "CPU harness supplies pending executable-write notification; platform hook is stubbed"
+  },
+  "rex": {
+    "release": "REX Release 0\u00bd Hotfix 1 - Wii",
+    "archive_sha256": "4c5feeaef44ec2659a483ffc5c3560e762c0900e59531d14cfb20025a19508c6",
+    "output_frames": 300,
+    "resimulated_frames": 297,
+    "verified_snapshot_operations": 894,
+    "gecko_last_report": "[gecko-verify] 2400 passes compared, 0 mismatched",
+    "completion": "[rollback] COMPLETE frames=300 saves=597 loads=297 advances=597 desyncs=0 region_differences=297",
+    "log_sha256": "ce8ed3f1e221b6ca9789a2cbad140ee378fd773cd9d67cc48bab292c69302b87",
+    "native_reference_mismatch_lines": []
+  },
+  "limits": [
+    "Native ARM validation still unavailable (GB10 SSH refuses connections).",
+    "REX full-memory differences remain: initial diagnostics locate changes in 0x805B5054 static range and 0x91329700 heap range; causes not yet established.",
+    "No exhaustive arbitrary-mod proof; this closes the native Gecko exit synchronization gap.",
+    "No timing claim for this patch."
+  ],
+  "project_plus_recordings": [
+    {
+      "recording": "match-001-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-001/game.brep",
+        "source_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "runtime_log_sha256": "e71f5b76842efb1ed5d0ef8c77069bde4dd264a5468d8c02a716a3420cf0be6b"
+    },
+    {
+      "recording": "match-064-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-064/game.brep",
+        "source_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "runtime_log_sha256": "8ecdf5291ca28cfb3e92c86748d46ff59b8c75cf5bb767e6e1a30a0d10b6e649"
+    },
+    {
+      "recording": "match-128-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-128/game.brep",
+        "source_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "runtime_log_sha256": "427b39d8a2883e5cb22c792954d2e5807088532e237f83d59a210982f764e4df"
+    }
+  ]
+}

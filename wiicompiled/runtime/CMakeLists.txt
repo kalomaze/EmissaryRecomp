@@ -530,7 +530,7 @@ if(MKW_BUILD_INTERPRETER_TESTS)
     endif()
     set_target_properties(mkw_interpreter_call_forms_tests PROPERTIES UNITY_BUILD OFF)
     add_executable(mkw_native_trampoline_tests
-        tests/native_trampoline_tests.cpp tests/interpreter_test_support.cpp
+        tests/native_trampoline_tests.cpp tests/interpreter_test_support.cpp src/hle/gecko_handler.cpp
         src/guest_code_patch.cpp src/abi_bridge.cpp src/fpu_helpers.cpp src/memory.cpp src/lean_base.cpp
         src/ppc_helpers.cpp src/ppc_quantized.cpp src/ppc_interpreter.cpp src/det_clock.cpp)
     if(MKW_FLAT_MEMORY)
