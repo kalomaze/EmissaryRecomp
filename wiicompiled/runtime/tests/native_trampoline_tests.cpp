@@ -73,11 +73,12 @@ static void TestOriginalTrampoline() {
     assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == nullptr);
     Memory::Write32(trampoline + 4, branch(trampoline + 4, original + 4));
     assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == OriginalNative);
-    // Ordinary writes invalidate inline dependencies at the same Sync boundary as
-    // translated calls. Restoring that leaf must allow the original shortcut again.
+    // A mod may patch an inlined leaf and call its original trampoline before
+    // returning through RunPatched. Reject that shortcut before the outer Sync.
     const uint32_t leafWord = Memory::Read32(0x80007020);
     Memory::Write32(0x80007020, 0x60000000);
     assert(GuestCodePatch::NoteWrite(0x80007020));
+    assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == nullptr);
     GuestCodePatch::Sync();
     assert(g_mkwGuestCodePatched[0] && g_mkwGuestCodePatched[1]);
     assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == nullptr);

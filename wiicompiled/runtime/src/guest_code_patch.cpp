@@ -473,6 +473,9 @@ OriginalNativeTarget ResolveOriginalNativeTrampoline(uint32_t trampoline) {
                                     [original](const auto& entry) { return entry.address == original; });
     if (found == OriginalNatives().end()) return {};
 
+    // An interpreted mod can patch an inlined leaf and call this trampoline
+    // before returning to RunPatched. Refresh dependency bits at this boundary.
+    Sync();
     std::lock_guard<std::mutex> lock(g_mutex);
     const int64_t index = FunctionIndex(original);
     if (index < 0 || index + 1 >= g_mkwGuardedFunctionCount || g_mkwGuardedFunctionStarts[index] != original ||
