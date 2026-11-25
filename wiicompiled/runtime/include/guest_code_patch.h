@@ -37,6 +37,9 @@ void Protect(uint32_t start, uint32_t end, const char* name);
 bool NoteWrite(uint32_t address);
 // Compares written pages with their pristine bytes; functions whose code changed go to the interpreter.
 void Sync();
+// Query synchronized guard state for every function intersecting [start, end).
+// Native bodies can span several translated functions or resume after guest calls.
+bool AnyPatchedInRange(uint32_t start, uint32_t end);
 // Sync, once a frame: also guards again the pages that hold both code and data.
 void SyncFrame();
 // [start, end) holds its pristine code again (a module was linked again at its home).

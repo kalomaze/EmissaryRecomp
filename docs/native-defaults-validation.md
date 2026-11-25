@@ -140,3 +140,16 @@ A focused regression writes a guarded callee through a Gecko 04 code and immedia
 REX Release 0½ Hotfix 1 boots into gameplay. With this fix, a 300-output-frame one-redo run completed 297 resimulations and verified all 894 snapshot save/load operations. The last Gecko report records 2,400 comparisons with zero mismatches; no native/reference mismatch was reported by the enabled differential checks. Full-memory replay differences persist in 297 repeated saves, even though the earlier 0f/1f runs agreed on all recorded gameplay, fighter, RNG and input fields. These memory differences remain unresolved, so this is not a claim of complete REX rollback determinism. Native ARM remains pending; QEMU results are CPU-level evidence only. [Validation receipt](gecko-exit-validation.json).
 
 The same production binary also passes the 120-frame one-redo replay checks for Project+ recordings 001, 064 and 128, with all 1,062 snapshot operations verified and no reported native/reference mismatch.
+
+
+### Gecko continuation guard coverage
+
+A synthetic guest callback demonstrates an additional edge case: a C0 code can rewrite and synchronize the Gecko handler while its native implementation is running. The native continuation previously ignored those edits. This was not an observed REX or Project+ failure. The production guard table also splits the handler at the separately translated helper `0x80001E88`; checking only its entry interval misses changes to later handler code.
+
+The native body now checks every guard interval intersecting its implementation (`0x800018A8..0x800021B0`) at entry and after either guest call. If the handler changed, the entry uses the original body or the active call resumes at its exact guest continuation in the interpreter. Unchanged handlers retain the native path.
+
+The fixture reflects the production guard split and verifies both a modified continuation and fallback on the next entry. It fails against the old handler in cached/classic/verifying modes, then passes all 12 checks across x86 and AArch64/QEMU, lean and flat. A REX 300-frame one-redo differential run verifies all 894 snapshot operations with no reported native/reference mismatch. Native ARM remains pending.
+
+A separate REX control with native Gecko disabled still reports 297 full-memory differences. Its 597 trace rows exactly match the native run's recorded gameplay, fighter, RNG and input fields. That excludes native Gecko as the sole explanation, but does not clear other native paths or establish full-memory determinism. [Validation receipt](gecko-continuation-validation.json).
+
+The same binary passes Project+ recordings 001/064/128 for 120 output frames with one redo, including all 1,062 snapshot operations and no reported native differential failures.

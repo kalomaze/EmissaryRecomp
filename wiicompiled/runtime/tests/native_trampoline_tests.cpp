@@ -9,11 +9,11 @@
 #include <iterator>
 #include <utility>
 
-extern "C" const uint32_t g_mkwGuardedFunctionCount = 4;
-extern "C" const uint32_t g_mkwGuardedFunctionStarts[] = {0x80007000, 0x80007020, 0x80007040, 0x80007060};
-extern "C" { uint8_t g_mkwGuestCodePatched[4] = {}; }
+extern "C" const uint32_t g_mkwGuardedFunctionCount = 6;
+extern "C" const uint32_t g_mkwGuardedFunctionStarts[] = {0x800018a8, 0x80001e88, 0x80007000, 0x80007020, 0x80007040, 0x80007060};
+extern "C" { uint8_t g_mkwGuestCodePatched[6] = {}; }
 extern "C" const uint32_t g_mkwInlinedLeafCount = 1;
-extern "C" const uint32_t g_mkwInlinedLeaves[] = {1, 0};
+extern "C" const uint32_t g_mkwInlinedLeaves[] = {3, 2};
 
 extern "C" const uint32_t g_mkwCodeVariantCount = 0;
 extern "C" const MkwCodeVariant g_mkwCodeVariants[1] = {};
@@ -25,9 +25,17 @@ extern "C" const uint32_t g_mkwCodeVariantRegions[1] = {};
 extern "C" void BrawlGecko_CodeHandler(CpuContext*);
 // This fixture exercises the native 04 store and exit, without verifier/audio
 // or the 8A/8C copy helper. Unexpected calls must fail the test.
-extern "C" void func_800018A8_body(CpuContext*) { std::abort(); }
+static unsigned geckoOriginalCalls = 0;
+extern "C" void func_800018A8_body(CpuContext*) { ++geckoOriginalCalls; }
 extern "C" void func_80001E88(CpuContext*) { std::abort(); }
 namespace AxDspHle { void JoinMixWorker() { std::abort(); } }
+
+static void PatchGeckoContinuation(CpuContext*) {
+    Memory::Write32(0x80001f14u, 0x935f6100u); // stw r26, 0x6100(r31)
+    Memory::Write32(0x80001f18u, 0x4bfffa2cu); // b 0x80001944
+    assert(GuestCodePatch::NoteWrite(0x80001f14u)); // stubbed platform hook
+    GuestCodePatch::Sync();
+}
 
 static unsigned originalCalls = 0;
 static void OriginalNative(CpuContext* ctx) {
@@ -37,7 +45,7 @@ static void OriginalNative(CpuContext* ctx) {
 }
 
 static void GuardedCallee(CpuContext* ctx) {
-    MKW_GUEST_CODE_GUARD(2u, 0x80007040u);
+    MKW_GUEST_CODE_GUARD(4u, 0x80007040u);
     ++ctx->gpr[3];
 }
 
@@ -61,6 +69,12 @@ static void TestOriginalTrampoline() {
     TranslatedFunctionRegistry::Register(std::move(callee));
     Memory::Write32(0x80007040u, 0x38630001u); // addi r3, r3, 1
     Memory::Write32(0x80007044u, 0x4e800020u); // blr
+    TranslatedFunctionInfo c0{};
+    c0.address = 0x80006010u;
+    c0.name = "PatchGeckoContinuation";
+    c0.rawCpuInvoker = PatchGeckoContinuation;
+    c0.entryPoint = reinterpret_cast<void*>(PatchGeckoContinuation);
+    TranslatedFunctionRegistry::Register(std::move(c0));
     TranslatedFunctionRegistry::Finalize();
     GuestCodePatch::RegisterOriginalNative(original, OriginalNative);
     GuestCodePatch::Protect(original, 0x80007060, "original trampoline test");
@@ -122,11 +136,33 @@ static void TestOriginalTrampoline() {
     BrawlGecko_CodeHandler(&geckoCtx);
     assert(geckoCtx.gpr[1] == 0x8000f000u && geckoCtx.lr == 0x80007800u);
     assert(Memory::Read32(0x80007040u) == 0x38630002u);
-    assert(g_mkwGuestCodePatched[2]);
+    assert(g_mkwGuestCodePatched[4]);
     GuardedCallee(&geckoCtx);
     assert(geckoCtx.gpr[3] == 12);
     Memory::Write32(0x80007040u, 0x38630001u);
     GuestCodePatch::ResetPristine(0x80007040u, 0x80007060u);
+
+    // C0 guest code may rewrite and synchronize the handler while it is on
+    // the stack. The continuation must execute the new instructions.
+    Memory::Write32(0x80001f14u, 0x60000000u);
+    Memory::Write32(0x80001f18u, 0x60000000u);
+    GuestCodePatch::Protect(0x800018a8u, 0x80002200u, "Gecko continuation test");
+    const uint32_t c0Codes[] = {0x00d0c0deu, 0x00d0c0deu, 0xc0000000u, 1,
+                                 0x60000000u, 0x4e800020u, 0xf0000000u, 0};
+    for (unsigned i = 0; i < std::size(c0Codes); ++i)
+        Memory::Write32(0x80006000u + 4*i, c0Codes[i]);
+    Memory::Write32(0x80006100u, 0);
+    geckoCtx = {};
+    geckoCtx.gpr[1] = 0x8000f000u;
+    geckoCtx.lr = 0x80007800u;
+    BrawlGecko_CodeHandler(&geckoCtx);
+    assert(Memory::Read32(0x80006100u) == 1);
+    assert(geckoOriginalCalls == 0);
+    // Production splits the handler's guard at its 0x80001E88 helper. A
+    // changed tail must also decline the native body on the next invocation.
+    assert(!g_mkwGuestCodePatched[0] && g_mkwGuestCodePatched[1]);
+    BrawlGecko_CodeHandler(&geckoCtx);
+    assert(geckoOriginalCalls == 1);
 
     // isync also separates cached decoding: the store replaces an instruction
     // later in this same straight-line sequence, rather than a registered callee.
@@ -179,26 +215,26 @@ static void TestOriginalTrampoline() {
     assert(GuestCodePatch::NoteWrite(0x80007020));
     assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == nullptr);
     GuestCodePatch::Sync();
-    assert(g_mkwGuestCodePatched[0] && g_mkwGuestCodePatched[1]);
+    assert(g_mkwGuestCodePatched[2] && g_mkwGuestCodePatched[3]);
     assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == nullptr);
     Memory::Write32(0x80007020, leafWord);
     GuestCodePatch::ResetPristine(0x80007020, 0x80007040);
-    assert(!g_mkwGuestCodePatched[1]);
+    assert(!g_mkwGuestCodePatched[3]);
     assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == OriginalNative);
 
     // Relinking the leaf must not erase a pending write to another function on
     // that page, or replace the neighbor's pristine bytes with its patched bytes.
     Memory::Write32(0x80007040, 0x60000000);
     assert(GuestCodePatch::NoteWrite(0x80007040));
-    assert(!g_mkwGuestCodePatched[2]);
+    assert(!g_mkwGuestCodePatched[4]);
     GuestCodePatch::ResetPristine(0x80007020, 0x80007040);
     GuestCodePatch::Sync();
-    assert(g_mkwGuestCodePatched[2]);
+    assert(g_mkwGuestCodePatched[4]);
 
     // An unchanged native body may embed a leaf which a mod replaces separately.
     // The entry detour is allowed, but must not hide this dependency invalidation.
     GuestCodePatch::InterpretReplacedModule(0x80007020, 0x80007040, "inlined leaf replacement test");
-    assert(g_mkwGuestCodePatched[0] && g_mkwGuestCodePatched[1]);
+    assert(g_mkwGuestCodePatched[2] && g_mkwGuestCodePatched[3]);
     assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == nullptr);
     ctx.gpr[1] = 0x8000f000;
     ctx.gpr[3] = 1;

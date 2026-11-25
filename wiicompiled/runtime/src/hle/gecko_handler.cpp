@@ -28,6 +28,7 @@
 #include "brawl_dirty_memory.h"
 #include "brawl_mark_observer.h"
 #include "memory.h"
+#include "guest_code_patch.h"
 #include "ppc_interpreter.h"
 #include "runtime_log.h"
 
@@ -195,6 +196,12 @@ struct Prefetcher {
 inline bool AlreadyCopied(uint32_t dest, uint32_t source, uint32_t size) {
     if (!InRam(dest, size) || !InRam(source, size)) return false;
     return std::memcmp(Memory::GetPointer(dest, size), Memory::GetPointer(source, size), size) == 0;
+}
+
+// The handler resumes beyond the separately translated helper at 0x80001E88,
+// so its native implementation depends on both guard intervals.
+bool HandlerChanged() {
+    return GuestCodePatch::AnyPatchedInRange(0x800018A8u, 0x800021B0u);
 }
 
 void RunHandler(CpuContext* ctx) {
@@ -615,6 +622,7 @@ L_1E48:  // 8A/8C: memory copy
     ctx->lr = 0x80001E58u;
     func_80001E88(ctx);
     readBack();
+    if (HandlerChanged()) return bail(0x80001E58u);
     if (bt(kEq4)) r[9] += r[4];
     else r[17] += r[4];
     r[4] = rec(Rlwinm(r[3], 24, 16, 31));
@@ -643,6 +651,7 @@ L_1EFC:  // C0-CE
         ctx->lr = 0x80001F14u;
         InvokeIndirectCpu(r[15], ctx);
         readBack();
+        if (HandlerChanged()) return bail(0x80001F14u);
     }
 L_1F14:  // past the code's lines (r4 bytes, rounded up to a line)
     r[15] = r[4] + r[15];
@@ -870,7 +879,7 @@ void VerifyPass(CpuContext* ctx) {
 } // namespace
 
 MKW_NATIVE_BODY(0x800018A8u, BrawlGecko_CodeHandler) {
-    if (g_originals) {
+    if (g_originals || HandlerChanged()) {
         func_800018A8_body(ctx);
         return;
     }

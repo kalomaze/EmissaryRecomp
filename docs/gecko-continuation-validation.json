@@ -1,0 +1,112 @@
+{
+  "parent_commit": "ec804a1",
+  "case": "Synthetic C0 guest callback modifies and synchronizes the running Gecko handler. No REX or Project+ trigger observed.",
+  "production_layout": "Handler guard starts at 0x800018A8; separately translated helper at 0x80001E88 splits its continuation into a second guard interval.",
+  "fix": "Check all guard intervals intersecting 0x800018A8..0x800021B0 on entry and after guest calls; resume changed continuations in the interpreter.",
+  "regression": {
+    "negative_control": "Old handler fails cached/classic/verify in fixture reflecting the production guard split.",
+    "positive_control": "12 passes: cached/classic/verify x lean/flat x x86/AArch64-QEMU.",
+    "test_scope": "Synthetic registered guest callback; stubbed platform executable-write notification. Tests immediate changed continuation and next-entry fallback."
+  },
+  "rex": {
+    "output_frames": 300,
+    "resimulations": 297,
+    "verified_snapshot_operations": 894,
+    "gecko_last_report": "[gecko-verify] 2400 passes compared, 0 mismatched",
+    "log_sha256": "25d406ec7a564ba56ed82d513b91a7d3ac4f7e9dfaf6070d1bb9cabfd6753cd9",
+    "completion": {
+      "distance": 2,
+      "status": [
+        "run",
+        "scMelee",
+        "540",
+        "1594"
+      ],
+      "complete_line": [
+        "[rollback] COMPLETE frames=300 saves=597 loads=297 advances=597 desyncs=0 region_differences=297"
+      ]
+    }
+  },
+  "rex_gecko_off_control": {
+    "native_gecko_disabled_completion": {
+      "distance": 2,
+      "status": [
+        "run",
+        "scMelee",
+        "540",
+        "1988"
+      ],
+      "complete_line": [
+        "[rollback] COMPLETE frames=300 saves=597 loads=297 advances=597 desyncs=0 region_differences=297"
+      ]
+    },
+    "verified_snapshot_operations": 894,
+    "compared_rows": 597,
+    "field_mismatches": {
+      "gameplay_hash": 0,
+      "fighters": 0,
+      "rng": 0,
+      "rng_other": 0,
+      "libc_rng": 0,
+      "input_hash": 0
+    },
+    "interpretation": "Full-memory differences persist with native Gecko disabled; native Gecko alone does not explain them. This does not isolate other native paths."
+  },
+  "limits": [
+    "No exhaustive arbitrary-mod proof.",
+    "Native ARM validation remains unavailable; QEMU is CPU-level evidence.",
+    "REX full-memory differences persist; causes still under investigation.",
+    "No performance claim for this change."
+  ],
+  "binary_sha256": "5639346a136dd284b3a18ccef88fd44a90319ed9a3642d82141c7dd22945cefa",
+  "project_plus_recordings": [
+    {
+      "recording": "match-001-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-001/game.brep",
+        "source_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "log_sha256": "473c9a5b37c478c3be47a62f819b2fbda72b40e7aeb4b688b0267b2567b215f3"
+    },
+    {
+      "recording": "match-064-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-064/game.brep",
+        "source_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "log_sha256": "5a7175cd637613aa33e723cc85eb55fd33afbfe75b9ed233831cceeab8144b0a"
+    },
+    {
+      "recording": "match-128-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-128/game.brep",
+        "source_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "log_sha256": "471ceab57d557d08375062c4eae86bcb25bdb30731c93c5bff85719f468f0857"
+    }
+  ]
+}

@@ -451,6 +451,16 @@ namespace GuestCodePatch {
 
 bool Active() { return g_active.load(std::memory_order_acquire); }
 
+bool AnyPatchedInRange(uint32_t start, uint32_t end) {
+    if (start >= end || g_mkwGuardedFunctionCount == 0) return false;
+    const auto first = std::max<int64_t>(0, FunctionIndex(start));
+    for (uint32_t i = static_cast<uint32_t>(first);
+         i < g_mkwGuardedFunctionCount && g_mkwGuardedFunctionStarts[i] < end; ++i) {
+        if (g_mkwGuestCodePatched[i]) return true;
+    }
+    return false;
+}
+
 void RegisterOriginalNative(uint32_t address, void (*entry)(CpuContext*)) {
     // Native hooks register during startup, before guest execution.
     OriginalNatives().push_back({address, entry});
