@@ -93,3 +93,9 @@ The regression test marks a dependency write and asks the resolver to reject the
 A separate experiment registered the translated drawing body as an original trampoline with native drawing disabled. Its 16 timing runs passed checksum gates and three 300-frame one-redo recordings passed the snapshot replay harness. The experiment did not establish a consistent frame-time benefit, so that registration change is not retained. Those replay runs preceded the synchronization fix and must not be cited as replay validation of this fix.
 
 Post-fix x86 validation of `808aeb2`: recordings 001/064/128 pass 120-frame one-redo windows, with all 1,062 snapshot operations verified, completed fuzz trials and no reported native differential failures. Binary SHA-256: `e84c2a17420c0a8c3fdeeb117f15d3b7cabad6d442d68405883ba47e6de34081`. These runs validate the retained default stack; the trampoline-specific pending-write behavior is covered by the synthetic regression above. [Replay evidence](trampoline-sync-validation.json).
+
+## Fill-memory candidate not retained
+
+An exact-register candidate for `__fill_mem` passed three x86 120-frame one-redo recordings, 1,062 snapshot checks, and 2,000 randomized fill-memory trials per recording. A standalone test using the generated reference body also passed 32,896 full-context and destination/guard-byte cases on x86 and AArch64 under QEMU. Native ARM replay testing remains unavailable.
+
+The 16-run paired recording-128 experiment did not establish a consistent end-to-end benefit: 0f mean changed from 1.965455 to 1.981333 ms, and 1f from 3.986572 to 3.947026 ms, with substantial repeat variability. Most live fill calls still required checked-store fallback. The candidate was removed; the default remains translated fill-memory execution. [Experiment receipt](fillmem-experiment.json).

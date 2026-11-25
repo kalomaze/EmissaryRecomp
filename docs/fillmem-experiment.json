@@ -1,0 +1,69 @@
+{
+  "decision": "not retained: no consistent end-to-end improvement established",
+  "baseline_commit": "d3691a5",
+  "candidate_patch_sha256": "2c603cb5e116e36e3f769948c5a9bf537211de9b017530b1fdb70d2064c6cd1b",
+  "timing": {
+    "0": {
+      "old": {
+        "mean_ms": 1.9654547734375,
+        "runs_ms": [
+          1.9814699687500001,
+          1.9456508562500001,
+          1.9937102885416667,
+          1.9409879802083334
+        ],
+        "stdev_ms": 0.02611308561869229
+      },
+      "new": {
+        "mean_ms": 1.9813332953125,
+        "runs_ms": [
+          1.977672203125,
+          1.97859865625,
+          2.0034946020833333,
+          1.9655677197916668
+        ],
+        "stdev_ms": 0.01592229816014428
+      }
+    },
+    "2": {
+      "old": {
+        "mean_ms": 3.9865716330729164,
+        "runs_ms": [
+          3.962892185416666,
+          4.002903008333333,
+          3.983650103125,
+          3.9968412354166665
+        ],
+        "stdev_ms": 0.017714684386472286
+      },
+      "new": {
+        "mean_ms": 3.947025859375,
+        "runs_ms": [
+          3.874658559375,
+          3.974900880208333,
+          3.9082765979166667,
+          4.0302674000000005
+        ],
+        "stdev_ms": 0.06938948586286607
+      }
+    }
+  },
+  "checks": {
+    "x86_recordings": 3,
+    "output_frames_each": 120,
+    "verified_snapshot_operations": 1062,
+    "fillmem_fuzz_trials_per_recording": 2000,
+    "standalone_cases_per_architecture": 32896,
+    "standalone_architectures": [
+      "x86_64",
+      "AArch64 under QEMU"
+    ],
+    "native_arm": false
+  },
+  "limitations": [
+    "Only recording128 was timed.",
+    "Four repeats per arm and rollback depth; observed mean differences do not establish a consistent benefit.",
+    "Plain-RAM candidate declines checked-store ranges; most live calls in the verification window declined.",
+    "QEMU evidence is not native ARM replay validation."
+  ]
+}
