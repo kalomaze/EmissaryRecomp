@@ -1,0 +1,103 @@
+{
+  "scope": "Eleven retained non-Gecko helper entry intervals; metadata only",
+  "inputs_sha256": {
+    "base_translation_output.json": "39343ff633e029c002e52597cedad4cfb1385cc5fa3dfc73675a88d75880838b",
+    "guest_code_guard_acfd447672aef4aa.cpp": "acfd447672aef4aa45f3e2d9964f4015a576a3a38b3e0f4c8434df6be6a5ce53"
+  },
+  "guard_count": 120362,
+  "helpers": [
+    {
+      "helper": "memcpy",
+      "start": "80004338",
+      "next_guard": "80004388",
+      "guest_instructions": 20,
+      "direct_calls": [],
+      "passed": true
+    },
+    {
+      "helper": "Mtx44Copy",
+      "start": "80162c04",
+      "next_guard": "80162c48",
+      "guest_instructions": 17,
+      "direct_calls": [],
+      "passed": true
+    },
+    {
+      "helper": "CameraMtx",
+      "start": "801a7dbc",
+      "next_guard": "801a7e1c",
+      "guest_instructions": 24,
+      "direct_calls": [
+        "801a81d4"
+      ],
+      "passed": true
+    },
+    {
+      "helper": "EnvTexMtx",
+      "start": "801a7fc8",
+      "next_guard": "801a8048",
+      "guest_instructions": 32,
+      "direct_calls": [],
+      "passed": true
+    },
+    {
+      "helper": "LightSettingCopy",
+      "start": "801b6708",
+      "next_guard": "801b6898",
+      "guest_instructions": 100,
+      "direct_calls": [
+        "8019dfac"
+      ],
+      "passed": true
+    },
+    {
+      "helper": "PSMTXCopy",
+      "start": "801ec184",
+      "next_guard": "801ec1b8",
+      "guest_instructions": 13,
+      "direct_calls": [],
+      "passed": true
+    },
+    {
+      "helper": "PSMTXConcat",
+      "start": "801ec1b8",
+      "next_guard": "801ec284",
+      "guest_instructions": 51,
+      "direct_calls": [],
+      "passed": true
+    },
+    {
+      "helper": "PSMTXConcatArray",
+      "start": "801ec284",
+      "next_guard": "801ec41c",
+      "guest_instructions": 102,
+      "direct_calls": [],
+      "passed": true
+    },
+    {
+      "helper": "PSMTXInverse",
+      "start": "801ec41c",
+      "next_guard": "801ec514",
+      "guest_instructions": 62,
+      "direct_calls": [],
+      "passed": true
+    },
+    {
+      "helper": "AXFXReverbHiExpCallback",
+      "start": "80202a58",
+      "next_guard": "80202f70",
+      "guest_instructions": 326,
+      "direct_calls": [],
+      "passed": true
+    },
+    {
+      "helper": "AXFXDelayCallback",
+      "start": "80203a10",
+      "next_guard": "80203b90",
+      "guest_instructions": 96,
+      "direct_calls": [],
+      "passed": true
+    }
+  ],
+  "passed": true
+}
