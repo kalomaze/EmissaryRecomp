@@ -1,0 +1,120 @@
+{
+  "commit": "cb9887a",
+  "binary_sha256": "4049cd2017dacc0e5730dee54f9e0aadc0b8d3b6fccb3afb4047d78c86cb2e3f",
+  "recordings": [
+    {
+      "recording": "match-001-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-001/game.brep",
+        "source_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "runtime_log_sha256": "ae7034d983c8ca276edbfefb55a3d7ffd6ed9877900571a7106b7a967757ff1b",
+      "snapshot_csv_sha256": "6ac5e52884215f0d2784aebf4e577102de9685a3abc21209bae65c834b8c7de8"
+    },
+    {
+      "recording": "match-064-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-064/game.brep",
+        "source_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "runtime_log_sha256": "51c4afb0c582baacff9ce5cfbd7128a62adfe983e4637ed7643de333d42c4798",
+      "snapshot_csv_sha256": "1ef78aa5cbb34b9fff0565ad7ab6984e33c3df404b98788c5106e093eaa5354e"
+    },
+    {
+      "recording": "match-128-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-128/game.brep",
+        "source_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "runtime_log_sha256": "b34275d63354e1bb825051099e96ed73d10193bbcf05e139861cefb9193fca27",
+      "snapshot_csv_sha256": "e8e2b323e4bf9e8f15ae191db35e1b543509a61fe5978feb10c40d753ba2da74"
+    }
+  ],
+  "paired_recording128_timing": {
+    "0": {
+      "old": {
+        "mean_ms": 1.9527555627604167,
+        "runs_ms": [
+          1.9076222979166668,
+          1.9600791614583335,
+          1.9511561479166666,
+          1.99216464375
+        ],
+        "stdev_ms": 0.03486297217024649
+      },
+      "new": {
+        "mean_ms": 1.96506438515625,
+        "runs_ms": [
+          1.9258696552083332,
+          2.0031443104166664,
+          1.9855707927083335,
+          1.9456727822916666
+        ],
+        "stdev_ms": 0.03550987926328338
+      }
+    },
+    "2": {
+      "old": {
+        "mean_ms": 3.9188732093749996,
+        "runs_ms": [
+          3.803132661458333,
+          3.960762373958333,
+          3.987497720833333,
+          3.92410008125
+        ],
+        "stdev_ms": 0.081419122045607
+      },
+      "new": {
+        "mean_ms": 3.9452129635416666,
+        "runs_ms": [
+          3.969738989583333,
+          3.9253001281250004,
+          3.941382326041667,
+          3.9444304104166665
+        ],
+        "stdev_ms": 0.01837872992327079
+      }
+    }
+  },
+  "timing_run_count": 16,
+  "timing_local_reanalysis_matches": true,
+  "timing_identities": {
+    "old": {
+      "binary": "e84c2a17420c0a8c3fdeeb117f15d3b7cabad6d442d68405883ba47e6de34081",
+      "config": "a43fa16dc71d6f1722a1c292df04ebeecfde5869c156b45ee72f8627c3ded0cf"
+    },
+    "new": {
+      "binary": "4049cd2017dacc0e5730dee54f9e0aadc0b8d3b6fccb3afb4047d78c86cb2e3f",
+      "config": "a43fa16dc71d6f1722a1c292df04ebeecfde5869c156b45ee72f8627c3ded0cf"
+    }
+  },
+  "limitations": [
+    "Native ARM replay validation remains pending.",
+    "Timing differences are small relative to repeat variation; not proof of unchanged performance or a speedup.",
+    "These results predate the SDK instruction-cache HLE follow-up."
+  ]
+}
