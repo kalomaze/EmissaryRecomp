@@ -1,0 +1,67 @@
+{
+  "parent_commit": "5077df5",
+  "binary_sha256": "e9b75cde36ab6cd62885830f7947e69a0b56abc28fb7de8fb2091d1efa5914c5",
+  "recordings": [
+    {
+      "recording": "match-001-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-001/game.brep",
+        "source_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "runtime_log_sha256": "fb9db2f4faebd792a5aac700f9104598845863b7c743dc590330c24daa08f3cc"
+    },
+    {
+      "recording": "match-064-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-064/game.brep",
+        "source_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "runtime_log_sha256": "b096a66591252523fd46569e77ef4bd67cc97eec105e845c88a891e27f0597ff"
+    },
+    {
+      "recording": "match-128-delta",
+      "comparison": {
+        "source": "/dev/shm/emissary-portable-e2e/workspace/replay-corpus/match-128/game.brep",
+        "source_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+        "required_frames": 120,
+        "compared_frames": 120,
+        "full_match": false,
+        "missing_frames": [],
+        "mismatched_frames": 0,
+        "first_mismatches": [],
+        "passed": true
+      },
+      "verified_snapshot_operations": 354,
+      "runtime_log_sha256": "4aba717dbf863d21f321cf6d03fed4b8fcdd9e958e1dc4a2deb4c7017d32cf65"
+    }
+  ],
+  "cpu_tests": {
+    "x86_lean": 7,
+    "x86_flat": 7,
+    "aarch64_qemu_lean": 8,
+    "aarch64_qemu_flat": 8,
+    "negative_control": "Omitting synchronization before a guarded call after a host code restore fails cached, classic and verifying modes."
+  },
+  "limits": [
+    "CPU regression explicitly supplies executable-write notification because the harness stubs the platform hook.",
+    "Bounded replay validation exercises the gameplay rollback path; it does not directly establish online-core restore callback coverage.",
+    "Native ARM and REX gameplay validation remain pending.",
+    "This synchronizes restored instruction bytes, not all host-side module or patch metadata."
+  ]
+}

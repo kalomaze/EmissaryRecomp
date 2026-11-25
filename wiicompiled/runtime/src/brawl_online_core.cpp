@@ -152,6 +152,8 @@ void SnapshotRestore(int key) {
     auto read = [cursor = size_t{0}](size_t offset, uint8_t* out, size_t n) mutable { s_snap.Transfer<false>(cursor, offset, out, n); };
     auto write = [cursor = size_t{0}](size_t offset, const uint8_t* in, size_t n) mutable { s_snap.Transfer<true>(cursor, offset, const_cast<uint8_t*>(in), n); };
     s.store->Restore(key, s.anchor, dirty, read, write);
+    // Restored executable bytes must reach native/variant guards before resimulation.
+    GuestCodePatch::Sync();
     // Capture consumed the marks; the direct restore copies do not set new ones.
     s.anchor = key;
 }

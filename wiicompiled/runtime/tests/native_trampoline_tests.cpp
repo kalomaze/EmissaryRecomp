@@ -4,6 +4,7 @@
 #include "guest_code_patch.h"
 #include "guest_native_trampoline.h"
 #include <cassert>
+#include <cstring>
 #include <iterator>
 #include <utility>
 
@@ -73,6 +74,18 @@ static void TestOriginalTrampoline() {
     // its pending notification; the interpreted stw still performs the edit.
     assert(GuestCodePatch::NoteWrite(0x80007040u));
     PpcInterpreter::Run(&patchCtx, patchCaller);
+    assert(patchCtx.gpr[3] == 12);
+    Memory::Write32(0x80007040u, 0x38630001u);
+    GuestCodePatch::ResetPristine(0x80007040u, 0x80007060u);
+
+    // A host snapshot restore can replace code without executing a guest isync.
+    // As above, this harness supplies the stubbed executable-write notification.
+    const uint8_t restoredAddTwo[] = {0x38, 0x63, 0x00, 0x02};
+    std::memcpy(Memory::GetPointer(0x80007040u, 4), restoredAddTwo, 4);
+    assert(GuestCodePatch::NoteWrite(0x80007040u));
+    GuestCodePatch::Sync(); // host restore boundary, before guest execution resumes
+    patchCtx.gpr[3] = 10;
+    GuardedCallee(&patchCtx);
     assert(patchCtx.gpr[3] == 12);
     Memory::Write32(0x80007040u, 0x38630001u);
     GuestCodePatch::ResetPristine(0x80007040u, 0x80007060u);

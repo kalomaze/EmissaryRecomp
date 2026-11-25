@@ -12,6 +12,7 @@
 #include "brawl_online_ipc.h"
 #include "brawl_online_core.h"
 #include "memory.h"
+#include "guest_code_patch.h"
 #include "ppc_runtime.h"
 #include "save_states.h"
 #include "gekkonet.h"
@@ -440,6 +441,9 @@ void Load(int frame,CpuContext* ctx) {
             pos+=r.size;
         }
     }
+    // A restore may replace executable bytes without a guest isync. Publish
+    // pending code writes before a native entry or cached variant can run.
+    GuestCodePatch::Sync();
     *ctx=s.cpu;++session.loads;
     // Capture consumed the incremental path's marks; TransferPacked restores
     // bytes directly without setting new marks. Full-copy loads skip Capture.
