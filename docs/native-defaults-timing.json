@@ -1,0 +1,879 @@
+{
+  "runs": {
+    "d28-m001-d0-s0-dolphin": {
+      "name": "d28-m001-d0-s0-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 2.2432531708333334,
+        "p75": 2.266541,
+        "p90": 2.54439,
+        "p95": 3.1594745499999997,
+        "p99": 4.336833989999996
+      },
+      "Mcycles": {
+        "mean": 10.90793430625,
+        "p75": 11.272039,
+        "p90": 12.033206300000002,
+        "p95": 12.656784,
+        "p99": 17.494827699999995
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.040008577420305,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "25866b9c0416d9654a0b26ef688b4881eab9e55ac2572a7302254ec6e4b1d912"
+    },
+    "d28-m001-d0-s1-recomp": {
+      "name": "d28-m001-d0-s1-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 2.0218299791666667,
+        "p75": 2.092986,
+        "p90": 2.1874,
+        "p95": 2.26716865,
+        "p99": 2.4588972999999994
+      },
+      "Mcycles": {
+        "mean": 10.143055585416668,
+        "p75": 10.49185125,
+        "p90": 10.9870194,
+        "p95": 11.3793351,
+        "p99": 12.348401129999994
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.031803881769771,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "39a1057a77563f0883d0c4fb3007d78e5ad893bacafd3ccb822b65dec1234f02",
+      "checksums": "PASS",
+      "samples_sha256": "b4a517c3a39331b4d32e0efcf145d6c88ad2dacbe7788d68e1cd098ca8bd7d0c"
+    },
+    "d28-m001-d0-s2-recomp": {
+      "name": "d28-m001-d0-s2-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.8576819072916666,
+        "p75": 1.9364895,
+        "p90": 2.0642393,
+        "p95": 2.1790916499999997,
+        "p99": 2.47348284
+      },
+      "Mcycles": {
+        "mean": 9.330229754166664,
+        "p75": 9.734106500000001,
+        "p90": 10.3805169,
+        "p95": 10.932087849999998,
+        "p99": 12.43191231
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.0326230261966,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "39a1057a77563f0883d0c4fb3007d78e5ad893bacafd3ccb822b65dec1234f02",
+      "checksums": "PASS",
+      "samples_sha256": "5205dfd954fba8115aec0bc53836630f12e045c3597b3429e02ed5457cff3498"
+    },
+    "d28-m001-d0-s3-dolphin": {
+      "name": "d28-m001-d0-s3-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 2.2328762979166665,
+        "p75": 2.274413,
+        "p90": 2.5424451,
+        "p95": 2.9425352,
+        "p99": 3.8059095899999944
+      },
+      "Mcycles": {
+        "mean": 10.965933597916665,
+        "p75": 11.3375015,
+        "p90": 12.107419,
+        "p95": 12.661068599999998,
+        "p99": 17.128687819999985
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.039328145693128,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "dc57066339693588c9a8b64b9db4a7e0584824d82fa33d32d9e6124af607fbce"
+    },
+    "d28-m001-d2-s0-dolphin": {
+      "name": "d28-m001-d2-s0-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 4.390564133333333,
+        "p75": 4.5595895,
+        "p90": 4.9679391,
+        "p95": 5.23457915,
+        "p99": 5.8557615799999985
+      },
+      "Mcycles": {
+        "mean": 21.62681187291667,
+        "p75": 22.3729515,
+        "p90": 23.4831739,
+        "p95": 24.29431795,
+        "p99": 28.258323319999988
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.0363675761874935,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "0fed7f2b1dd5c403be807386f1d5d775db2650c5a98a4ecb597af8a852dd2e59"
+    },
+    "d28-m001-d2-s1-recomp": {
+      "name": "d28-m001-d2-s1-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.95995371875,
+        "p75": 4.1352875,
+        "p90": 4.3367212,
+        "p95": 4.448313649999999,
+        "p99": 4.73933691
+      },
+      "Mcycles": {
+        "mean": 19.909906525,
+        "p75": 20.794494,
+        "p90": 21.808838299999998,
+        "p95": 22.396810549999998,
+        "p99": 23.753565269999996
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.037796018458056,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "39a1057a77563f0883d0c4fb3007d78e5ad893bacafd3ccb822b65dec1234f02",
+      "checksums": "PASS",
+      "samples_sha256": "51b6b01a89dd4437832006f52d7e83dcc22e7479367fa3bcfdf18e57f554554e"
+    },
+    "d28-m001-d2-s2-recomp": {
+      "name": "d28-m001-d2-s2-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 4.114512997916667,
+        "p75": 4.26504,
+        "p90": 4.452679300000001,
+        "p95": 4.54922355,
+        "p99": 4.82912234
+      },
+      "Mcycles": {
+        "mean": 20.73660216666667,
+        "p75": 21.5103225,
+        "p90": 22.4694971,
+        "p95": 22.9423095,
+        "p99": 24.379155769999997
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.050246341935579,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "39a1057a77563f0883d0c4fb3007d78e5ad893bacafd3ccb822b65dec1234f02",
+      "checksums": "PASS",
+      "samples_sha256": "b08eb544a63c1eafab0e60a776abc29f15bde42285bd7bbe5871985f087a0bc0"
+    },
+    "d28-m001-d2-s3-dolphin": {
+      "name": "d28-m001-d2-s3-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 4.332925639583333,
+        "p75": 4.4436925,
+        "p90": 4.998948400000001,
+        "p95": 5.4987186999999995,
+        "p99": 6.847711259999999
+      },
+      "Mcycles": {
+        "mean": 21.085507245833334,
+        "p75": 21.84297575,
+        "p90": 22.8982935,
+        "p95": 23.66748195,
+        "p99": 27.242075939999967
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.0497180731794975,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "4f1d737cf44c35c39ff48aa32779fbde699052892211025d44b1d4ee925087f2"
+    },
+    "d28-m064-d0-s0-recomp": {
+      "name": "d28-m064-d0-s0-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.7736423395833334,
+        "p75": 1.8615410000000001,
+        "p90": 2.0047981,
+        "p95": 2.1216278999999996,
+        "p99": 2.3147069599999996
+      },
+      "Mcycles": {
+        "mean": 8.918478529166668,
+        "p75": 9.353007000000002,
+        "p90": 10.0938672,
+        "p95": 10.666365549999998,
+        "p99": 11.6551002
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.0383560044369196,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "39a1057a77563f0883d0c4fb3007d78e5ad893bacafd3ccb822b65dec1234f02",
+      "checksums": "PASS",
+      "samples_sha256": "826819790d560aae786e38d388ad11795356d999da8985b13743968cd5298e15"
+    },
+    "d28-m064-d0-s1-dolphin": {
+      "name": "d28-m064-d0-s1-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.9993241625,
+        "p75": 2.0539509999999996,
+        "p90": 2.306616,
+        "p95": 2.6673860499999993,
+        "p99": 3.5988331399999964
+      },
+      "Mcycles": {
+        "mean": 9.830917531250002,
+        "p75": 10.26892875,
+        "p90": 11.084082500000001,
+        "p95": 11.73372565,
+        "p99": 15.834276449999965
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.037569304609273,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "896f800b50010a24b1a8cb9e0e1eb247a312c843f13f8a72694e9b46e0021034"
+    },
+    "d28-m064-d0-s2-dolphin": {
+      "name": "d28-m064-d0-s2-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 2.050295771875,
+        "p75": 2.12313875,
+        "p90": 2.3673612,
+        "p95": 2.7005565499999995,
+        "p99": 3.50012506
+      },
+      "Mcycles": {
+        "mean": 10.112887913541666,
+        "p75": 10.58263675,
+        "p90": 11.420537300000001,
+        "p95": 11.954567050000001,
+        "p99": 16.40710723999997
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.038333869252269,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "59651a8959be53f08e74548f16b482cf62ff298bafab7fb8b92371ac00c774db"
+    },
+    "d28-m064-d0-s3-recomp": {
+      "name": "d28-m064-d0-s3-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.9069504177083332,
+        "p75": 1.99000175,
+        "p90": 2.1083783,
+        "p95": 2.1722439999999996,
+        "p99": 2.351785
+      },
+      "Mcycles": {
+        "mean": 9.575492116666664,
+        "p75": 9.9947395,
+        "p90": 10.5607135,
+        "p95": 10.893375650000001,
+        "p99": 11.771179599999998
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.033204895581727,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "39a1057a77563f0883d0c4fb3007d78e5ad893bacafd3ccb822b65dec1234f02",
+      "checksums": "PASS",
+      "samples_sha256": "5f9271a1f8ac7aa7a89fa8b0ffccb43838b73167d0df0375b72e1e9497d02fdf"
+    },
+    "d28-m064-d2-s0-recomp": {
+      "name": "d28-m064-d2-s0-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.8131397124999995,
+        "p75": 3.98054575,
+        "p90": 4.1854059,
+        "p95": 4.3120735,
+        "p99": 4.531542409999999
+      },
+      "Mcycles": {
+        "mean": 19.161137347916668,
+        "p75": 20.005602250000003,
+        "p90": 21.030260900000002,
+        "p95": 21.60866625,
+        "p99": 22.792133089999997
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.031864167094732,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "39a1057a77563f0883d0c4fb3007d78e5ad893bacafd3ccb822b65dec1234f02",
+      "checksums": "PASS",
+      "samples_sha256": "0e217449ee3b333e5b0b0f0c3425f8a24f9051760ff27003358a9733c4ceb456"
+    },
+    "d28-m064-d2-s1-dolphin": {
+      "name": "d28-m064-d2-s1-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.8797854989583334,
+        "p75": 4.042806000000001,
+        "p90": 4.470841500000001,
+        "p95": 4.841879699999999,
+        "p99": 5.860842129999998
+      },
+      "Mcycles": {
+        "mean": 18.991507633333335,
+        "p75": 19.8048055,
+        "p90": 21.1252156,
+        "p95": 21.838214699999998,
+        "p99": 25.851745639999958
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.035278148621339,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "8cf34d6768623f2de64abbf4fd7e03e26c5f4b26a82acfcb935a8c9b681b1969"
+    },
+    "d28-m064-d2-s2-dolphin": {
+      "name": "d28-m064-d2-s2-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.922059282291667,
+        "p75": 4.09703125,
+        "p90": 4.4912605,
+        "p95": 4.79414215,
+        "p99": 5.732173519999999
+      },
+      "Mcycles": {
+        "mean": 19.274377912499997,
+        "p75": 20.135835,
+        "p90": 21.4346252,
+        "p95": 22.244656049999996,
+        "p99": 25.804416469999968
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.037325000942494,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "985510f537f67bb42ac6cf7cde77d0a30523aeb2eb268693563782f1b9d15ce4"
+    },
+    "d28-m064-d2-s3-recomp": {
+      "name": "d28-m064-d2-s3-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.842488257291667,
+        "p75": 4.00792675,
+        "p90": 4.2324191,
+        "p95": 4.343748049999999,
+        "p99": 4.5583814
+      },
+      "Mcycles": {
+        "mean": 19.311121609374997,
+        "p75": 20.14219425,
+        "p90": 21.2413624,
+        "p95": 21.804868799999998,
+        "p99": 22.90807954
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.0320442222643464,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "39a1057a77563f0883d0c4fb3007d78e5ad893bacafd3ccb822b65dec1234f02",
+      "checksums": "PASS",
+      "samples_sha256": "40fc336fb26274967fd15def0c54de87b151a2e2e4f4dae7a81c40533c45ee87"
+    },
+    "d28-m128-d0-s0-dolphin": {
+      "name": "d28-m128-d0-s0-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 2.025476620833333,
+        "p75": 2.108805,
+        "p90": 2.3145919999999998,
+        "p95": 2.5450687999999997,
+        "p99": 3.2134585199999988
+      },
+      "Mcycles": {
+        "mean": 10.093787346875,
+        "p75": 10.51305325,
+        "p90": 11.3643863,
+        "p95": 11.947853599999998,
+        "p99": 16.182794959999995
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.038049406196785,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "540768fc3ed1c3fd7d0ee81f77a92eb62ba7f236efc389333e25d141f833cd67"
+    },
+    "d28-m128-d0-s1-recomp": {
+      "name": "d28-m128-d0-s1-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.9971118312499998,
+        "p75": 2.08670975,
+        "p90": 2.2072635000000003,
+        "p95": 2.2905396,
+        "p99": 2.4556050799999998
+      },
+      "Mcycles": {
+        "mean": 10.013972696875,
+        "p75": 10.469891,
+        "p90": 11.0488353,
+        "p95": 11.5140678,
+        "p99": 12.318496089999998
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.03724117392582,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "39a1057a77563f0883d0c4fb3007d78e5ad893bacafd3ccb822b65dec1234f02",
+      "checksums": "PASS",
+      "samples_sha256": "b3bb7fae4cc831fac716ee38d3f1fd36a55f65fa7f9485013c7dac684f2da0ef"
+    },
+    "d28-m128-d0-s2-recomp": {
+      "name": "d28-m128-d0-s2-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.7771621458333333,
+        "p75": 1.860006,
+        "p90": 1.986523,
+        "p95": 2.065461,
+        "p99": 2.25777576
+      },
+      "Mcycles": {
+        "mean": 8.934212842708332,
+        "p75": 9.35487175,
+        "p90": 9.9908196,
+        "p95": 10.3842705,
+        "p99": 11.3562243
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.032083684970937,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "39a1057a77563f0883d0c4fb3007d78e5ad893bacafd3ccb822b65dec1234f02",
+      "checksums": "PASS",
+      "samples_sha256": "eaa50c548397c9a9b707709f46e25ddc031c55fe600bfc951e612a490acb1921"
+    },
+    "d28-m128-d0-s3-dolphin": {
+      "name": "d28-m128-d0-s3-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 2.0266600333333336,
+        "p75": 2.1036599999999996,
+        "p90": 2.3404711,
+        "p95": 2.5416652,
+        "p99": 3.289566299999999
+      },
+      "Mcycles": {
+        "mean": 10.1036081375,
+        "p75": 10.5171655,
+        "p90": 11.3407637,
+        "p95": 11.986393899999998,
+        "p99": 16.575882099999994
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.040309871467387,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "5f0c2f0ff2dfa8db04e8a3b1b12bf7df88884a94d68fb0eae3d0881947e1d676"
+    },
+    "d28-m128-d2-s0-dolphin": {
+      "name": "d28-m128-d2-s0-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.88809986875,
+        "p75": 4.088992,
+        "p90": 4.3700228,
+        "p95": 4.563315299999999,
+        "p99": 5.1507958799999995
+      },
+      "Mcycles": {
+        "mean": 19.41718610520833,
+        "p75": 20.3467925,
+        "p90": 21.5874099,
+        "p95": 22.46251595,
+        "p99": 25.317707739999975
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.04752754297864,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "17c44f4d3cefaa69dc4315f2ff9bcedfcaa098e5b6eb3541fbc7439410a7e0a7"
+    },
+    "d28-m128-d2-s1-recomp": {
+      "name": "d28-m128-d2-s1-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 4.054406267708333,
+        "p75": 4.2378925,
+        "p90": 4.4436382,
+        "p95": 4.5792762,
+        "p99": 4.84780698
+      },
+      "Mcycles": {
+        "mean": 20.339213572916666,
+        "p75": 21.253907249999997,
+        "p90": 22.3159062,
+        "p95": 22.936123499999997,
+        "p99": 24.36328525
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.035536872490584,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "39a1057a77563f0883d0c4fb3007d78e5ad893bacafd3ccb822b65dec1234f02",
+      "checksums": "PASS",
+      "samples_sha256": "c1b8f83c2be1698f8cbc5c9c7881f61b2647d24473670cae45920ad1d0b2c5f6"
+    },
+    "d28-m128-d2-s2-recomp": {
+      "name": "d28-m128-d2-s2-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 4.016362334375,
+        "p75": 4.197245,
+        "p90": 4.408817099999999,
+        "p95": 4.553654,
+        "p99": 4.79812437
+      },
+      "Mcycles": {
+        "mean": 20.179793334375,
+        "p75": 21.0924145,
+        "p90": 22.1478903,
+        "p95": 22.8771596,
+        "p99": 24.12004988
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.032500053997051,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "39a1057a77563f0883d0c4fb3007d78e5ad893bacafd3ccb822b65dec1234f02",
+      "checksums": "PASS",
+      "samples_sha256": "bdfe5a2a3f68bc01af9dbc8dbda65dc52bb291ccc072441d0b19956b0003a2dc"
+    },
+    "d28-m128-d2-s3-dolphin": {
+      "name": "d28-m128-d2-s3-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.8356808322916667,
+        "p75": 4.041494,
+        "p90": 4.366955600000001,
+        "p95": 4.63561555,
+        "p99": 5.420350699999995
+      },
+      "Mcycles": {
+        "mean": 19.085554240625,
+        "p75": 20.11952475,
+        "p90": 21.42222,
+        "p95": 22.243172649999998,
+        "p99": 26.006923679999993
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.039460648813604,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "49befa2bcc7d7ba1754824c4956cbda473cfb647b4aa330af0dbf79472550654"
+    }
+  },
+  "input_sha256": {
+    "001": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+    "064": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+    "128": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206"
+  },
+  "complete": true,
+  "comparisons": {
+    "0f": {
+      "units": "wall_ms",
+      "per_match": {
+        "001": {
+          "dolphin": {
+            "runs": 2,
+            "stats": {
+              "mean": 2.238064734375,
+              "p75": 2.270477,
+              "p90": 2.54341755,
+              "p95": 3.051004875,
+              "p99": 4.071371789999995
+            }
+          },
+          "recomp": {
+            "runs": 2,
+            "stats": {
+              "mean": 1.9397559432291667,
+              "p75": 2.01473775,
+              "p90": 2.12581965,
+              "p95": 2.22313015,
+              "p99": 2.4661900699999997
+            }
+          }
+        },
+        "064": {
+          "dolphin": {
+            "runs": 2,
+            "stats": {
+              "mean": 2.0248099671875,
+              "p75": 2.0885448749999997,
+              "p90": 2.3369885999999997,
+              "p95": 2.6839712999999996,
+              "p99": 3.5494790999999983
+            }
+          },
+          "recomp": {
+            "runs": 2,
+            "stats": {
+              "mean": 1.8402963786458333,
+              "p75": 1.925771375,
+              "p90": 2.0565882,
+              "p95": 2.1469359499999996,
+              "p99": 2.33324598
+            }
+          }
+        },
+        "128": {
+          "dolphin": {
+            "runs": 2,
+            "stats": {
+              "mean": 2.0260683270833333,
+              "p75": 2.1062325,
+              "p90": 2.32753155,
+              "p95": 2.543367,
+              "p99": 3.251512409999999
+            }
+          },
+          "recomp": {
+            "runs": 2,
+            "stats": {
+              "mean": 1.8871369885416667,
+              "p75": 1.973357875,
+              "p90": 2.09689325,
+              "p95": 2.1780003,
+              "p99": 2.3566904199999996
+            }
+          }
+        }
+      },
+      "equal_match": {
+        "dolphin": {
+          "mean": 2.0963143428819446,
+          "p75": 2.1550847916666664,
+          "p90": 2.4026459,
+          "p95": 2.759447725,
+          "p99": 3.6241210999999978
+        },
+        "recomp": {
+          "mean": 1.8890631034722223,
+          "p75": 1.9712889999999998,
+          "p90": 2.093100366666667,
+          "p95": 2.1826887999999998,
+          "p99": 2.38537549
+        }
+      },
+      "reduction_percent": {
+        "mean": 9.8864581122314,
+        "p75": 8.528471472555166,
+        "p90": 12.883527003847428,
+        "p95": 20.90124483151787,
+        "p99": 34.180579948059645
+      }
+    },
+    "1f": {
+      "units": "wall_ms",
+      "per_match": {
+        "001": {
+          "dolphin": {
+            "runs": 2,
+            "stats": {
+              "mean": 4.361744886458333,
+              "p75": 4.501641,
+              "p90": 4.98344375,
+              "p95": 5.366648925,
+              "p99": 6.351736419999998
+            }
+          },
+          "recomp": {
+            "runs": 2,
+            "stats": {
+              "mean": 4.037233358333333,
+              "p75": 4.20016375,
+              "p90": 4.3947002500000005,
+              "p95": 4.4987686,
+              "p99": 4.784229625
+            }
+          }
+        },
+        "064": {
+          "dolphin": {
+            "runs": 2,
+            "stats": {
+              "mean": 3.9009223906250003,
+              "p75": 4.069918625,
+              "p90": 4.481051000000001,
+              "p95": 4.818010924999999,
+              "p99": 5.796507824999999
+            }
+          },
+          "recomp": {
+            "runs": 2,
+            "stats": {
+              "mean": 3.8278139848958332,
+              "p75": 3.99423625,
+              "p90": 4.2089125,
+              "p95": 4.327910774999999,
+              "p99": 4.544961904999999
+            }
+          }
+        },
+        "128": {
+          "dolphin": {
+            "runs": 2,
+            "stats": {
+              "mean": 3.8618903505208335,
+              "p75": 4.065243000000001,
+              "p90": 4.368489200000001,
+              "p95": 4.599465425,
+              "p99": 5.285573289999997
+            }
+          },
+          "recomp": {
+            "runs": 2,
+            "stats": {
+              "mean": 4.035384301041667,
+              "p75": 4.21756875,
+              "p90": 4.4262276499999995,
+              "p95": 4.5664651,
+              "p99": 4.822965675
+            }
+          }
+        }
+      },
+      "equal_match": {
+        "dolphin": {
+          "mean": 4.04151920920139,
+          "p75": 4.212267541666667,
+          "p90": 4.61099465,
+          "p95": 4.928041758333333,
+          "p99": 5.811272511666665
+        },
+        "recomp": {
+          "mean": 3.9668105480902778,
+          "p75": 4.137322916666666,
+          "p90": 4.343280133333333,
+          "p95": 4.464381491666667,
+          "p99": 4.717385735
+        }
+      },
+      "reduction_percent": {
+        "mean": 1.8485291605449095,
+        "p75": 1.7791990717272221,
+        "p90": 5.806003628016954,
+        "p95": 9.40861075056062,
+        "p99": 18.823532616489537
+      }
+    }
+  },
+  "limitations": [
+    "Dolphin OpenGL versus recomp Vulkan; Linux recomp has no OpenGL backend.",
+    "Dolphin is a Release NoGUI build of official 0.2.8 source with a preserved replay snapshot/marker hook; not the exact shipping ELF.",
+    "Recorded playback with snapshots, either zero redo or one redo per output; no network transport or real peer prediction.",
+    "Frame markers differ in phase; full intervals include the selected update/save/load workload. Tail percentiles are averaged run percentiles across three fixed recordings.",
+    "Host wall throughput is not a Switch measurement; cycles measure only game CPU thread, not combined CPU/GPU cost."
+  ]
+}
