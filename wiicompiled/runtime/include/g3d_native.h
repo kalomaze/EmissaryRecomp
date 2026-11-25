@@ -2,8 +2,8 @@
 // Native nw4r g3d draw path (hle/g3d_native.cpp): the HLE-boundary recorder it is verified with.
 //
 // G3D_NATIVE=2 checks every native DrawResMdlDirectly call against the translated one, in the same frame: the native
-// path runs first with the recorder suppressing (each outermost GX HLE entry it reaches is recorded and returns
-// without effect), then the translated function runs for real while recorded. The two event streams, and the
+// path runs first with the recorder suppressing GPU effects (guest texture-object writes are journaled and restored),
+// then the translated function runs for real while recorded. The two event streams, and the
 // G3DState bytes each leaves in guest memory, must be identical. The recorder sits at the GX HLE entry points both
 // paths reach: guest FIFO writes, GXCallDisplayList, and the GX calls nw4r g3d makes.
 #include <cstdint>
@@ -18,6 +18,9 @@ inline uint32_t F32Bits(float f) {
 }
 // The words of a guest matrix (big-endian in memory, host order here), for matrix-load events.
 void RecGuestWords(uint32_t* out, uint32_t addr, uint32_t words);
+// Verification must keep guest-visible HLE writes while suppressing GPU effects.
+// Save a byte before such a write so the translated pass starts from the same input.
+void SaveVerifyGuestByte(uint32_t address);
 
 enum RecTag : uint8_t {
     kRecFifo = 1,        // bytes written to the GX FIFO; a direct GXCallDisplayList records as its FIFO form (0x40)

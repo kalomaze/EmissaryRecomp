@@ -10,6 +10,7 @@
 // one per use, and here each register remembers which form its last write left and is converted at a use of the
 // other form, the same PPC_PsFromScalarInline / PPC_PsToScalarInline conversions translated code makes.
 #include "ppc_interpreter.h"
+#include "guest_native_trampoline.h"
 #include "brawl_online_core.h"
 #include "brawl_rollback.h"
 #include "brawl_dirty_memory.h"
@@ -408,7 +409,25 @@ bool Call(Frame& f, uint32_t target, uint32_t returnTo, const CallSite* site = n
     }
     const bool translated =
         site != nullptr ? site->info != nullptr : TranslatedFunctionRegistry::FindByAddressPtr(target) != nullptr;
-    if (!translated && CanRun(target)) return false;
+    if (!translated && CanRun(target)) {
+        const auto original = GuestCodePatch::ResolveOriginalNativeTrampoline(target);
+        if (original.entry == nullptr) return false;
+        const auto* raw = TranslatedFunctionRegistry::FindRawByAddressPtr(original.address);
+        if (raw == nullptr) return false;
+        RawDispatchRecord call = *raw;
+        call.entry = original.entry;
+        const auto* abi = FloatAbiOf(original.address);
+        NormalizeCallFloatArguments(f, abi);
+        {
+            HZ_EXCLUSIVE_PAUSE();
+            MKW_INTERP_PROFILE_PAUSE();
+            TryDispatchRawCpuTarget(&call, f.ctx);
+        }
+        if (loopCall) BrawlRollback::LoopCallDone(target);
+        NormalizeCalleeFloatReturn(f, abi);
+        NormalizeCallFloatReturn(f);
+        return true;
+    }
     const MkwGuestFloatAbi* floatAbi = site != nullptr ? site->abi : FloatAbiOf(target);
     NormalizeCallFloatArguments(f, floatAbi);
     HZ_EXCLUSIVE_PAUSE();

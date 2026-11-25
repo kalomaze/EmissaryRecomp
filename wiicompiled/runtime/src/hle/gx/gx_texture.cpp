@@ -819,7 +819,11 @@ static void StampTexObjRegisterIds(uint32_t oa, uint32_t tid) {
         const struct { uint32_t off; uint8_t id; } words[4] = {
             {0x00, kMode0[tid]}, {0x04, kMode1[tid]}, {0x08, kImage0[tid]}, {0x0C, kImage3[tid]}};
         for (const auto& w : words) {
-            if (Memory::Read8(oa + w.off) != w.id) Memory::Write8(oa + w.off, w.id);
+            if (Memory::Read8(oa + w.off) != w.id) {
+                if (g3dn::g_recOn && g3dn::g_recSuppress && !g3dn::g_recJob)
+                    g3dn::SaveVerifyGuestByte(oa + w.off);
+                Memory::Write8(oa + w.off, w.id);
+            }
         }
     } catch (...) {
     }
@@ -828,7 +832,6 @@ static void StampTexObjRegisterIds(uint32_t oa, uint32_t tid) {
 // remember: a deferred draw's load (GX_HLE_PlanTexLoadForJob). An inline load (GX__LoadTexObj_HLE) never repeats so:
 // its GXLoadTexObj writes the map's register ids into the host object, so its next plan finds other host bytes.
 static TexLoadPlan PlanTexLoad(uint32_t oa, uint32_t tid, bool remember = false) {
-    StampTexObjRegisterIds(oa, tid);
     if (!remember) return PlanTexLoadFull(oa, tid);
     std::lock_guard<GuestThreadGuard> guard(g_texObjGuard);
     ++s_texPlanJobs;
@@ -929,6 +932,8 @@ static void WriteTexLoadGuestEffects() {
 }
 
 extern "C" void GX__LoadTexObj_HLE(uint32_t oa, uint32_t tid) {
+    // These are guest-visible SDK effects, including during differential recording.
+    StampTexObjRegisterIds(oa, tid);
     G3D_REC_HLE(g3dn::kRecLoadTexObj, oa, tid);
     const TexLoadPlan plan = PlanTexLoad(oa, tid);
     if (!RunTexLoadPlan(plan, oa, tid, plan.obj)) return;
@@ -949,6 +954,7 @@ struct TexLoadJobPlan {
 };
 extern "C" size_t GX_HLE_TexLoadPlanBytes() { return sizeof(TexLoadJobPlan); }
 extern "C" void GX_HLE_PlanTexLoadForJob(uint32_t oa, uint32_t tid, void* out) {
+    StampTexObjRegisterIds(oa, tid);
     TexLoadJobPlan job{};
     job.plan = PlanTexLoad(oa, tid, /*remember=*/true);
     if (job.plan.kind == TexLoadPlan::kLoad) {

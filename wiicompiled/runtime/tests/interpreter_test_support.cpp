@@ -4,6 +4,7 @@
 #include "system_bridge.h"
 #include "ppc_runtime.h"
 #include "recomp_mod_loader.h"
+#include "guest_native_trampoline.h"
 
 #include <csetjmp>
 #include <atomic>
@@ -48,6 +49,7 @@ std::atomic<uint8_t> g_executableWriteGuardMidPages[kExecutableWriteGuardMidPage
 uint32_t CurrentTranslatedExecutionAddress() noexcept { return 0; }
 bool HandleExecutableWrite(uint32_t, size_t, uint64_t) { return false; }
 void CheckExecutableWrite(uint32_t, size_t, uint64_t) {}
+void RegisterExecutableRange(uint32_t, uint32_t, std::string) {}
 }
 
 void SystemBridge::DumpCpuState(const CpuContext*) {}
@@ -82,9 +84,13 @@ bool FrameEnd(CpuContext*) { ++InterpreterTest::frameEnds; return true; }
 void LoopEnd(CpuContext*) { ++InterpreterTest::loopEnds; }
 uint32_t SoundHook(CpuContext*, uint32_t pc) { ++InterpreterTest::soundHooks; return pc + 4; }
 }
+#if !defined(MKW_TEST_REAL_CODE_PATCH)
 namespace GuestCodePatch {
+OriginalNativeTarget ResolveOriginalNativeTrampoline(uint32_t) { return {}; }
 static void TestContinuation(CpuContext* ctx) { ctx->gpr[3] = 0x55; }
 void (*ContinuationAt(uint32_t address))(CpuContext*) {
     return address == 0x8000d004u ? TestContinuation : nullptr;
 }
 }
+
+#endif

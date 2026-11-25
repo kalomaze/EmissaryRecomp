@@ -529,11 +529,39 @@ if(MKW_BUILD_INTERPRETER_TESTS)
         target_link_options(mkw_interpreter_call_forms_tests PRIVATE -Wl,--gc-sections)
     endif()
     set_target_properties(mkw_interpreter_call_forms_tests PROPERTIES UNITY_BUILD OFF)
+    add_executable(mkw_native_trampoline_tests
+        tests/native_trampoline_tests.cpp tests/interpreter_test_support.cpp
+        src/guest_code_patch.cpp src/abi_bridge.cpp src/fpu_helpers.cpp src/memory.cpp src/lean_base.cpp
+        src/ppc_helpers.cpp src/ppc_quantized.cpp src/ppc_interpreter.cpp src/det_clock.cpp)
+    if(MKW_FLAT_MEMORY)
+        target_sources(mkw_native_trampoline_tests PRIVATE src/guest_flat_memory.cpp)
+    endif()
+    target_compile_definitions(mkw_native_trampoline_tests PRIVATE MKW_TEST_REAL_CODE_PATCH=1
+        MKW_LEAN_MEMORY=$<BOOL:${MKW_LEAN_MEMORY}> MKW_FLAT_MEMORY=$<BOOL:${MKW_FLAT_MEMORY}>)
+    target_include_directories(mkw_native_trampoline_tests PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}/interpreter-test-config"
+        "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/..")
+    target_compile_features(mkw_native_trampoline_tests PRIVATE cxx_std_20)
+    target_compile_options(mkw_native_trampoline_tests PRIVATE
+        -UNDEBUG ${MKW_TRANSLATED_PPC_FP_OPTIONS} -ffunction-sections -fdata-sections)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+        target_compile_options(mkw_native_trampoline_tests PRIVATE -march=x86-64-v3)
+    endif()
+    if(APPLE)
+        target_link_options(mkw_native_trampoline_tests PRIVATE -Wl,-dead_strip)
+    else()
+        target_link_options(mkw_native_trampoline_tests PRIVATE -Wl,--gc-sections)
+    endif()
+    set_target_properties(mkw_native_trampoline_tests PROPERTIES UNITY_BUILD OFF)
+    foreach(native_mode IN ITEMS cached classic verify)
+        add_test(NAME mkw_native_trampoline_${native_mode}_tests COMMAND mkw_native_trampoline_tests)
+        set_tests_properties(mkw_native_trampoline_${native_mode}_tests PROPERTIES ENVIRONMENT "BRAWL_INTERP=${native_mode};BRAWL_INTERP_VERIFY=$<STREQUAL:${native_mode},verify>")
+    endforeach()
     add_test(NAME mkw_interpreter_call_forms_tests COMMAND mkw_interpreter_call_forms_tests)
     foreach(interp_mode IN ITEMS cached classic verify)
         add_test(NAME mkw_interpreter_${interp_mode}_online_tests COMMAND mkw_interpreter_call_forms_tests)
         set_tests_properties(mkw_interpreter_${interp_mode}_online_tests PROPERTIES
-            ENVIRONMENT "BRAWL_TEST_ONLINE_CORE=1;BRAWL_INTERP=${interp_mode}")
+            ENVIRONMENT "BRAWL_TEST_ONLINE_CORE=1;BRAWL_INTERP=${interp_mode};BRAWL_INTERP_VERIFY=$<STREQUAL:${interp_mode},verify>")
     endforeach()
 endif()
 

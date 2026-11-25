@@ -22,6 +22,7 @@
 // its verdict. The per-scene caches (compiled lists, shape-list records, model names) go on every scene change.
 #include "abi_bridge.h"
 #include "g3d_native.h"
+#include "guest_native_trampoline.h"
 #include "gx_guest_write.h"
 #include "memory.h"
 #include "runtime_log.h"
@@ -211,6 +212,18 @@ thread_local bool g_recOn = false;
 thread_local bool g_recSuppress = false;
 thread_local bool g_recJob = false;
 thread_local int g_recDepth = 0;
+struct VerifyGuestByte {
+    uint32_t address;
+    uint8_t before, native;
+};
+static std::vector<VerifyGuestByte> s_verifyGuestBytes;
+void SaveVerifyGuestByte(uint32_t address) {
+    // A texture can be loaded into several maps in one draw. Restore its input
+    // once, and compare the final native byte with the translated result.
+    for (const auto& byte : s_verifyGuestBytes)
+        if (byte.address == address) return;
+    s_verifyGuestBytes.push_back({address, Memory::Read8(address), 0});
+}
 static RecBytes s_rec;
 static size_t s_recLastFifo = SIZE_MAX;  // offset of the open FIFO event's header, if the last event is FIFO bytes
 // The offsets of the recording's events the game thread acts on once it defers the draw, in order, so it does not walk
@@ -1758,7 +1771,11 @@ void PlanLoads(PlanBytes& plans) {
 }
 
 void RunNative(CpuContext* ctx, uint32_t mdl, bool compiled) {
-    if (s_async != 0) {
+    // Verify already owns the recorder and suppresses every GX effect. Recording
+    // an async job here would clear that recording, replace its event tags, and
+    // replay/publish real work before the translated comparison. Keep this pass
+    // inline; ordinary native draws still use the configured worker path.
+    if (s_async != 0 && !g_recOn) {
         const bool defer = s_async == 2 && GXShadowDirtyState() == 0 && GX_HLE_IdleForDeferral();
         if (s_async == 2 && !defer) ++s_jobStats.notEligible;
         // The replay here (below) calls the HLE directly, not through its entry thunks: take the vertex state back. A
@@ -1919,6 +1936,7 @@ void Verify(CpuContext* ctx, uint32_t mdl, ModelInfo& info) {
     const uint32_t cr = ctx->cr, xer = ctx->xer, ctr = ctx->ctr, lr = ctx->lr;
     Snapshot before, afterNative, afterGuest;
     before.Take();
+    s_verifyGuestBytes.clear();
     s_rec.clear();
     s_recMarks.clear();
     s_recLoadMarks.clear();
@@ -1929,6 +1947,10 @@ void Verify(CpuContext* ctx, uint32_t mdl, ModelInfo& info) {
     RecBytes nativeRec;
     nativeRec.swap(s_rec);
     afterNative.Take();
+    for (auto& byte : s_verifyGuestBytes) {
+        byte.native = Memory::Read8(byte.address);
+        Memory::Write8(byte.address, byte.before);
+    }
     before.Restore();
     std::memcpy(ctx->gpr, gpr, sizeof(gpr));
     ctx->cr = cr;
@@ -1944,7 +1966,9 @@ void Verify(CpuContext* ctx, uint32_t mdl, ModelInfo& info) {
     g_recOn = false;
     afterGuest.Take();
     const bool eventsEqual = nativeRec == s_rec;
-    const bool stateEqual =
+    const bool guestWritesEqual = std::all_of(s_verifyGuestBytes.begin(), s_verifyGuestBytes.end(),
+        [](const VerifyGuestByte& byte) { return Memory::Read8(byte.address) == byte.native; });
+    const bool stateEqual = guestWritesEqual &&
         afterNative.bss == afterGuest.bss && afterNative.sbss == afterGuest.sbss && afterNative.seed == afterGuest.seed;
     if (eventsEqual && stateEqual) {
         ++s_stats.verifiedOk;
@@ -1954,6 +1978,7 @@ void Verify(CpuContext* ctx, uint32_t mdl, ModelInfo& info) {
     static int logged = 0;
     if (info.mismatches++ < 3 && logged++ < 120) {
         std::string what = eventsEqual ? std::string("events equal") : FirstDifference(nativeRec, s_rec);
+        if (!guestWritesEqual) what += "\n    guest HLE writes differ";
         if (!stateEqual) {
             for (size_t i = 0; i < afterNative.bss.size(); i += 4)
                 if (std::memcmp(&afterNative.bss[i], &afterGuest.bss[i], 4) != 0) {
@@ -2049,6 +2074,9 @@ struct Install {
         if (s_mode == 1 || s_mode == 2) {
             FindSubtreeGuards();
             g_mkwNativeHook[0] = DrawResMdlDirectlyHook;
+            GuestCodePatch::RegisterOriginalNative(0x801A64B0u, [](CpuContext* ctx) {
+                if (!DrawResMdlDirectlyHook(ctx)) func_801A64B0_body(ctx);
+            });
             RT_LOGF(RT_TAG_GX, "[g3dn] native nw4r g3d draws: G3D_NATIVE=%d, fast %d, compiled %d, envelope %d, shape "
                     "%d, async %d, carry %d, %zu/%zu subtree functions guarded against mod patches\n",
                     s_mode, s_fast ? 1 : 0, s_compiled ? 1 : 0, s_envelope ? 1 : 0, s_shape ? 1 : 0, s_async,

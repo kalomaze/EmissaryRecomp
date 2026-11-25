@@ -3,6 +3,7 @@
 // See include/guest_code_patch.h.
 
 #include "guest_code_patch.h"
+#include "guest_native_trampoline.h"
 
 #include "abi_bridge.h"
 #include "guest_flat_memory.h"
@@ -36,6 +37,11 @@ extern "C" const uint32_t g_mkwInlinedLeafCount;
 namespace {
 
 constexpr uint32_t kPage = 4096;
+
+std::vector<GuestCodePatch::OriginalNativeTarget>& OriginalNatives() {
+    static std::vector<GuestCodePatch::OriginalNativeTarget> entries;
+    return entries;
+}
 
 std::atomic<bool> g_active{false};
 std::atomic<bool> g_anyDirty{false};  // pending write notifications or retained edge pages
@@ -438,6 +444,56 @@ void HoldBakedLocked(uint32_t start, uint32_t end) {
 namespace GuestCodePatch {
 
 bool Active() { return g_active.load(std::memory_order_acquire); }
+
+void RegisterOriginalNative(uint32_t address, void (*entry)(CpuContext*)) {
+    // Native hooks register during startup, before guest execution.
+    OriginalNatives().push_back({address, entry});
+}
+
+OriginalNativeTarget ResolveOriginalNativeTrampoline(uint32_t trampoline) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MKW_NATIVE_TRAMPOLINES");
+        return value == nullptr || *value != '0';
+    }();
+    if (!enabled || !Active() || OriginalNatives().empty() || (trampoline & 3u) || !Memory::Contains(trampoline, 8)) return {};
+    // A displaced, location-independent stack prologue followed by b original+4. Do not shortcut arbitrary mod
+    // functions or relocate PC-relative instructions. Re-read both words on every call, including cache hits above us.
+    const uint32_t first = Memory::Read32(trampoline), branch = Memory::Read32(trampoline + 4);
+    if ((first & 0xFFFF0000u) != 0x94210000u || (branch & 0xFC000003u) != 0x48000000u) return {};
+    int32_t displacement = static_cast<int32_t>(branch & 0x03FFFFFCu);
+    if (displacement & 0x02000000) displacement -= 0x04000000;
+    const uint32_t original = trampoline + static_cast<uint32_t>(displacement);
+    const auto found = std::find_if(OriginalNatives().begin(), OriginalNatives().end(),
+                                    [original](const auto& entry) { return entry.address == original; });
+    if (found == OriginalNatives().end()) return {};
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const int64_t index = FunctionIndex(original);
+    if (index < 0 || index + 1 >= g_mkwGuardedFunctionCount || g_mkwGuardedFunctionStarts[index] != original ||
+        std::find(g_forced.begin(), g_forced.end(), static_cast<uint32_t>(index)) != g_forced.end()) return {};
+    for (const auto& redirect : g_redirects) {
+        const uint32_t start = redirect.start.load(std::memory_order_acquire);
+        if (start != 0 && original >= start && original < redirect.end.load(std::memory_order_relaxed)) return {};
+    }
+    const uint32_t end = g_mkwGuardedFunctionStarts[index + 1];
+    if (!IsGuardedLocked(original) || !IsGuardedLocked(end - 1)) return {};
+    const auto pristine = g_pristine.find(original & ~(kPage - 1));
+    if (pristine == g_pristine.end() ||
+        std::memcmp(Memory::GetPointer(trampoline, 4), pristine->second->data() + (original & (kPage - 1)), 4)) return {};
+    // The entry detour is intentionally excluded; every other body byte must still be the protected original.
+    // Compare on each invocation so a later code patch cannot leave a stale native continuation enabled.
+    for (uint32_t at = original + 4; at < end;) {
+        const uint32_t page = at & ~(kPage - 1), offset = at - page;
+        const uint32_t size = std::min(end - at, kPage - offset);
+        const auto before = g_pristine.find(page);
+        if (before == g_pristine.end() || !Memory::Contains(at, size) ||
+            std::memcmp(Memory::GetPointer(at, size), before->second->data() + offset, size)) return {};
+        at += size;
+    }
+    return *found;
+}
+
+
 
 // Every translated function starting in [start, end) runs in the interpreter from now on, through module relinks.
 uint32_t InterpretRangeLocked(uint32_t start, uint32_t end) {
