@@ -1,0 +1,879 @@
+{
+  "runs": {
+    "safehead-m001-d0-s0-dolphin": {
+      "name": "safehead-m001-d0-s0-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 2.2096190781250002,
+        "p75": 2.2323095,
+        "p90": 2.4833927,
+        "p95": 3.13338255,
+        "p99": 4.515568319999999
+      },
+      "Mcycles": {
+        "mean": 10.78727471875,
+        "p75": 11.184326500000001,
+        "p90": 11.921947000000001,
+        "p95": 12.553713149999998,
+        "p99": 17.37448164
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.051735254240839,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "92f0124dfc99b00acec1f351851d9d49ce285033455855269e37c0651d567f45"
+    },
+    "safehead-m001-d0-s1-recomp": {
+      "name": "safehead-m001-d0-s1-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 2.0230135427083336,
+        "p75": 2.10261275,
+        "p90": 2.1984863000000003,
+        "p95": 2.2758715,
+        "p99": 2.4676997199999997
+      },
+      "Mcycles": {
+        "mean": 10.169259773958334,
+        "p75": 10.57040925,
+        "p90": 11.0522401,
+        "p95": 11.44902375,
+        "p99": 12.392935769999996
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.034681709344607,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "checksums": "PASS",
+      "samples_sha256": "e1519652ee59670b694c5fb6eb0b0f0787ea3328cd78bcbe37cb6cee9b919943"
+    },
+    "safehead-m001-d0-s2-recomp": {
+      "name": "safehead-m001-d0-s2-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 2.042760727083333,
+        "p75": 2.11822075,
+        "p90": 2.212996,
+        "p95": 2.28689965,
+        "p99": 2.4525162899999997
+      },
+      "Mcycles": {
+        "mean": 10.272191147916665,
+        "p75": 10.65187225,
+        "p90": 11.1408656,
+        "p95": 11.500601699999999,
+        "p99": 12.350655269999999
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.03727660319313,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "checksums": "PASS",
+      "samples_sha256": "36b5090fd2bfb6881532e4a737df41c721bd066259429ebdd03f2d6974e358ff"
+    },
+    "safehead-m001-d0-s3-dolphin": {
+      "name": "safehead-m001-d0-s3-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 2.2508466499999997,
+        "p75": 2.2940432499999996,
+        "p90": 2.5924387,
+        "p95": 2.9991301999999997,
+        "p99": 4.227463559999996
+      },
+      "Mcycles": {
+        "mean": 11.065046043749998,
+        "p75": 11.47506275,
+        "p90": 12.2678574,
+        "p95": 12.885198399999998,
+        "p99": 17.656310289999993
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.0393265577296145,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "9794b4b7028677173f31b550fc686827d5c18f03c128a3b22199d5a4831722c0"
+    },
+    "safehead-m001-d2-s0-dolphin": {
+      "name": "safehead-m001-d2-s0-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 4.364519267708333,
+        "p75": 4.53701125,
+        "p90": 4.938640100000001,
+        "p95": 5.2028137,
+        "p99": 6.115620109999998
+      },
+      "Mcycles": {
+        "mean": 21.482976803125,
+        "p75": 22.26246325,
+        "p90": 23.3304726,
+        "p95": 24.203230899999998,
+        "p99": 27.840736859999993
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.038671135252378,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "7f4f588584efd64e04c75e424ca931a6df0c2837f47a6de8e6ad5c5c1a1d7524"
+    },
+    "safehead-m001-d2-s1-recomp": {
+      "name": "safehead-m001-d2-s1-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 4.00062938125,
+        "p75": 4.14064925,
+        "p90": 4.3204862,
+        "p95": 4.44067905,
+        "p99": 4.6592664599999996
+      },
+      "Mcycles": {
+        "mean": 20.078935786458334,
+        "p75": 20.805916749999998,
+        "p90": 21.717938800000002,
+        "p95": 22.30646095,
+        "p99": 23.378042139999994
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.034470643413667,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "checksums": "PASS",
+      "samples_sha256": "b4c573a6dc04d04b7ff8d52eee76bbe858bb982e03976d7534f4bc0c52e37cd4"
+    },
+    "safehead-m001-d2-s2-recomp": {
+      "name": "safehead-m001-d2-s2-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 4.194534955208334,
+        "p75": 4.3503675,
+        "p90": 4.524678000000001,
+        "p95": 4.65342855,
+        "p99": 4.886661009999999
+      },
+      "Mcycles": {
+        "mean": 21.05533192604167,
+        "p75": 21.848723,
+        "p90": 22.728969,
+        "p95": 23.338337399999997,
+        "p99": 24.549230509999997
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.031700195846669,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "checksums": "PASS",
+      "samples_sha256": "00ef8be11c6bf5a294bf8b77afe690998d8f56b06269aef9ec073665a8a6f077"
+    },
+    "safehead-m001-d2-s3-dolphin": {
+      "name": "safehead-m001-d2-s3-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "001",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 4.362320988541667,
+        "p75": 4.47051075,
+        "p90": 5.0663333,
+        "p95": 5.5584114499999995,
+        "p99": 7.019380059999998
+      },
+      "Mcycles": {
+        "mean": 21.20062381875,
+        "p75": 21.98380125,
+        "p90": 23.1229878,
+        "p95": 23.7861202,
+        "p99": 27.629002519999986
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.0381680645086755,
+      "input_sha256": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "583c99ecacee3759fb795f209ad24228156fca5def0ac3ac75fefdc412a3ca0f"
+    },
+    "safehead-m064-d0-s0-recomp": {
+      "name": "safehead-m064-d0-s0-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.902508503125,
+        "p75": 1.985053,
+        "p90": 2.0925401,
+        "p95": 2.1808956,
+        "p99": 2.364133839999999
+      },
+      "Mcycles": {
+        "mean": 9.551228221874998,
+        "p75": 9.973458,
+        "p90": 10.491555700000001,
+        "p95": 10.95170145,
+        "p99": 11.849858669999996
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.03542815458138,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "checksums": "PASS",
+      "samples_sha256": "0a4e0391a7ad333c8f60a00d625938e5a9106ff000281768d547ce28203c74fa"
+    },
+    "safehead-m064-d0-s1-dolphin": {
+      "name": "safehead-m064-d0-s1-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 2.0306246822916667,
+        "p75": 2.093259,
+        "p90": 2.3381482,
+        "p95": 2.824550399999999,
+        "p99": 3.7588372
+      },
+      "Mcycles": {
+        "mean": 9.975174607291667,
+        "p75": 10.449478749999999,
+        "p90": 11.339863300000001,
+        "p95": 11.899924949999996,
+        "p99": 16.652346789999967
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.041443172758639,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "4774669977f964ba9b1ddedd254d3cbf2deeb3b090e1fc49c6384e1cd16452df"
+    },
+    "safehead-m064-d0-s2-dolphin": {
+      "name": "safehead-m064-d0-s2-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 2.0149735895833336,
+        "p75": 2.0765165,
+        "p90": 2.3201441000000003,
+        "p95": 2.6870260999999993,
+        "p99": 3.643808059999999
+      },
+      "Mcycles": {
+        "mean": 9.9240478625,
+        "p75": 10.3571305,
+        "p90": 11.2638923,
+        "p95": 11.8501617,
+        "p99": 15.870097769999969
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.049992097321788,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "8d8f69b795082c674dc5b2c6319648354d5c6857164097d143ca2a473b888679"
+    },
+    "safehead-m064-d0-s3-recomp": {
+      "name": "safehead-m064-d0-s3-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.8943907197916667,
+        "p75": 1.98013075,
+        "p90": 2.0824251,
+        "p95": 2.1776701999999997,
+        "p99": 2.32412353
+      },
+      "Mcycles": {
+        "mean": 9.516208484375,
+        "p75": 9.95122375,
+        "p90": 10.4524243,
+        "p95": 10.93372075,
+        "p99": 11.68646937
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.040581709710613,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "checksums": "PASS",
+      "samples_sha256": "0e437de4456e80cd05f7e977543ce01c732d43d31e0a953633dc2e9de902688b"
+    },
+    "safehead-m064-d2-s0-recomp": {
+      "name": "safehead-m064-d2-s0-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.8521568833333335,
+        "p75": 4.01894875,
+        "p90": 4.2247434,
+        "p95": 4.353409399999999,
+        "p99": 4.56597732
+      },
+      "Mcycles": {
+        "mean": 19.38310993854167,
+        "p75": 20.21839275,
+        "p90": 21.2368346,
+        "p95": 21.845978399999996,
+        "p99": 22.99420756
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.03886369097017,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "checksums": "PASS",
+      "samples_sha256": "dce0a3069b3a9ae78aecad28fe337ac18df23b2ff557ca820ed2b693af57e197"
+    },
+    "safehead-m064-d2-s1-dolphin": {
+      "name": "safehead-m064-d2-s1-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.852146264583333,
+        "p75": 3.9534825000000002,
+        "p90": 4.4578051,
+        "p95": 5.2912287499999975,
+        "p99": 8.21372062
+      },
+      "Mcycles": {
+        "mean": 18.377142888541666,
+        "p75": 19.2392255,
+        "p90": 20.4884257,
+        "p95": 21.392834049999994,
+        "p99": 25.61013644999995
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.037284654497882,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "61fa9e0f3978c0cc5fd43b1fc3a7516771c2c6d7eb1c8e506d1ba2f7a068fdcf"
+    },
+    "safehead-m064-d2-s2-dolphin": {
+      "name": "safehead-m064-d2-s2-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.8644557229166665,
+        "p75": 4.043964,
+        "p90": 4.4629513,
+        "p95": 4.746035349999999,
+        "p99": 6.02211874
+      },
+      "Mcycles": {
+        "mean": 19.023797847916665,
+        "p75": 19.824696499999998,
+        "p90": 21.238475700000002,
+        "p95": 22.136410649999995,
+        "p99": 25.682795519999974
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.050322141957582,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "1924b921f63ad5f171102f3bf94a3dd8230dcf037ddfa846460f9f6e8e9cb07d"
+    },
+    "safehead-m064-d2-s3-recomp": {
+      "name": "safehead-m064-d2-s3-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "064",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.8208907770833336,
+        "p75": 3.989047,
+        "p90": 4.2013833,
+        "p95": 4.32748005,
+        "p99": 4.526421159999999
+      },
+      "Mcycles": {
+        "mean": 19.234657084374998,
+        "p75": 20.083395,
+        "p90": 21.1539468,
+        "p95": 21.78450105,
+        "p99": 22.773675139999995
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.036235696021189,
+      "input_sha256": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "checksums": "PASS",
+      "samples_sha256": "7a9932ba5c491d3c707bac22c99eb8f4c5cd97b0a99739c2ec57beb1c4f0a195"
+    },
+    "safehead-m128-d0-s0-dolphin": {
+      "name": "safehead-m128-d0-s0-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 2.012113765625,
+        "p75": 2.09813325,
+        "p90": 2.3024951000000002,
+        "p95": 2.5354258,
+        "p99": 3.267356619999999
+      },
+      "Mcycles": {
+        "mean": 10.022932045833333,
+        "p75": 10.507375750000001,
+        "p90": 11.2798517,
+        "p95": 12.06170965,
+        "p99": 16.455366949999995
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.03928695523363,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "4461c231a25ee6ded1cf8a01aebce332110daecd1b1afd18fbc1c29826a9af35"
+    },
+    "safehead-m128-d0-s1-recomp": {
+      "name": "safehead-m128-d0-s1-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.9368390395833335,
+        "p75": 2.0263345,
+        "p90": 2.1495221,
+        "p95": 2.2298791999999996,
+        "p99": 2.4198821
+      },
+      "Mcycles": {
+        "mean": 9.749188963541666,
+        "p75": 10.18911825,
+        "p90": 10.8076189,
+        "p95": 11.246589699999998,
+        "p99": 12.15695294
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.050038553133761,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "checksums": "PASS",
+      "samples_sha256": "37fd2a6d8248b051665022f61ef111679f1eecb18550fc37fd6a72eab2ff15f3"
+    },
+    "safehead-m128-d0-s2-recomp": {
+      "name": "safehead-m128-d0-s2-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.9614860552083333,
+        "p75": 2.04873775,
+        "p90": 2.183924,
+        "p95": 2.2708736,
+        "p99": 2.4419651
+      },
+      "Mcycles": {
+        "mean": 9.844118284375002,
+        "p75": 10.290162500000001,
+        "p90": 10.9556691,
+        "p95": 11.40775565,
+        "p99": 12.25656003
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.037027867818462,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "checksums": "PASS",
+      "samples_sha256": "a5b4e75fcb655a66856a41a01c3b117dc0674123d232a9ecccf46ca60a5ecb1a"
+    },
+    "safehead-m128-d0-s3-dolphin": {
+      "name": "safehead-m128-d0-s3-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 0,
+      "wall_ms": {
+        "mean": 1.9982483197916667,
+        "p75": 2.0795735,
+        "p90": 2.2879412,
+        "p95": 2.4982210999999994,
+        "p99": 3.2091333399999975
+      },
+      "Mcycles": {
+        "mean": 9.9725038,
+        "p75": 10.4089355,
+        "p90": 11.3130603,
+        "p95": 11.850349799999998,
+        "p99": 16.195010169999986
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.048425721242599,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "a0ef894f1903ba844aaff55c4d77ef1fc59ae119dfc6a2ad9d56f8aedc10b5c2"
+    },
+    "safehead-m128-d2-s0-dolphin": {
+      "name": "safehead-m128-d2-s0-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.876103478125,
+        "p75": 4.097473,
+        "p90": 4.4107370999999995,
+        "p95": 4.68671675,
+        "p99": 6.068800709999982
+      },
+      "Mcycles": {
+        "mean": 19.261485038541664,
+        "p75": 20.460964,
+        "p90": 21.7992171,
+        "p95": 22.752127299999998,
+        "p99": 26.440267349999992
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.049479496547445,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "94c40ad470b019daebc8b37a1ba1f71666f31d5a4454dcf3106049e27ee5a846"
+    },
+    "safehead-m128-d2-s1-recomp": {
+      "name": "safehead-m128-d2-s1-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.9959303791666665,
+        "p75": 4.189124,
+        "p90": 4.4288501,
+        "p95": 4.5502695,
+        "p99": 4.80052885
+      },
+      "Mcycles": {
+        "mean": 20.090909022916666,
+        "p75": 21.0794375,
+        "p90": 22.2958413,
+        "p95": 22.9017086,
+        "p99": 24.173205579999998
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.036797339404183,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "checksums": "PASS",
+      "samples_sha256": "5a8f51fcd872e1a0c5bea3110d6d7e0db207ca90138409645e450cf02283f424"
+    },
+    "safehead-m128-d2-s2-recomp": {
+      "name": "safehead-m128-d2-s2-recomp",
+      "engine": "recomp",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 4.077643719791666,
+        "p75": 4.2563604999999995,
+        "p90": 4.4786496,
+        "p95": 4.607305149999999,
+        "p99": 4.86387433
+      },
+      "Mcycles": {
+        "mean": 20.44693949583333,
+        "p75": 21.3507795,
+        "p90": 22.4944075,
+        "p95": 23.1200575,
+        "p99": 24.46944953
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.033484503680734,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a",
+      "checksums": "PASS",
+      "samples_sha256": "e4a540bd81c491523964753859439d12f1058833a64e88dbe32847642c3ee161"
+    },
+    "safehead-m128-d2-s3-dolphin": {
+      "name": "safehead-m128-d2-s3-dolphin",
+      "engine": "dolphin",
+      "arm": "new",
+      "match": "128",
+      "phase": "unpaced",
+      "distance": 2,
+      "wall_ms": {
+        "mean": 3.9222183447916668,
+        "p75": 4.11086275,
+        "p90": 4.4169757,
+        "p95": 4.6295578,
+        "p99": 5.2450204
+      },
+      "Mcycles": {
+        "mean": 19.597353828124998,
+        "p75": 20.51409175,
+        "p90": 21.7343289,
+        "p95": 22.670055,
+        "p99": 26.00477068999999
+      },
+      "intervals": 960,
+      "max_counter_rate_GHz": 5.049995358660452,
+      "input_sha256": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206",
+      "binary_sha256": "502cee6955573dc65e22758d9213545ce72ca03535e2a47008f51637ae843bd0",
+      "checksums": "PASS",
+      "samples_sha256": "7d9556f2cd63139e6aacc6216c231cfa034fdd22a091126fbd570aea4288bb67"
+    }
+  },
+  "input_sha256": {
+    "001": "c4bdc255a96e502d82818268b4e0ea1bbb3644a23a91806219f8265bf5440857",
+    "064": "f69264f9d514df53b45c1789b8525c4ba251103807f7abc769c350fec4121668",
+    "128": "0de0f93d2c9f76ffb8881e5417d2163d2ba07df4d9c67910a77c7814d8fbe206"
+  },
+  "complete": true,
+  "comparisons": {
+    "0f": {
+      "units": "wall_ms",
+      "per_match": {
+        "001": {
+          "dolphin": {
+            "runs": 2,
+            "stats": {
+              "mean": 2.2302328640624998,
+              "p75": 2.2631763749999996,
+              "p90": 2.5379157,
+              "p95": 3.066256375,
+              "p99": 4.371515939999997
+            }
+          },
+          "recomp": {
+            "runs": 2,
+            "stats": {
+              "mean": 2.0328871348958333,
+              "p75": 2.1104167499999997,
+              "p90": 2.20574115,
+              "p95": 2.281385575,
+              "p99": 2.4601080049999995
+            }
+          }
+        },
+        "064": {
+          "dolphin": {
+            "runs": 2,
+            "stats": {
+              "mean": 2.0227991359375004,
+              "p75": 2.08488775,
+              "p90": 2.32914615,
+              "p95": 2.7557882499999993,
+              "p99": 3.7013226299999995
+            }
+          },
+          "recomp": {
+            "runs": 2,
+            "stats": {
+              "mean": 1.8984496114583334,
+              "p75": 1.982591875,
+              "p90": 2.0874826,
+              "p95": 2.1792828999999996,
+              "p99": 2.3441286849999994
+            }
+          }
+        },
+        "128": {
+          "dolphin": {
+            "runs": 2,
+            "stats": {
+              "mean": 2.005181042708333,
+              "p75": 2.0888533750000002,
+              "p90": 2.29521815,
+              "p95": 2.5168234499999995,
+              "p99": 3.2382449799999984
+            }
+          },
+          "recomp": {
+            "runs": 2,
+            "stats": {
+              "mean": 1.9491625473958334,
+              "p75": 2.037536125,
+              "p90": 2.16672305,
+              "p95": 2.2503763999999995,
+              "p99": 2.4309236
+            }
+          }
+        }
+      },
+      "equal_match": {
+        "dolphin": {
+          "mean": 2.086071014236111,
+          "p75": 2.1456391666666668,
+          "p90": 2.387426666666667,
+          "p95": 2.7796226916666664,
+          "p99": 3.770361183333332
+        },
+        "recomp": {
+          "mean": 1.9601664312500002,
+          "p75": 2.0435149166666666,
+          "p90": 2.1533156,
+          "p95": 2.237014958333333,
+          "p99": 2.411720096666666
+        }
+      },
+      "reduction_percent": {
+        "mean": 6.035488826933111,
+        "p75": 4.7596190257215625,
+        "p90": 9.806000323919207,
+        "p95": 19.520913214591186,
+        "p99": 36.034772813608996
+      }
+    },
+    "1f": {
+      "units": "wall_ms",
+      "per_match": {
+        "001": {
+          "dolphin": {
+            "runs": 2,
+            "stats": {
+              "mean": 4.363420128125,
+              "p75": 4.503761,
+              "p90": 5.0024867,
+              "p95": 5.380612575,
+              "p99": 6.567500084999998
+            }
+          },
+          "recomp": {
+            "runs": 2,
+            "stats": {
+              "mean": 4.097582168229167,
+              "p75": 4.245508375,
+              "p90": 4.4225821000000005,
+              "p95": 4.5470538000000005,
+              "p99": 4.772963734999999
+            }
+          }
+        },
+        "064": {
+          "dolphin": {
+            "runs": 2,
+            "stats": {
+              "mean": 3.8583009937499995,
+              "p75": 3.9987232500000003,
+              "p90": 4.4603782,
+              "p95": 5.018632049999998,
+              "p99": 7.11791968
+            }
+          },
+          "recomp": {
+            "runs": 2,
+            "stats": {
+              "mean": 3.8365238302083338,
+              "p75": 4.003997875,
+              "p90": 4.2130633500000005,
+              "p95": 4.340444724999999,
+              "p99": 4.54619924
+            }
+          }
+        },
+        "128": {
+          "dolphin": {
+            "runs": 2,
+            "stats": {
+              "mean": 3.8991609114583334,
+              "p75": 4.104167875,
+              "p90": 4.4138564,
+              "p95": 4.658137275,
+              "p99": 5.656910554999991
+            }
+          },
+          "recomp": {
+            "runs": 2,
+            "stats": {
+              "mean": 4.036787049479166,
+              "p75": 4.22274225,
+              "p90": 4.4537498499999995,
+              "p95": 4.5787873249999995,
+              "p99": 4.83220159
+            }
+          }
+        }
+      },
+      "equal_match": {
+        "dolphin": {
+          "mean": 4.0402940111111105,
+          "p75": 4.202217375,
+          "p90": 4.625573766666666,
+          "p95": 5.019127299999999,
+          "p99": 6.447443439999996
+        },
+        "recomp": {
+          "mean": 3.990297682638889,
+          "p75": 4.157416166666667,
+          "p90": 4.363131766666667,
+          "p95": 4.48876195,
+          "p99": 4.717121521666667
+        }
+      },
+      "reduction_percent": {
+        "mean": 1.2374428280399363,
+        "p75": 1.0661325756222584,
+        "p90": 5.673717753486896,
+        "p95": 10.566883808665295,
+        "p99": 26.837333812009845
+      }
+    }
+  },
+  "limitations": [
+    "Dolphin OpenGL versus recomp Vulkan; Linux recomp has no OpenGL backend.",
+    "Dolphin is a Release NoGUI build of official 0.2.8 source with a preserved replay snapshot/marker hook; not the exact shipping ELF.",
+    "Recorded playback with snapshots, either zero redo or one redo per output; no network transport or real peer prediction.",
+    "Frame markers differ in phase; full intervals include the selected update/save/load workload. Tail percentiles are averaged run percentiles across three fixed recordings.",
+    "Host wall throughput is not a Switch measurement; cycles measure only game CPU thread, not combined CPU/GPU cost."
+  ]
+}

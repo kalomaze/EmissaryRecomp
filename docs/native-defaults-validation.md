@@ -60,3 +60,16 @@ Code protection and module relinking previously refreshed pristine bytes for an 
 Regression coverage includes an ordinary code write plus `Sync`, rejecting the native trampoline while its inline dependency is patched, restoring that dependency with `ResetPristine`, accepting the trampoline again, and detecting a pending patch to another function on the same page after the reset. All seven tests pass in lean and flat x86 builds. This additional change still requires ARM validation.
 
 Three x86 one-redo recordings (001/064/128, 120 frames each) pass original checksums with no reported native differential failures, and all 1,062 snapshot operations verify. Tested binary SHA-256: `32a8e01f6c02fefbe339ea2ab0a24fd4a1fe009dc9eb1d46e259c27e5fc4216a`. These runs do not establish a performance change.
+
+## Current-head timing confirmation
+
+A fresh matched 24-capture batch tests `6afee6a` using the same host, affinity, recordings, timing windows, renderer backends and warm-up procedure above. All checksums and work-count gates pass; local reanalysis is byte-identical to the remote report. Lean memory and compiled mods are enabled, without PGO.
+
+| Depth | Statistic | Dolphin ms | Recomp ms | Recomp time reduction |
+|---|---|---:|---:|---:|
+| 0f | mean | 2.086071 | 1.960166 | 6.04% |
+| 0f | p99 | 3.770361 | 2.411720 | 36.03% |
+| 1f | mean | 4.040294 | 3.990298 | 1.24% |
+| 1f | p99 | 6.447443 | 4.717122 | 26.84% |
+
+Recording 128 remains slower at 1f: Dolphin 3.899161 ms, recomp 4.036787 ms (3.53% more time). The aggregate 1f lead remains small; this second batch does not meet the requirement to win every tested recording. Differences between batches do not isolate the cost of the guard fixes. Detailed results: [current-head timing](native-defaults-timing-current.json).
