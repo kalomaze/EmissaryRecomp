@@ -243,3 +243,10 @@ Source inspection of the tested Dolphin 0.2.8 build distinguishes two restore co
 The recomp gameplay and online snapshot callbacks likewise restore selected memory and CPU context without rewinding `DetClock`; resimulation changes pacing while guest clock reads continue advancing virtual time. Therefore clock-derived bytes can differ after resimulation even when snapshot restoration itself is correct. Rewinding only the recomp clock would change its behavior relative to this Dolphin mode and is not justified as a fix by the repeated-save differences alone.
 
 This is a source-level contract observation, not proof that every differing byte is harmless, that guest clocks are numerically identical between engines, or that arbitrary clock-dependent mods will remain synchronized. Non-clock differences and native ARM validation remain open. [Source identities and audit scope](rollback-clock-contract.json).
+
+
+### Non-clock region writer observation
+
+A gameplay-gated GDB watchpoint covering `815425A0..815425BF`, one repeatedly differing 32-byte granule in the classic control, catches 24 writes through the same chain: `PPC_WriteSpr`, `801D7A38`, `801AE08C`, `801B21E8`. This is the locked-cache DMA store path. The diagnostic uses the classic interpreter with compiled variants and handwritten helper families disabled. An earlier first-word-only watch completed 1,200 frames without a hit; the differing bytes were elsewhere within the watched granule.
+
+The debugger intentionally quits after 24 observations, so the driver's subsequent IPC-close error is expected and is not a gameplay desync result. This localizes a non-clock producer; it does not identify the consumers or prove that these bytes are harmless rendering state. No runtime behavior or snapshot exclusions were changed. [Observation receipt](rex-stage-state-writer.json).

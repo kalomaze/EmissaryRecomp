@@ -1,0 +1,22 @@
+{
+  "kind": "Bounded GDB writer observation, not a completed gameplay test",
+  "address_range": "815425a0..815425bf",
+  "watch_armed": "After BrawlFrameCpuMarker sees an active gameplay session",
+  "hits": 24,
+  "shared_call_chain": [
+    "libc copy",
+    "PPC_WriteSpr",
+    "func_801D7A38_body",
+    "func_801AE08C_body",
+    "func_801B21E8_body"
+  ],
+  "configuration": "Classic interpreter, compiled variants disabled, handwritten helper families disabled; same combat driver as previous classic control",
+  "termination": "GDB intentionally quits at hit 24; driver reports IPC closure. Not a gameplay desync.",
+  "first_attempt": "Watching only the first 4 bytes produced no hits during a completed 1200-frame run. Widening to the full 32-byte diagnostic granule caught writes.",
+  "inference": "Writer is the existing locked-cache DMA store path. Consumer and gameplay relevance remain unresolved.",
+  "artifact_sha256": {
+    "runtime.log": "46caa417da78be0aabca081b9a62c064a9da7d09ed534a3cfa399ae5ef3f9e5c",
+    "driver": "66e0b922dc53aff1e1fb519212fe42f898a9f7d1861eb84d9e1b4f27b8882c3a",
+    "gdb_script": "d306164ff7f6707171ef94b144b58c36e03caeb8a0fe79b50fb6b60ce7005752"
+  }
+}
