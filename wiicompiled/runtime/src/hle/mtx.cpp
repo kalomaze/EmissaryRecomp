@@ -1,4 +1,3 @@
-#include "guest_memory_alias.h"
 // Native bodies for the hot Revolution SDK matrix routines (revolution/MTX/mtx.c): PSMTXCopy, PSMTXConcat,
 // PSMTXConcatArray and PSMTXInverse, the paired-single assembly under nw4r g3d's and the game's bone and hitbox
 // math, and C_MTXLightPerspective.
@@ -219,11 +218,11 @@ inline F4 ConcatArrayRow(F4 a, F4 b0, F4 b1, F4 b2, F4 unit)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Lean memory (memory_access.h): GuestMemoryAlias::Offset(address) is the offset into one host window.
+// Lean memory (memory_access.h): guest address & kLeanMask is the offset into one host window.
 // ---------------------------------------------------------------------------------------------------------------
 
 inline uint8_t* Window() { return MemoryInline::g_leanBase; }
-inline uint32_t Canonical(uint32_t address) { return GuestMemoryAlias::Offset(address); }
+inline uint32_t Canonical(uint32_t address) { return address & MemoryInline::kLeanMask; }
 
 // psq stores mark through MarkHost, relative to flatBase; Memory::Init makes that the window.
 inline bool LeanReady()
@@ -231,10 +230,10 @@ inline bool LeanReady()
     return BrawlDirtyMemory::flatBase == reinterpret_cast<uintptr_t>(MemoryInline::g_leanBase);
 }
 
-// Require a mapped, contiguous host range before bypassing scalar accessors.
-inline bool Fits(uint32_t address, uint64_t size)
+// One host range: the original's per-access masking cannot wrap inside it.
+inline bool Fits(uint32_t canonical, uint64_t size)
 {
-    return MemoryInline::LeanRangeMapped(address, size);
+    return canonical + size <= MemoryInline::kLeanWindowSize;
 }
 
 // No 64 KiB chunk of the range sends a store to the checked path; the original's psq stores test the policy byte
@@ -335,7 +334,7 @@ template <bool Exact>
     const uint32_t a = Canonical(ctx->gpr[3]);
     const uint32_t b = Canonical(ctx->gpr[4]);
     const uint32_t ab = Canonical(ctx->gpr[5]);
-    if (!Fits(ctx->gpr[3], 48) || !Fits(ctx->gpr[4], 48) || !Fits(ctx->gpr[5], 48) || !PlainStores48(m, ab)) return false;
+    if (!Fits(a, 48) || !Fits(b, 48) || !Fits(ab, 48) || !PlainStores48(m, ab)) return false;
 
     // stwu r1, -64(r1) first, as in the original (its f14, f15, f31 saves are host locals in the translation).
     const uint32_t r1 = ctx->gpr[1];
@@ -387,7 +386,7 @@ template <bool Exact>
     const uint32_t unitAddress = ctx->gpr[13] - 22976u;  // f27 = {0, 1}: addi r6, r13, -22976
     const uint32_t unitCanonical = Canonical(unitAddress);
     const uint64_t size = 48ull * count;
-    if (!Fits(ctx->gpr[3], 48) || !Fits(ctx->gpr[4], size) || !Fits(ctx->gpr[5], size) || !Fits(unitAddress, 8) || !PlainStores(dst, size))
+    if (!Fits(a, 48) || !Fits(src, size) || !Fits(dst, size) || !Fits(unitCanonical, 8) || !PlainStores(dst, size))
         return false;
     // The original loads src[i + 1] while it still stores dst[i]; this loop finishes dst[i] first. The two agree
     // unless dst[i] overlaps src[i + 1].
@@ -432,7 +431,7 @@ template <bool Exact>
     if (ctx->gqr[0] != 0 || BrawlDirtyMemory::flatBase != reinterpret_cast<uintptr_t>(m)) return false;
     const uint32_t src = Canonical(ctx->gpr[3]);
     const uint32_t dst = Canonical(ctx->gpr[4]);
-    if (!Fits(ctx->gpr[3], 48) || !Fits(ctx->gpr[4], 48) || !PlainStores48(m, dst)) return false;
+    if (!Fits(src, 48) || !Fits(dst, 48) || !PlainStores48(m, dst)) return false;
     // The original interleaves loads and stores; loading all first agrees unless a store lands on a later load.
     const int64_t shift = static_cast<int64_t>(dst) - static_cast<int64_t>(src);
     if (shift > 0 && shift < 48) return false;
@@ -572,7 +571,7 @@ inline void MarkStores(uint8_t* dirty, uint32_t canonical, uint32_t last)
     if (ctx->gqr[0] != 0 || BrawlDirtyMemory::flatBase != reinterpret_cast<uintptr_t>(m)) return false;
     const uint32_t src = Canonical(ctx->gpr[3]);
     const uint32_t dst = Canonical(ctx->gpr[4]);
-    if (!Fits(ctx->gpr[3], 48) || !Fits(ctx->gpr[4], 48) || !PlainStores48(m, dst)) return false;
+    if (!Fits(src, 48) || !Fits(dst, 48) || !PlainStores48(m, dst)) return false;
     // Every load precedes every store, so inv may alias src.
     const uint8_t* const s = m + src;
     double f0 = LoadSingleOne(s), f1 = LoadPair(s + 4), f2 = LoadSingleOne(s + 16);
@@ -658,9 +657,11 @@ int32_t GuardIndex(uint32_t address)
 // A callee the native evaluates itself: translated, and its code not patched.
 inline bool CalleeUnpatched(int32_t guard) { return guard >= 0 && g_mkwGuestCodePatched[guard] == 0; }
 
-inline double LoadDouble(uint32_t address)
+inline double LoadDouble(const uint8_t* window, uint32_t address)
 {
-    return MemoryInline::FlatReadFloat64(address);
+    uint64_t be;
+    std::memcpy(&be, window + Canonical(address), sizeof(be));
+    return __builtin_bit_cast(double, __builtin_bswap64(be));
 }
 
 // BRAWL_HLE_TAN=0: C_MTXLightPerspective calls the translated tan, for A/B measurements on one binary.
@@ -691,7 +692,7 @@ bool TanNative(CpuContext* ctx)
     const uint32_t r1Tan = r1 - 32u, r1Kernel = r1Tan - 80u;
     const uint32_t k = Canonical(r1Kernel);
     // __kernel_tan's stwu r1, -80(r1) through tan's stw r0, 36(r1): [r1Kernel, r1Tan + 40).
-    if (!Fits(r1Kernel, 120) || !PlainStores(k, 120)) return false;
+    if (!Fits(k, 120) || !PlainStores(k, 120)) return false;
     const uint64_t xBits = ctx->fpr[1].raw;
     const uint32_t hx = static_cast<uint32_t>(xBits >> 32);
     const int32_t ix = static_cast<int32_t>(hx & 0x7FFFFFFFu);
@@ -699,40 +700,40 @@ bool TanNative(CpuContext* ctx)
     const uint32_t r2 = ctx->gpr[2];
 
     double f1 = ctx->fpr[1].d;
-    double f2 = LoadDouble(r2 - 16928u);  // tan: lfd f2 (y)
+    double f2 = LoadDouble(m, r2 - 16928u);  // tan: lfd f2 (y)
     const bool big = ix >= 0x3FE59428;
     if (big) {
         if (static_cast<int32_t>(hx) < 0) {
             f1 = -f1;
             f2 = -f2;
         }
-        const double pio4 = LoadDouble(r2 - 17104u), pio4lo = LoadDouble(r2 - 17096u);
+        const double pio4 = LoadDouble(m, r2 - 17104u), pio4lo = LoadDouble(m, r2 - 17096u);
         f1 = PpcFsubInline(pio4, f1);
         const double w = PpcFsubInline(pio4lo, f2);
-        f2 = LoadDouble(r2 - 17088u);
+        f2 = LoadDouble(m, r2 - 17088u);
         f1 = PpcFaddInline(f1, w);
     }
     const uint32_t t = 0x80420368u;  // T[0..12] (lis r6, 0x8042; addi r5, r6, 872)
     const double z = PpcFmulInline(f1, f1);
     const double w = PpcFmulInline(z, z);
-    double f5 = LoadDouble(t + 96), f8 = LoadDouble(t + 88), f6 = LoadDouble(t + 80);
-    double f10 = LoadDouble(t + 72);
+    double f5 = LoadDouble(m, t + 96), f8 = LoadDouble(m, t + 88), f6 = LoadDouble(m, t + 80);
+    double f10 = LoadDouble(m, t + 72);
     double f4 = PpcFmulInline(z, f1);
     double f7 = PpcFmulInline(w, f5);
-    f5 = LoadDouble(t);
-    double f9 = LoadDouble(t + 64);
+    f5 = LoadDouble(m, t);
+    double f9 = LoadDouble(m, t + 64);
     double f11 = PpcFmulInline(w, f8);
-    const double f31 = LoadDouble(t + 56);
-    f8 = LoadDouble(t + 48);
+    const double f31 = LoadDouble(m, t + 56);
+    f8 = LoadDouble(m, t + 48);
     f6 = PpcFaddInline(f6, f7);
-    const double f13 = LoadDouble(t + 40);
+    const double f13 = LoadDouble(m, t + 40);
     double f30 = PpcFaddInline(f10, f11);
-    f7 = LoadDouble(t + 32);
+    f7 = LoadDouble(m, t + 32);
     f5 = PpcFmulInline(f5, f4);
-    const double f12 = LoadDouble(t + 24);
+    const double f12 = LoadDouble(m, t + 24);
     f10 = PpcFmulInline(w, f6);
-    f6 = LoadDouble(t + 16);
-    f11 = LoadDouble(t + 8);
+    f6 = LoadDouble(m, t + 16);
+    f11 = LoadDouble(m, t + 8);
     f30 = PpcFmulInline(w, f30);
     f9 = PpcFaddInline(f9, f10);
     f10 = PpcFaddInline(f31, f30);
@@ -773,9 +774,9 @@ bool TanNative(CpuContext* ctx)
         Store32(kf + 32, r4);
         Store32(kf + 44, signWord);
         Store32(kf + 40, r4);
-        f5 = LoadDouble(r2 - 17072u);
+        f5 = LoadDouble(m, r2 - 17072u);
         f3 = PpcFmulInline(f4, f4);
-        f0 = LoadDouble(r2 - 17080u);
+        f0 = LoadDouble(m, r2 - 17080u);
         f7 = PpcFsubInline(__builtin_bit_cast(double, (uint64_t{0x43300000u} << 32) | iyWord), f5);
         f2 = PpcFaddInline(f4, f7);
         double sign = PpcFsubInline(__builtin_bit_cast(double, (uint64_t{0x43300000u} << 32) | signWord), f5);
@@ -816,7 +817,7 @@ bool LightPerspectiveNative(CpuContext* ctx)
     const uint32_t frame = Canonical(r1 - 96u);
     const uint32_t matrix = Canonical(out);
     // stwu r1, -96(r1) through stw r0, 100(r1): [r1 - 96, r1 + 8), the frame and the caller's LR slot.
-    if (!Fits(r1 - 96u, 104) || !PlainStores(frame, 104) || !Fits(out, 48) || !PlainStores48(m, matrix)) return false;
+    if (!Fits(frame, 104) || !PlainStores(frame, 104) || !Fits(matrix, 48) || !PlainStores48(m, matrix)) return false;
 
     uint8_t* const f = m + frame;
     const uint32_t lr = ctx->lr;
@@ -995,7 +996,7 @@ bool Verifiable(const GuestRanges& ranges)
 {
     for (int i = 0; i < ranges.count; ++i) {
         const uint32_t c = Canonical(ranges.items[i].address);
-        if (ranges.items[i].size == 0 || !Fits(ranges.items[i].address, ranges.items[i].size) || !PlainStores(c, ranges.items[i].size))
+        if (ranges.items[i].size == 0 || !Fits(c, ranges.items[i].size) || !PlainStores(c, ranges.items[i].size))
             return false;
     }
     return LeanReady();
@@ -1251,7 +1252,7 @@ void RandomizeRegisters(CpuContext& ctx, Fuzzer& f)
 void RunFuzz(NativeSpec& spec, const CpuContext& live, uint32_t trials)
 {
     const uint32_t scratch = Canonical(kFuzzScratch);
-    if (!Fits(kFuzzScratch, kFuzzScratchSize) || !PlainStores(scratch, kFuzzScratchSize) || !LeanReady()) {
+    if (!Fits(scratch, kFuzzScratchSize) || !PlainStores(scratch, kFuzzScratchSize) || !LeanReady()) {
         std::fprintf(stderr, "[hle-fuzz] %s: scratch window unavailable, skipped\n", spec.name);
         return;
     }

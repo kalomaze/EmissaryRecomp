@@ -6,11 +6,7 @@
 
 namespace MemoryInline { uintptr_t g_fullWritablePageBias[kPageCount]{}; }
 void Memory::RefreshWritableFastPathsForExecutableRanges() {}
-namespace GuestCodePatch {
-uint32_t lastNoted = 0;
-bool allowPatch = false;
-bool NoteWrite(uint32_t address) { lastNoted = address; return allowPatch; }
-}
+namespace GuestCodePatch { bool NoteWrite(uint32_t) { return false; } }
 #if MKW_FLAT_MEMORY
 namespace GuestFlat { void RegisterExecutableRange(uint32_t, uint32_t) {} }
 #endif
@@ -41,18 +37,6 @@ int main() {
     Require(FindExecutableRange(0xC0001010, 4)->start == 0xC0001000);
     Require(!FindExecutableRange(0x80002800, 4));
     Require(FindExecutableRange(0x80000fff, 2)->start == 0x80001000);
-
-    // Writes through every MEM1 view must reach the primary code guard.
-    GuestCodePatch::allowPatch = true;
-    for (uint32_t address : {0x1010u, 0x82001010u, 0x84001010u, 0x86001010u,
-                             0xc2001010u, 0xc4001010u, 0xc6001010u}) {
-        GuestCodePatch::lastNoted = 0;
-        Require(!RecompMod::HandleExecutableWrite(address, 4, 0));
-        Require(GuestCodePatch::lastNoted == 0x80001010u);
-    }
-    RecompMod::RegisterExecutableRange(0x8348b000u, 0x8348c000u, "mirror registration");
-    Require(FindExecutableRange(0x8148b010u, 4) != nullptr);
-    GuestCodePatch::allowPatch = false;
 
     std::signal(SIGUSR1, LookupInterrupted);
     {

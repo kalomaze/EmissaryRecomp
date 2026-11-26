@@ -1,4 +1,3 @@
-#include "guest_memory_alias.h"
 #include "brawl_dirty_memory.h"
 // guest_code_patch.cpp - routes translated functions whose guest code a mod changed at run time to the interpreter.
 // See include/guest_code_patch.h.
@@ -280,7 +279,7 @@ void (*MatchingVariant(uint32_t address))(CpuContext*) {
 }
 
 // The cached (0x8/0x9) view: the trap also fires for the uncached alias of guarded code.
-uint32_t Cached(uint32_t address) { return GuestMemoryAlias::Cached(address); }
+uint32_t Cached(uint32_t address) { return (address & 0xE0000000u) == 0xC0000000u ? address - 0x40000000u : address; }
 
 bool IsGuardedLocked(uint32_t address) {
     return std::any_of(g_ranges.begin(), g_ranges.end(),

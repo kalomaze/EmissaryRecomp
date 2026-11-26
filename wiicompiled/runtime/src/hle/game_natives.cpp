@@ -1,4 +1,3 @@
-#include "guest_memory_alias.h"
 // Native bodies for unnamed Brawl game code (no decomp names or splits for these; identified from the PPC).
 //
 // Havok (hk*) animation runs inside Brawl's per-frame fighter update: fn_800969E0 builds an hkaPose from the skeleton
@@ -187,12 +186,12 @@ inline void Bump(std::atomic<uint64_t>& counter, uint64_t n = 1) {
 
 #if MKW_LEAN_MEMORY
 // ---------------------------------------------------------------------------------------------------------------
-// Lean memory (memory_access.h; g3d_calc.cpp's helpers): guest GuestMemoryAlias::Offset(address) is the offset into one host window;
+// Lean memory (memory_access.h; g3d_calc.cpp's helpers): guest address & kLeanMask is the offset into one host window;
 // rollback's dirty marks are one byte per 64 guest bytes; a 64 KiB chunk with a non-zero policy byte sends stores to
 // the checked path.
 // ---------------------------------------------------------------------------------------------------------------
 inline uint8_t* Window() { return MemoryInline::g_leanBase; }
-inline uint32_t Canonical(uint32_t address) { return GuestMemoryAlias::Offset(address); }
+inline uint32_t Canonical(uint32_t address) { return address & MemoryInline::kLeanMask; }
 inline bool LeanReady() {
     return MemoryInline::g_leanBase != nullptr &&
            BrawlDirtyMemory::flatBase == reinterpret_cast<uintptr_t>(MemoryInline::g_leanBase);
@@ -201,7 +200,7 @@ inline bool LeanReady() {
 inline bool PlainRange(uint32_t address, uint64_t size) {
     if (size == 0) return true;
     const uint32_t c = Canonical(address);
-    if (!MemoryInline::LeanRangeMapped(address, size)) return false;
+    if (c + size > MemoryInline::kLeanWindowSize) return false;
     if (((address ^ (address + static_cast<uint32_t>(size - 1))) & ~MemoryInline::kLeanMask) != 0) return false;
     const uint8_t* const policy = Window() + MemoryInline::kLeanPolicyOffset;
     for (uint64_t chunk = c >> MemoryInline::kLeanPolicyShift; chunk <= (c + size - 1) >> MemoryInline::kLeanPolicyShift;
@@ -212,7 +211,8 @@ inline bool PlainRange(uint32_t address, uint64_t size) {
 // The range lies in one view of the window (one host span; guest loads read the window at any address).
 inline bool OneView(uint32_t address, uint32_t size) {
     if (size == 0) return true;
-    return MemoryInline::LeanRangeMapped(address, size);
+    return Canonical(address) + static_cast<uint64_t>(size) <= MemoryInline::kLeanWindowSize &&
+           ((address ^ (address + (size - 1))) & ~MemoryInline::kLeanMask) == 0;
 }
 inline bool Overlap(uint32_t a, uint32_t aSize, uint32_t b, uint32_t bSize) {
     return aSize != 0 && bSize != 0 && Canonical(a) < Canonical(b) + static_cast<uint64_t>(bSize) &&
@@ -753,7 +753,6 @@ constexpr float kEps = 0x1p-23f;     // 0x34000000
 constexpr float kEps2 = 0.001f;      // 0x3A83126F
 
 bool SameWords(uint32_t address, const uint32_t* values, uint32_t words) {
-    if (!MemoryInline::LeanRangeMapped(address, uint64_t(words) * 4)) return false;
     const uint8_t* const p = Window() + Canonical(address);
     for (uint32_t i = 0; i < words; ++i)
         if (Load32(p + 4u * i) != values[i]) return false;

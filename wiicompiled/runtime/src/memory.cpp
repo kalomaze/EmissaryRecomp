@@ -1,4 +1,3 @@
-#include "guest_memory_alias.h"
 #include "memory.h"
 #include "hz_perf.h"
 
@@ -34,7 +33,8 @@
 #include <sys/mman.h>
 #endif
 #if MKW_LEAN_MEMORY && defined(__SWITCH__)
-// platform/horizon.c: backing for the parts of the reserved window in use.
+// platform/horizon.c: the lean window's address space, and backing for the parts in use (BackLeanWindow).
+extern "C" void* HorizonLeanWindowReserve(uint64_t size);
 extern "C" uint32_t HorizonLeanWindowBack(uint8_t* target, uint64_t size);
 #endif
 
@@ -43,23 +43,6 @@ uintptr_t MemoryInline::g_fullPageBias[MemoryInline::kPageCount]{};
 uintptr_t MemoryInline::g_fullWritablePageBias[MemoryInline::kPageCount]{};
 const MemoryInline::SparseWritablePageTable*
     MemoryInline::g_sparseWritablePageTables[MemoryInline::kPageCount]{};
-#if MKW_LEAN_MEMORY
-bool MemoryInline::LeanRangeMappedSlow(uint32_t address, size_t length) {
-    if (!length || length - 1 > UINT32_MAX - address) return false;
-    const uint32_t offset = GuestMemoryAlias::Offset(address);
-    if (length > kLeanWindowSize - offset) return false;
-    size_t done = 0;
-    while (done < length) {
-        const uint32_t at = address + static_cast<uint32_t>(done);
-        const size_t count = std::min(length - done, size_t(kPageSize - (at & kPageMask)));
-        uint8_t* mapped = nullptr;
-        if (!TryGetPointerFast(at, count, mapped) || mapped != g_leanBase + offset + done) return false;
-        done += count;
-    }
-    return true;
-}
-#endif
-
 template <typename T>
 T MemoryInline::ReadResolvedFallback(uint32_t addr) {
     HZ_PERF_ADD(kHzFallbackReads, 1);
@@ -171,7 +154,7 @@ void MemoryInline::WriteResolvedFallback(uint32_t addr, T value) {
         const uint32_t offset = addr & 0x0FFFFFFFu;
         const uint32_t top = addr >> 28;
         const uint32_t last = addr + static_cast<uint32_t>(sizeof(T)) - 1u;
-        if (g_leanFallbackFast && LeanScalarHost(addr) != nullptr &&
+        if (g_leanFallbackFast &&
             ((top == 0x8u && offset + sizeof(T) <= 0x01800000u) || (top == 0x9u && offset + sizeof(T) <= 0x04000000u)) &&
             RecompMod::g_executableWriteGuardPages[addr >> RecompMod::kExecutableWriteGuardPageShift].load(
                 std::memory_order_relaxed) == 0 &&
@@ -289,14 +272,17 @@ void BuildPageTable() {
 // the checked Memory::Write* path. Every chunk not wholly inside a guest region, so a store no region maps raises
 // the checked path's AccessViolation, as without the window (most of those chunks have no backing at all:
 // BackLeanWindow); the MMIO window, so GX FIFO and register writes reach their handlers; every chunk holding an
-// executable 4 KiB page, so writes into code still reach GuestCodePatch. Indexing by the normalized offset makes every
+// executable 4 KiB page, so writes into code still reach GuestCodePatch. Indexing by the masked address makes every
 // view (physical, cached, uncached) of a page share its flag.
 void RefreshLeanStorePolicy() {
     constexpr uint64_t kChunks = MemoryInline::kLeanWindowSize >> MemoryInline::kLeanPolicyShift;
     uint8_t* const policy = MemoryInline::LeanBaseAtInit() + MemoryInline::kLeanPolicyOffset;
+    // The range policy (memory_access.h, kLeanRangePolicyOffset) reads "checked" while the store policy changes.
+    uint8_t* const rangePolicy = MemoryInline::LeanBaseAtInit() + MemoryInline::kLeanRangePolicyOffset;
+    std::memset(rangePolicy, 1, kChunks);
     std::memset(policy, 1, kChunks);
     for (const auto& region : Regions()) {
-        const uint64_t start = GuestMemoryAlias::Offset(region.config.baseAddress);
+        const uint64_t start = region.config.baseAddress & MemoryInline::kLeanMask;
         const uint64_t end = start + region.storageSize;
         constexpr uint64_t kChunk = uint64_t{1} << MemoryInline::kLeanPolicyShift;
         for (uint64_t chunk = (start + kChunk - 1) >> MemoryInline::kLeanPolicyShift;
@@ -304,7 +290,7 @@ void RefreshLeanStorePolicy() {
             policy[chunk] = 0;
     }
     const auto mark = [&](uint32_t address) {
-        policy[(GuestMemoryAlias::Offset(address)) >> MemoryInline::kLeanPolicyShift] = 1;
+        policy[(address & MemoryInline::kLeanMask) >> MemoryInline::kLeanPolicyShift] = 1;
     };
     for (uint64_t address = 0xCC000000u; address < 0xCE000000u; address += 1u << MemoryInline::kLeanPolicyShift)
         mark(static_cast<uint32_t>(address));
@@ -320,9 +306,13 @@ void RefreshLeanStorePolicy() {
             if (RecompMod::g_executableWriteGuardPages[first + sub].load(std::memory_order_relaxed) != 0)
                 mark((first + sub) << MemoryInline::kWritableSubPageShift);
     }
+    // A resolved write range of at most 64 KiB starting in chunk c lies in c and c + 1 (the last chunk's next one is
+    // past the window), so its one test reads both.
+    for (uint64_t chunk = 0; chunk + 1 < kChunks; ++chunk)
+        rangePolicy[chunk] = static_cast<uint8_t>(policy[chunk] | policy[chunk + 1]);
 }
 
-// The window is reserved address space on every OS (lean_base.cpp), which backs only what is in use, the same ranges
+// The window is reserved address space on every OS (Memory::Init), which backs only what is in use, the same ranges
 // everywhere: each guest region, its slice of the dirty map, the store policy, and the whole MMIO window. Horizon has no lazily backed anonymous memory; backing the same ranges on Linux and Windows makes
 // them fault wherever the Switch does. The MMIO backing stays zero (every store there takes the checked path), so a
 // guest load there reads zero, as without the window (Read*Slow: nothing on the bus outside the modeled devices) and
@@ -716,11 +706,23 @@ void Memory::Init(const Config& config) {
 
 #elif MKW_LEAN_MEMORY
     // One 1 GiB window for every guest view (memory_access.h, MKW_LEAN_MEMORY): a region's host bytes sit at its
-    // normalized offset, so configured physical, cached, uncached and mirror views share backing.
+    // masked address, so the physical, cached and uncached views of MEM1/MEM2 alias by construction.
     // Address space only: BackLeanWindow backs the parts in use. The 64 KiB after it (kLeanGuardSize) stay reserved and
-    // unbacked, so a resolved read range's access past the window's end faults.
-    uint8_t* const window = MemoryInline::LeanBaseAtInit();
-    if (!window) throw std::runtime_error("lean memory: could not reserve the 1 GiB guest window");
+    // unbacked, so a resolved read range's access past the window's end faults (memory_access.h, kLeanRangePolicyOffset).
+    static uint8_t* const window = [] {
+        constexpr uint64_t kReserved = MemoryInline::kLeanWindowSize + MemoryInline::kLeanGuardSize;
+#if defined(_WIN32)
+        void* reserved = VirtualAlloc(nullptr, kReserved, MEM_RESERVE, PAGE_NOACCESS);
+#elif defined(__SWITCH__)
+        void* reserved = HorizonLeanWindowReserve(kReserved);
+#else
+        void* reserved = mmap(nullptr, kReserved, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (reserved == MAP_FAILED) reserved = nullptr;
+#endif
+        if (reserved == nullptr) throw std::runtime_error("lean memory: could not reserve the 1 GiB guest window");
+        return static_cast<uint8_t*>(reserved);
+    }();
+    MemoryInline::SetLeanBase(window);
     BackLeanWindow(MemoryInline::kLeanPolicyOffset, MemoryInline::kLeanWindowSize >> MemoryInline::kLeanPolicyShift);
     // The whole MMIO window 0xCC000000-0xCE000000 reads zero (BackLeanWindow). A Wii answers loads anywhere in it, and
     // guest code loads through garbage pointers into it (the game's 0xCC heap fill: P+'s pad hook reads 0xCCCCCD14
@@ -772,11 +774,8 @@ void Memory::Init(const Config& config) {
         }
 #elif MKW_LEAN_MEMORY
         {
-            const uint64_t windowOffset = GuestMemoryAlias::Offset(regionConfig.baseAddress);
-            if (regionConfig.sizeBytes > UINT32_MAX - uint64_t(regionConfig.baseAddress) + 1 ||
-                windowOffset + regionConfig.sizeBytes > MemoryInline::kLeanDirtyOffset ||
-                (regionConfig.sizeBytes && GuestMemoryAlias::Offset(regionConfig.baseAddress +
-                    static_cast<uint32_t>(regionConfig.sizeBytes - 1)) != windowOffset + regionConfig.sizeBytes - 1))
+            const uint64_t windowOffset = regionConfig.baseAddress & MemoryInline::kLeanMask;
+            if (windowOffset + regionConfig.sizeBytes > MemoryInline::kLeanWindowSize)
                 throw std::runtime_error("lean memory: region '" + regionConfig.name + "' does not fit the window");
             instance.storagePtr = MemoryInline::LeanBaseAtInit() + windowOffset;
             if (regionConfig.sizeBytes != 0) {

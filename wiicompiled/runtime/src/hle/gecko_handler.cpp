@@ -1,4 +1,3 @@
-#include "guest_memory_alias.h"
 // gecko_handler.cpp - the Gecko code handler (projects/brawl/gecko/codehandler.bin, entry 0x800018A8) as a native
 // body. A mod's code list is walked in full at every hooked frame (Project+: ~2,900 codes, 1,226 of them C2 hooks and
 // 260 string writes of ~12 KB, at each VBI in a match and at each AX frame in the menus), and nearly every write it
@@ -781,7 +780,7 @@ void VerifyPass(CpuContext* ctx) {
     static std::vector<uint8_t> before[2], original[2];
 #if MKW_LEAN_MEMORY
     static std::vector<uint8_t> marksBefore[2], marksOriginal[2];
-    const auto marks = [](const Region& region) { return BrawlDirtyMemory::leanBlocks + ((GuestMemoryAlias::Offset(region.base)) >> 6); };
+    const auto marks = [](const Region& region) { return BrawlDirtyMemory::leanBlocks + ((region.base & 0x3FFFFFFFu) >> 6); };
 #endif
     const auto capture = [&](std::vector<uint8_t>* mem, [[maybe_unused]] std::vector<uint8_t>* dirty) {
         for (int i = 0; i < 2; ++i) {

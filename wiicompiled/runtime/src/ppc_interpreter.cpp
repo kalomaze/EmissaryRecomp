@@ -1,4 +1,3 @@
-#include "guest_memory_alias.h"
 // PowerPC (Gekko/Broadway) interpreter for guest code the static translation does not have: code a mod puts in
 // memory (Gecko C0/C2 inserts, Syriinge plugins, replaced .rel modules) and any address the translation missed.
 // A call to such an address (InvokeIndirectCpu, InvokeDirectCpu, InvokeIndirectJump) runs here instead of failing:
@@ -1683,7 +1682,7 @@ struct BlockCache {
                 if (now != *word && shown++ < 8)
                     RT_LOGF(RT_TAG_RUNTIME, "interpreter:   0x%08X was %08X, now %08X (mark %u)\n", at, *word, now,
 #if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
-                            static_cast<unsigned>(BrawlDirtyMemory::leanBlocks[(GuestMemoryAlias::Offset(at)) >> 6]));
+                            static_cast<unsigned>(BrawlDirtyMemory::leanBlocks[(at & 0x3FFFFFFFu) >> 6]));
 #else
                             0u);
 #endif
@@ -1719,7 +1718,7 @@ struct BlockCache {
         for (uint32_t s = 0; s < b.segments; ++s) {
             const Segment& g = b.segment[s];
             if (mark - g.firstMark <= g.lastMark - g.firstMark) {
-                const uint32_t canonical = GuestMemoryAlias::Offset(g.start);
+                const uint32_t canonical = g.start & BrawlDirtyMemory::kLeanDirtyMask;
                 const uint8_t* const host = MemoryInline::LeanHost(g.start);
                 for (uint32_t k = 0; k < g.count; ++k) {
                     if (((canonical + 4u * k) >> 6) != mark) continue;
@@ -1830,8 +1829,8 @@ struct BlockCache {
                 segment[s].firstMark = 1;
                 segment[s].lastMark = 0;
             } else {
-                segment[s].firstMark = (GuestMemoryAlias::Offset(segment[s].start)) >> 6;
-                segment[s].lastMark = (GuestMemoryAlias::Offset((segment[s].start + 4u * segment[s].count - 1u))) >> 6;
+                segment[s].firstMark = (segment[s].start & 0x3FFFFFFFu) >> 6;
+                segment[s].lastMark = ((segment[s].start + 4u * segment[s].count - 1u) & 0x3FFFFFFFu) >> 6;
             }
             segs[s] = segment[s];
 #if MKW_LEAN_MEMORY

@@ -78,20 +78,6 @@ static void TestOriginalTrampoline() {
     TranslatedFunctionRegistry::Finalize();
     GuestCodePatch::RegisterOriginalNative(original, OriginalNative);
     GuestCodePatch::Protect(original, 0x80007060, "original trampoline test");
-    // Mirror writes must retire the same translated function as its normal view.
-    for (uint32_t alias : {0x00007040u, 0x82007040u, 0x84007040u, 0x86007040u,
-                           0xc2007040u, 0xc4007040u, 0xc6007040u}) {
-        Memory::Write32(alias, 0x38630002u);
-        assert(GuestCodePatch::NoteWrite(alias)); // platform hook is stubbed here
-        GuestCodePatch::Sync();
-        assert(g_mkwGuestCodePatched[4]);
-        CpuContext mirrorCtx{};
-        mirrorCtx.gpr[3] = 10;
-        GuardedCallee(&mirrorCtx);
-        assert(mirrorCtx.gpr[3] == 12);
-        Memory::Write32(alias, 0x38630001u);
-        GuestCodePatch::ResetPristine(0x80007040u, 0x80007060u);
-    }
     // The mod writes a callee's code and calls its registered entry immediately,
     // after the guest cache-synchronization sequence, without returning through
     // RunPatched or invoking a trampoline resolver.
@@ -259,4 +245,4 @@ static void TestOriginalTrampoline() {
     assert(GuestCodePatch::ResolveOriginalNativeTrampoline(trampoline).entry == nullptr);
 }
 
-int main() { Memory::Init(Memory::Config::WiiDefaults()); TestOriginalTrampoline(); }
+int main() { Memory::Init(0x200000); TestOriginalTrampoline(); }

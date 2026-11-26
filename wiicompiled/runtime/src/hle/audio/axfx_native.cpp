@@ -1,4 +1,3 @@
-#include "guest_memory_alias.h"
 // axfx_native.cpp - Brawl's AXFX reverb and delay callbacks, natively (vanilla rev 1 main.dol):
 //   AXFXReverbHiExpCallback 0x80202A58 (the hottest guest function in a match: ~7% of the game thread)
 //   AXFXDelayCallback       0x80203A10
@@ -245,7 +244,7 @@ inline void MarkStores4(uint32_t start, uint64_t bytes) {
 #if MKW_LEAN_MEMORY && !MKW_LEAN_DIRTY_MARKS
     (void)start;  // no dirty marks in this build (no translated store marks either; rollback refuses to run)
 #elif MKW_LEAN_MEMORY
-    const uint32_t canonical = GuestMemoryAlias::Offset(start);
+    const uint32_t canonical = start & MemoryInline::kLeanMask;
     const uint32_t first = canonical >> 6;
     const uint32_t last = ((canonical + static_cast<uint32_t>(bytes) - 4) >> 6) + 1;
     std::memset(MemoryInline::g_leanBase + MemoryInline::kLeanDirtyOffset + first, 1, last - first + 1);
@@ -275,7 +274,7 @@ inline bool Resolve(Span& span, uint32_t start, uint64_t bytes, bool write) {
 // Alias test on the lean window offset, which folds the physical, cached and uncached views together (memory_access.h).
 // For the other memory models it is conservative: a false overlap only sends the call to the translated original.
 inline bool Overlap(const Span& a, const Span& b) {
-    const uint32_t ca = GuestMemoryAlias::Offset(a.start), cb = GuestMemoryAlias::Offset(b.start);
+    const uint32_t ca = a.start & 0x3FFFFFFFu, cb = b.start & 0x3FFFFFFFu;
     return ca < cb + b.bytes && cb < ca + a.bytes;
 }
 
@@ -339,7 +338,7 @@ struct Segment {
 };
 
 inline void AddSegment(Segment* segments, uint32_t& count, const Span& span, bool write) {
-    const uint32_t start = GuestMemoryAlias::Offset(span.start);
+    const uint32_t start = span.start & 0x3FFFFFFFu;
     segments[count++] = {start, start + span.bytes, write};
 }
 
@@ -1471,7 +1470,7 @@ inline bool SameConfig(const uint8_t* a, const uint8_t* b) {
 // The store-policy chunks a written range lies in (false: too many).
 bool AddChunks(uint32_t* chunks, uint32_t& count, uint32_t max, const Span& span) {
 #if MKW_LEAN_MEMORY
-    const uint32_t start = GuestMemoryAlias::Offset(span.start);
+    const uint32_t start = span.start & MemoryInline::kLeanMask;
     const uint32_t first = start >> MemoryInline::kLeanPolicyShift;
     const uint32_t last = (start + span.bytes - 1) >> MemoryInline::kLeanPolicyShift;
     for (uint32_t chunk = first; chunk <= last; ++chunk) {
@@ -1514,7 +1513,7 @@ bool OverlapsSorted(const Segment* list, uint32_t count, uint32_t start, uint32_
     return lo < count && list[lo].start < end;
 }
 inline bool OverlapsSorted(const Segment* list, uint32_t count, const Span& span) {
-    const uint32_t start = GuestMemoryAlias::Offset(span.start);
+    const uint32_t start = span.start & 0x3FFFFFFFu;
     return OverlapsSorted(list, count, start, start + span.bytes);
 }
 
@@ -1766,7 +1765,7 @@ uint32_t Footprint(const Plan& p, uint32_t fx, Segment out[kMaxFootprint]) {
     }
     uint32_t lo = UINT32_MAX, hi = 0;
     const auto cover = [&](const Ring& r) {
-        const uint32_t start = GuestMemoryAlias::Offset(r.span.start);
+        const uint32_t start = r.span.start & 0x3FFFFFFFu;
         lo = std::min(lo, start);
         hi = std::max(hi, start + r.span.bytes);
     };
@@ -1778,7 +1777,7 @@ uint32_t Footprint(const Plan& p, uint32_t fx, Segment out[kMaxFootprint]) {
         cover(p.last[c]);
     }
     out[n++] = {lo, hi, true};
-    const uint32_t lpf = GuestMemoryAlias::Offset((fx + kLastLpfOut));
+    const uint32_t lpf = (fx + kLastLpfOut) & 0x3FFFFFFFu;
     out[n++] = {lpf, lpf + 12, true};
     return n;
 }
@@ -1789,7 +1788,7 @@ uint32_t CachedFootprint(const Proven& e, const Plan& p, uint32_t fx, Segment ou
     uint32_t n = 0;
     for (uint32_t c = 0; c < 3; ++c) AddSegment(out, n, p.in[c], true);
     out[n++] = e.cover;
-    const uint32_t lpf = GuestMemoryAlias::Offset((fx + kLastLpfOut));
+    const uint32_t lpf = (fx + kLastLpfOut) & 0x3FFFFFFFu;
     out[n++] = {lpf, lpf + 12, true};
     return n;
 }
@@ -2272,7 +2271,7 @@ bool Run(CpuContext* ctx) {
     uint32_t lo = UINT32_MAX, hi = 0;
     for (uint32_t c = 0; c < 3; ++c) {
         AddSegment(footprint, count, inSpan[c], true);
-        const uint32_t start = GuestMemoryAlias::Offset(line[c].span.start);
+        const uint32_t start = line[c].span.start & 0x3FFFFFFFu;
         lo = std::min(lo, start);
         hi = std::max(hi, start + line[c].span.bytes);
     }
@@ -2689,7 +2688,7 @@ bool Pending() {
 
 bool Overlaps(uint32_t start, uint32_t bytes) {
     State& g = G();
-    const uint32_t canonical = GuestMemoryAlias::Offset(start);
+    const uint32_t canonical = start & 0x3FFFFFFFu;
     if (!OverlapsHeld(g, canonical, canonical + bytes)) return false;
     ++g.conflicts;
     return true;
@@ -2807,7 +2806,7 @@ bool AddRange(VerifyScratch& scratch, uint32_t start, uint64_t bytes) {
     r.bytes = span.bytes;
     r.host = span.host;
 #if MKW_LEAN_MEMORY
-    const uint32_t canonical = GuestMemoryAlias::Offset(start);
+    const uint32_t canonical = start & MemoryInline::kLeanMask;
     const uint32_t first = canonical >> 6;
     const uint32_t last = ((canonical + span.bytes - 1) >> 6) + 1;
     r.marks = MemoryInline::g_leanBase + MemoryInline::kLeanDirtyOffset + first;
@@ -2908,7 +2907,7 @@ bool SameRegisters(const CpuContext& in, const CpuContext& original, const CpuCo
 // UINT32_MAX. r.marks holds the native's marks, measured from zero; r.host its bytes; r.before the bytes before.
 uint32_t FirstUncoveredBlock(const VerifyRange& r) {
 #if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS  // (without dirty marks neither side marks: nothing to cover)
-    const uint32_t c = GuestMemoryAlias::Offset(r.start);
+    const uint32_t c = r.start & MemoryInline::kLeanMask;
     const uint32_t first = c >> 6;
     for (uint32_t b = 0; b < r.markCount; ++b) {
         if (r.marks[b] != 0) continue;

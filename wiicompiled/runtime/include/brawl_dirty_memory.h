@@ -1,5 +1,4 @@
 #pragma once
-#include "guest_memory_alias.h"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -71,11 +70,12 @@ BRAWL_DIRTY_MEMORY_SLOW inline void MarkSlow(uint32_t address,size_t size) {
     }
 }
 #if MKW_LEAN_MEMORY
-// The lean memory model (memory_access.h) gives every guest byte one canonical offset, GuestMemoryAlias::Offset(address), in a
+// The lean memory model (memory_access.h) gives every guest byte one canonical offset, `address & 0x3FFFFFFF`, in a
 // 1 GiB window, so its marks are one flat byte per 64 guest bytes over that window (leanBlocks, allocated by
 // Memory::Init), with no page table or alias pointers. Every store marks unconditionally, tracked or not: a shift
 // and one 16-bit store of 0x0101, no branch. That store also marks the following block, which covers a write of up
 // to 64 bytes that crosses into it; the scanner copies the extra block. WriteWatch scans and clears its pages' slices.
+inline constexpr uint32_t kLeanDirtyMask=0x3FFFFFFFu;
 inline constexpr size_t kLeanDirtyBlocks=(size_t{1}<<30)/64;
 inline uint8_t* leanBlocks=nullptr;  // kLeanDirtyBlocks + 1 bytes (the last block's mark spills one byte)
 inline void LeanMarkBlockPair(uint32_t canonical) {
@@ -92,8 +92,8 @@ inline void Mark(uint32_t address,size_t size) {
 #if MKW_LEAN_MEMORY && !MKW_LEAN_DIRTY_MARKS
     (void)address;(void)size;
 #elif MKW_LEAN_MEMORY
-    if(size<=64) LeanMarkBlockPair(GuestMemoryAlias::Offset(address));
-    else if(size) LeanMarkRange(GuestMemoryAlias::Offset(address),size);
+    if(size<=64) LeanMarkBlockPair(address&kLeanDirtyMask);
+    else if(size) LeanMarkRange(address&kLeanDirtyMask,size);
 #else
     if(active.load(std::memory_order_relaxed))MarkSlow(address,size);
 #endif

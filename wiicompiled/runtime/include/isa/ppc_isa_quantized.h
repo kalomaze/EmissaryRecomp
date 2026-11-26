@@ -323,7 +323,7 @@ inline void PpcWritePairPsqInline(uint32_t addr, T first, T second)
 MKW_PPC_FORCE_INLINE const uint8_t* PpcTryGetPsqReadableHostInline(uint32_t addr)
 {
 #if MKW_LEAN_MEMORY
-    return MemoryInline::LeanScalarHost(addr);
+    return MemoryInline::LeanHost(addr);  // memory_access.h: loads need no check
 #endif
     if (GuestFlat::RequiresCheckedAccess()) [[unlikely]]
         return nullptr;
@@ -342,7 +342,6 @@ MKW_PPC_FORCE_INLINE const uint8_t* PpcTryGetPsqReadableHostInline(uint32_t addr
 MKW_PPC_FORCE_INLINE uint8_t* PpcTryGetPsqWritableHostInline(uint32_t addr)
 {
 #if MKW_LEAN_MEMORY
-    if (!MemoryInline::LeanScalarHost(addr)) [[unlikely]] return nullptr;
     // One policy byte per 64 KiB: an 8-byte pair can only straddle two chunks.
     if (MemoryInline::LeanStoreNeedsPolicy(addr) || MemoryInline::LeanStoreNeedsPolicy(addr + 7u)) [[unlikely]]
         return nullptr;
@@ -745,6 +744,9 @@ inline double PpcLoadPairPsqFloatStackInline(uint32_t addr)
 {
     // MemoryInline::ReadStack64's exact proof (TryGetPointerFast), then the
     // same Memory::Read64 fallback it uses on a miss.
+#if MKW_LEAN_MEMORY
+    return PpcLoadPairPsqFloatFromHostInline(MemoryInline::LeanHost(addr));
+#endif
     uint8_t* host = nullptr;
     if (MemoryInline::TryGetPointerFast(addr, sizeof(uint64_t), host)) [[likely]]
         return PpcLoadPairPsqFloatFromHostInline(host);

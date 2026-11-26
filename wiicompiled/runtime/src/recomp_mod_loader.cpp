@@ -1,4 +1,3 @@
-#include "guest_memory_alias.h"
 #include "guest_code_patch.h"
 #include "fault_report.h"
 #include "recomp_mod_loader.h"
@@ -143,9 +142,13 @@ void AddMem1AliasesLocked(uint32_t start, uint32_t end, const std::string& name)
         AddExecutableRangeLocked(0xC0000000u + offset, static_cast<uint32_t>(0xC0000000ull + offset + length), name + " [uncached]");
     };
 
-    const uint32_t cached = GuestMemoryAlias::Cached(start);
-    if (cached >= Memory::kMem1CachedBase && cached < Memory::kMem1CachedBase + Memory::kMem1Size)
-        addFromOffset(cached - Memory::kMem1CachedBase);
+    if (start < 0x01800000u && end <= 0x01800000u) {
+        addFromOffset(start);
+    } else if (start >= 0x80000000u && end <= 0x81800000u) {
+        addFromOffset(start - 0x80000000u);
+    } else if (start >= 0xC0000000u && end <= 0xC1800000u) {
+        addFromOffset(start - 0xC0000000u);
+    }
 }
 
 void AddMem2AliasesLocked(uint32_t start, uint32_t end, const std::string& name) {
@@ -372,7 +375,6 @@ void RegisterExecutableRange(uint32_t start, uint32_t end, std::string name) {
                                                  const ExecutableRange& range, bool storeKnown = true);
 
 bool HandleExecutableWrite(uint32_t address, size_t length, uint64_t value) {
-    address = GuestMemoryAlias::Cached(address);
     if (!ExecutableWriteGuardMayHit(address, length)) {
         return false;
     }
@@ -390,7 +392,6 @@ bool HandleExecutableWrite(uint32_t address, size_t length, uint64_t value) {
 }
 
 void CheckExecutableWrite(uint32_t address, size_t length, uint64_t value) {
-    address = GuestMemoryAlias::Cached(address);
     if (!ExecutableWriteGuardMayHit(address, length)) {
         return;
     }
