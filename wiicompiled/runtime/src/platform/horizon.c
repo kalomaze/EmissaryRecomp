@@ -260,7 +260,8 @@ void HorizonTrace(const char* text) {
 }
 
 // Lean guest memory (runtime/include/memory_access.h, MKW_LEAN_MEMORY): every guest access is
-// window + (address & 0x3FFFFFFF) into one 1 GiB host window. Horizon has no lazily backed anonymous memory, so the
+// one 1 GiB host window; the runtime normalizes aliases and validates guest ranges. Horizon has no lazily backed
+// anonymous memory, so the
 // window is address space reserved in the stack region (svcMapMemory's destination), and only the ranges
 // memory.cpp's BackLeanWindow names are backed (as on every OS), with heap memory aliased in by svcMapMemory as libnx
 // maps thread stacks.

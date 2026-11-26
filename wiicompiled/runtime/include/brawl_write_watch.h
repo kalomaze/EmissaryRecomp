@@ -43,7 +43,7 @@ public:
     WriteWatch& operator=(const WriteWatch&)=delete;
     void Add(const void* host,size_t size,size_t packed,uint32_t guest=0) {
         if(!size)return;
-        const uint32_t physical=guest&0x3fffffffu;
+        const uint32_t physical=GuestMemoryAlias::Offset(guest);
         for(const auto& s:spans)if(uint64_t(physical)<uint64_t(s.guest)+s.size && uint64_t(s.guest)<uint64_t(physical)+size)
             throw std::runtime_error("overlapping selected snapshot regions");
         spans.push_back({physical,size,packed});
@@ -55,14 +55,14 @@ public:
         bool registered=false;
         for(const auto& span:BrawlDirtyMemory::hosts) {
             if(hostStart<span.start || hostStart-span.start>span.size || size>span.size-(hostStart-span.start))continue;
-            if(((span.guest+uint32_t(hostStart-span.start))&0x3fffffffu)!=physical)
+            if(GuestMemoryAlias::Offset(span.guest+uint32_t(hostStart-span.start))!=physical)
                 throw std::runtime_error("inconsistent guest mapping for host memory");
             registered=true;break;
         }
         if(!registered)BrawlDirtyMemory::hosts.push_back({hostStart,size,guest});
         for(uint64_t addr=uint64_t(guest)&~uint64_t(65535);addr<uint64_t(guest)+size;addr+=65536) {
             // MEM1/MEM2 physical/cached/uncached aliases share the same mark.
-            const uint32_t canonical=uint32_t(addr)&0x3fffffffu;
+            const uint32_t canonical=GuestMemoryAlias::Offset(uint32_t(addr));
             auto& page=owned[canonical>>16];
 #if MKW_LEAN_MEMORY  // the marks live in BrawlDirtyMemory::leanBlocks at the canonical offset: no Page, no aliases
             (void)page;

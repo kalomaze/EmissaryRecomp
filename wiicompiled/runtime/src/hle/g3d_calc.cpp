@@ -1,3 +1,4 @@
+#include "guest_memory_alias.h"
 // Native bodies for nw4r g3d's calc side (doldecomp/ogws g3d_calcworld.cpp, g3d_calcview.cpp, g3d_resanmchr.cpp,
 // nw4r for MDL0 rev 9, checked against Brawl's translated functions), the per-frame work under ScnMdl's CALC_WORLD
 // and CALC_VIEW: CalcSkinning (0x801A5414), the envelope blend that writes skinned matrices into the model's
@@ -197,13 +198,13 @@ inline void Bump(std::atomic<uint64_t>& counter, uint64_t n = 1) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Lean memory (memory_access.h): guest address & kLeanMask is the offset into one host window; rollback's dirty marks
+// Lean memory (memory_access.h): guest GuestMemoryAlias::Offset(address) is the offset into one host window; rollback's dirty marks
 // are one byte per 64 guest bytes (BrawlDirtyMemory::leanBlocks); a 64 KiB chunk with a non-zero policy byte sends
 // stores to the checked path.
 // ---------------------------------------------------------------------------------------------------------------
 #if MKW_LEAN_MEMORY
 inline uint8_t* Window() { return MemoryInline::g_leanBase; }
-inline uint32_t Canonical(uint32_t address) { return address & MemoryInline::kLeanMask; }
+inline uint32_t Canonical(uint32_t address) { return GuestMemoryAlias::Offset(address); }
 inline bool LeanReady() {
     return MemoryInline::g_leanBase != nullptr &&
            BrawlDirtyMemory::flatBase == reinterpret_cast<uintptr_t>(MemoryInline::g_leanBase);
@@ -212,7 +213,7 @@ inline bool LeanReady() {
 inline bool PlainRange(uint32_t address, uint64_t size) {
     if (size == 0) return true;
     const uint32_t c = Canonical(address);
-    if (c + size > MemoryInline::kLeanWindowSize) return false;
+    if (!MemoryInline::LeanRangeMapped(address, size)) return false;
     if (((address ^ (address + static_cast<uint32_t>(size - 1))) & ~MemoryInline::kLeanMask) != 0) return false;
     const uint8_t* const policy = Window() + MemoryInline::kLeanPolicyOffset;
     for (uint64_t chunk = c >> MemoryInline::kLeanPolicyShift; chunk <= (c + size - 1) >> MemoryInline::kLeanPolicyShift;
@@ -223,8 +224,7 @@ inline bool PlainRange(uint32_t address, uint64_t size) {
 // The range lies in one view of the window (one host span; guest loads read the window at any address).
 inline bool OneView(uint32_t address, uint32_t size) {
     if (size == 0) return true;
-    return Canonical(address) + static_cast<uint64_t>(size) <= MemoryInline::kLeanWindowSize &&
-           ((address ^ (address + (size - 1))) & ~MemoryInline::kLeanMask) == 0;
+    return MemoryInline::LeanRangeMapped(address, size);
 }
 inline bool Overlap(uint32_t a, uint32_t aSize, uint32_t b, uint32_t bSize) {
     return aSize != 0 && bSize != 0 && Canonical(a) < Canonical(b) + static_cast<uint64_t>(bSize) &&
@@ -2255,7 +2255,7 @@ inline double ScaledValue(uint32_t track, double dequantized) {
 inline double ScaledScalar(uint32_t track, double value) {
     return PPC_FmaddsSingleC(GuestLoadFloat(track + 8u), value, GuestLoadFloat(track + 12u));
 }
-inline bool TrackHeaderOk(uint32_t track) { return ((track ^ (track + 15u)) & ~MemoryInline::kLeanMask) == 0; }
+inline bool TrackHeaderOk(uint32_t track) { return MemoryInline::LeanRangeMapped(track, 16); }
 
 // FVS32 (0x801943DC): a 32-byte frame. Writes back r1, r3, r4, f1, f2.
 bool KeyFVS32Native(CpuContext* ctx) {

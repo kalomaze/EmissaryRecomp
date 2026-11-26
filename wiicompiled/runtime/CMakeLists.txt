@@ -422,8 +422,8 @@ endif()
 # a registration file is silently never compiled and never errors. The stale-glob
 # failure mode is worth far more than the milliseconds.
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp")
-# The lean window base's one writable definition (memory_access.h): every other source declares it const, so it must
-# not share a unity batch or the precompiled header with them.
+# Keep platform reservation headers and the lean window's startup initializer
+# in their own translation unit.
 set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/src/lean_base.cpp" PROPERTIES
     SKIP_UNITY_BUILD_INCLUSION ON
     SKIP_PRECOMPILE_HEADERS ON)
@@ -529,6 +529,22 @@ if(MKW_BUILD_INTERPRETER_TESTS)
         target_link_options(mkw_interpreter_call_forms_tests PRIVATE -Wl,--gc-sections)
     endif()
     set_target_properties(mkw_interpreter_call_forms_tests PROPERTIES UNITY_BUILD OFF)
+    if(MKW_LEAN_MEMORY)
+        add_executable(mkw_lean_memory_tests tests/lean_memory_tests.cpp
+            tests/interpreter_test_support.cpp src/memory.cpp src/lean_base.cpp)
+        target_compile_definitions(mkw_lean_memory_tests PRIVATE MKW_LEAN_MEMORY=1 MKW_FLAT_MEMORY=0)
+        target_include_directories(mkw_lean_memory_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/..")
+        target_compile_features(mkw_lean_memory_tests PRIVATE cxx_std_20)
+        target_link_libraries(mkw_lean_memory_tests PRIVATE Threads::Threads)
+        target_compile_options(mkw_lean_memory_tests PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)
+        if(APPLE)
+            target_link_options(mkw_lean_memory_tests PRIVATE -Wl,-dead_strip)
+        else()
+            target_link_options(mkw_lean_memory_tests PRIVATE -Wl,--gc-sections)
+        endif()
+        set_target_properties(mkw_lean_memory_tests PROPERTIES UNITY_BUILD OFF)
+        add_test(NAME mkw_lean_memory_tests COMMAND mkw_lean_memory_tests)
+    endif()
     add_executable(mkw_native_trampoline_tests
         tests/native_trampoline_tests.cpp tests/interpreter_test_support.cpp src/hle/gecko_handler.cpp
         src/guest_code_patch.cpp src/abi_bridge.cpp src/fpu_helpers.cpp src/memory.cpp src/lean_base.cpp
