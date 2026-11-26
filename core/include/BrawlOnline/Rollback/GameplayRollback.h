@@ -1,0 +1,506 @@
+// Copyright 2026 Dolphin Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// Gameplay-only (Slippi-style) rollback for Brawl / Project+: Brawl memory helpers, the gameplay
+// region set, and a per-game-frame trace of gameplay observables.
+//
+// The session model: each player boots and uses the menus on their own. They connect at the
+// character select, exchange selections, and start the same match. Only gameplay state (a
+// configured region set) is saved and restored during the match. See
+// docs/gameplay-rollback-status.md in the workspace.
+
+#pragma once
+
+#include <array>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "Common/CommonTypes.h"
+#include "InputCommon/GCPadStatus.h"
+
+namespace Core
+{
+class CPUThreadGuard;
+class System;
+}
+namespace Memory
+{
+class MemoryManager;
+}
+
+namespace Gprb
+{
+// ---------------------------------------------------------------------------------------------
+// Brawl memory helpers (host-side reads of guest memory; no CPU interaction).
+
+namespace Addr
+{
+constexpr u32 SCENE_MANAGER_PTR = 0x805A0060;  // gfSceneManager*
+constexpr u32 APPLICATION_PTR = 0x8059FFAC;    // gfApplication*
+constexpr u32 APP_FRAME_COUNTER_OFF = 0x100;
+constexpr u32 HEAP_INFOS = 0x80494958;  // HeapInfo g_HeapInfos[0x48] {name*, pool*, size, arena}
+constexpr u32 HEAP_INFO_COUNT = 0x48;
+constexpr u32 OS_MODULE_LIST_HEAD = 0x800030C8;
+constexpr u32 SND_SYSTEM_PTR = 0x805A01D0;  // g_sndSystem (.sbss)
+constexpr u32 SND_HEAP_SYS = 0x2D0;         // sndSystem: sndHeapSys*
+constexpr u32 SND_LOADER = 0xB98;           // sndSystem: the sound group loader (its own thread)
+constexpr u32 SND_ARCHIVE_PLAYER = 0x18C;    // sndSystem: nw4r::snd::SoundArchivePlayer
+constexpr u32 SAP_GROUP_TABLE = 0x14;       // SoundArchivePlayer: GroupAddressTable*
+constexpr u32 GAME_FRAME = 0x901812A0;  // +4 frameCounter, +0x14 persistentFrameCounter (0x18 bytes)
+constexpr u32 GAME_FRAME_SIZE = 0x18;
+constexpr u32 MTRAND_DEFAULT_SEED = 0x805A00BC;  // g_mtRand {vtable, seed}
+constexpr u32 MTRAND_OTHER_SEED = 0x805A0424;    // g_mtRandOther
+constexpr u32 LIBC_RAND_NEXT = 0x8059FF58;       // rand()/srand() state
+constexpr u32 OBJECT_SERIAL_COUNTER = 0x8059C668;
+constexpr u32 GAME_GLOBAL_PTR = 0x805A00E0;  // GameGlobal*
+constexpr u32 GG_MODE_MELEE = 0x08;          // -> gmGlobalModeMelee (0x320 bytes)
+constexpr u32 MODE_MELEE_SIZE = 0x320;
+constexpr u32 PAD_SYSTEM_PTR = 0x805A0040;  // gfPadSystem* (0x805BACC0)
+// gfPadSystem's system pads (+0x40), what the game uses: gfPadStatus[8], stride 0x40, GameCube
+// ports 0-3 then Wii Remotes 0-3 (a Wii Remote alone, with a Nunchuk or with a Classic
+// Controller). A match player's gmPlayerInitData controller number is the pad + 1.
+constexpr u32 PAD_STATUS = 0x805BAD00;
+constexpr u32 PAD_STRIDE = 0x40;
+constexpr u32 WII_PADS = 4;  // the first Wii Remote's pad
+// gfPadStatus +0x38 the error (0 none, 0xFF no controller), +0x3C the controller type (u32:
+// 0 GameCube, 1 Classic Controller, 2 Wii Remote, 3 Nunchuk; the game's gfPadType).
+constexpr u32 PAD_ERROR_OFF = 0x38;
+constexpr u32 PAD_TYPE_OFF = 0x3F;  // the type's low byte
+// g_PadConfig (ipPadConfig, 0x1AC bytes): each controller's layout, GameCube pads 12 bytes each
+// at pad * 0xC (+0 L's action, +1 R's; 3 Shield, the default), Wii Remote pads 0x21 bytes each
+// from +0x30, player -> pad at +0xB5.
+constexpr u32 PAD_CONFIG = 0x805B7480;
+constexpr u8 PAD_ACTION_SHIELD = 3;
+constexpr u32 PAD_THREAD = 0x805BA108;           // OSThread of Brawl's pad thread (object at -8)
+constexpr u32 PAD_THREAD_RUN = 0x805BA440;       // u8: the thread's loop runs while non-zero
+constexpr u32 PAD_SYS_THREAD_OFF = 0xB54;        // gfPadSystem+0xB54: the thread the alarm resumes
+constexpr u32 OS_ALARM_QUEUE = 0x805A0678;       // {head, tail} of the OS alarm queue (r13-0x3DA8)
+constexpr u32 SCM_OPERATOR_RULE_MELEE = 0x54;
+constexpr u32 OPR_IS_GAME_SET = 0x74;
+// stOperator::m_condition (the match's gmGlobalModeMelee) and stOperatorRuleMelee::m_resultInfo,
+// what its isSuddenDeath (sora_melee 0x8095517C) reads: SuddenDeathFollows.
+constexpr u32 OPR_CONDITION = 0x44;
+constexpr u32 OPR_RESULT_INFO = 0xCC;
+// scMelee's state flags: 0x80 from the frame of a game set until the scene goes on (to its end, or
+// to the stage of a sudden death, which Brawl plays with the same operators).
+constexpr u32 SCM_STATE_FLAGS = 0xD8;
+constexpr u8 SCM_GAME_SET_FLAG = 0x80;
+constexpr u32 OPR_REMAINING_FRAMES = 0xE0;  // m_remainingFrameTime: the match timer, in frames
+constexpr u32 MM_TIME_LIMIT = 0x20;         // gmGlobalModeMelee: the time limit (s32 frames, 0 none)
+// scMelee's stOperatorInfoMelee (its gfTask name at +0) and its flags byte: 0x80 running, 0x40 stop
+// requested, 0x30 the pause screen's L+R+A+START quit (sora_melee text+0x256F80), 0x20 its other
+// quit (+0x256FB0).
+constexpr u32 SCM_OPERATOR_INFO = 0x68;
+constexpr u32 OPI_FLAGS = 0x11B;
+constexpr u8 OPI_QUIT = 0x30;
+}  // namespace Addr
+
+class Guest
+{
+public:
+  explicit Guest(const Memory::MemoryManager& memory) : m_memory(memory) {}
+  // nullptr if [addr, addr+size) is not inside one mapped region.
+  const u8* Ptr(u32 addr, u32 size) const;
+  std::optional<u32> U32(u32 addr) const;
+  std::optional<u32> Ptr32(u32 addr) const;  // a u32 that must look like a MEM1/MEM2 pointer
+  std::optional<std::string> CStr(u32 addr, u32 max_len = 64) const;
+
+private:
+  const Memory::MemoryManager& m_memory;
+};
+
+bool IsMemAddr(u32 addr, u32 size = 1);
+std::string CurrentSceneName(const Guest& g);
+bool IsNextSceneMelee(const Guest& g);  // a scene change to scMelee is pending
+bool IsSceneMelee(const Guest& g);      // not the online waiting room's scMelee (IsWaitingRoom)
+bool IsWaitingRoom(const Guest& g);     // the match setup is Brawl's online waiting room
+
+struct HeapInfo
+{
+  u32 id;
+  std::string name;
+  u32 start;
+  u32 end;
+};
+std::vector<HeapInfo> ReadHeapTable(const Guest& g);
+
+struct ModuleSection
+{
+  u32 module_id;
+  u32 index;
+  u32 addr;
+  u32 size;
+  bool exec;
+  bool bss;
+};
+std::vector<ModuleSection> ReadModuleSections(const Guest& g);
+
+// Per port: active instance, damage, stocks, X, Y, status kind of the active fighter (raw u32s,
+// zeroes when not resolvable). The same fields Rollback::CalculateDesyncChecksums hashes.
+using FighterFields = std::array<std::array<u32, 6>, 4>;
+FighterFields ReadFighterFields(const Guest& g);
+u32 FightersCrc(const FighterFields& f);
+
+// scMelee's stOperatorRuleMelee "is game set" byte (0 if not in a match).
+bool IsGameSet(const Guest& g);
+// The match goes on to sudden death once it is game set: Brawl's own stOperatorRuleMelee::
+// isSuddenDeath, from the same state (more than one player or team ranked first: a double KO on
+// the last stocks, or a time-out tie). Brawl then rebuilds the stage and the tied fighters in the
+// same scene, and the match ends at the sudden death's own game set.
+bool SuddenDeathFollows(const Guest& g);
+// The match scene shows a game set (scMelee's own flag): also a sudden death's, where the rule's
+// game set byte has stayed set since the tie.
+bool SceneShowsGameSet(const Guest& g);
+// The match timer in frames (stOperatorRuleMelee m_remainingFrameTime; one that ran out reads 1),
+// 0 when the match has no time limit (gmGlobalModeMelee's) or none is running.
+u32 RemainingFrames(const Guest& g);
+// A pause-screen quit is chosen (online the plugin marks it and keeps the game paused until the
+// session has ended: docs/game-code.md, the pause-screen quit).
+bool IsQuitRequested(const Guest& g);
+
+// ---------------------------------------------------------------------------------------------
+// Region set: what gameplay-only rollback saves and restores.
+
+struct Range
+{
+  u32 addr;  // effective address (0x8xxxxxxx / 0x9xxxxxxx)
+  u32 size;
+  std::string label;
+};
+
+// Brawl's sound heaps (gp-v25): sndHeapSys (*g_sndSystem +0x2D0, 0x504 bytes: the table of loaded
+// sound groups, the heaps' nw4r SoundHeap objects, their bases and sizes) and each of its frame
+// heaps' memory. Empty if the sound system is not set up.
+std::vector<Range> ReadSoundHeaps(const Guest& g);
+// nw4r's table of the loaded groups' addresses (gp-v28): SoundArchivePlayer::mGroupTable, {count,
+// {address, wave data address} per group}. Empty if the sound system is not set up.
+std::vector<Range> ReadSoundGroupTable(const Guest& g);
+
+struct RegionSetSpec
+{
+  std::string name;
+  std::vector<std::string> heaps;          // resolved by name from the live heap table
+  bool rel_data = false;                   // every loaded REL's non-exec sections (data + bss)
+  bool sound_heaps = false;                // sndHeapSys and its sound heaps (ReadSoundHeaps)
+  bool sound_group_table = false;          // nw4r's group address table (ReadSoundGroupTable)
+  std::vector<Range> add;                  // static ranges
+  std::vector<std::pair<u32, u32>> remove;  // holes punched out of everything above
+  std::vector<std::string> remove_heaps;
+  // Bytes never restored, even inside a granule the set touches (see RollbackManager).
+  std::vector<Range> exclude;
+};
+
+// Parses the region-set JSON (Data/Sys/Rollback/*.json). Returns an error message on failure.
+std::optional<std::string> ParseRegionSet(const std::string& json, RegionSetSpec* out);
+// Loads Sys/Rollback/<name>.json (or a path). Returns an error message on failure.
+std::optional<std::string> LoadRegionSet(const std::string& name_or_path, RegionSetSpec* out);
+// Resolves the spec against the current heap table and module list: sorted, merged, holes removed.
+std::vector<Range> ResolveRegionSet(const Guest& g, const RegionSetSpec& spec);
+
+// ---------------------------------------------------------------------------------------------
+// Frame trace: one row per game frame of the match (keyed by g_GameFrame.frameCounter), recorded
+// at the end of the game loop iteration. Lets two instances be compared every frame without
+// pausing either. Enabled while the harness is active or with PPR_FRAME_TRACE=1.
+
+struct FrameTraceRow
+{
+  u32 epoch = 0;       // increments whenever a new match simulation starts
+  u32 game_frame = 0;  // g_GameFrame.frameCounter
+  u32 persistent = 0;  // g_GameFrame.persistentFrameCounter
+  u32 logic_steps = 0;  // gameProc calls in the iteration
+  u64 ticks = 0;        // CoreTiming ticks at the frame end
+  std::array<u32, 3> rng{};  // g_mtRand, g_mtRandOther, libc rand
+  u32 fighters_crc = 0;
+  FighterFields fighters{};
+  u64 range_hash = 0;  // XXH3 over the configured ranges (0 if none)
+  u32 game_set = 0;
+  bool resim = false;  // recorded during a rollback resimulation pass
+};
+
+void FrameTraceConfigure(bool enabled, std::vector<std::pair<u32, u32>> ranges);
+bool FrameTraceEnabled();
+// CPU thread, end of every game-loop iteration (BrawlbackGekkoNetFrameEnd).
+void FrameTraceOnFrameEnd(Core::System& system, u32 logic_steps, bool resim);
+// Rows of the current epoch (or `epoch`) with game_frame >= since, oldest first.
+std::vector<FrameTraceRow> FrameTraceRows(std::optional<u32> epoch, u32 since, u32 max_rows);
+u32 FrameTraceEpoch();
+
+// ---------------------------------------------------------------------------------------------
+// Game-frame-anchored pads.
+//
+// Brawl's pad thread (OSThread 0x805BA108: gfPadSystem::updateLow -> updateLowGC) writes the
+// gfPadStatus slots (0x805BAD00 + 0x40 * port) once per frame, but at a time that is not tied to
+// the main game loop. Which sample a game frame consumes therefore depends on thread timing, i.e.
+// on the emulated-time phase, which differs between two machines with different menu histories
+// (the "late divergence" of docs/gameplay-rollback-feasibility.md). Anchoring the input to the
+// game frame removes the race: at the top of every main-loop iteration the slots of the driven
+// ports are written with that frame's input, and whenever the pad thread writes them again they
+// are overwritten with the same frame's input.
+//
+// The harness uses this to give two instances bit-identical per-frame input (record on one,
+// inject into the other); the gameplay rollback session uses it for GekkoNet's input.
+
+// The players' input, one gfPadStatus per in-game port (0-3). A record whose controller type is
+// a Wii one (1-3) is written into the port's Wii Remote pad (WII_PADS + port) and the port's
+// GameCube pad is left with no controller; any other into the GameCube pad, the Wii Remote pad
+// left with none. So a player keeps the controller they locked in with on every machine, and no
+// pad of the eight holds this machine's own controllers while the slots are in force.
+constexpr u32 PAD_SLOTS_SIZE = 4 * Addr::PAD_STRIDE;
+using PadSlots = std::array<u8, PAD_SLOTS_SIZE>;
+// All eight pads as the pad thread made them (GameCube 0-3, Wii Remotes 4-7): the local controllers.
+constexpr u32 RAW_PADS_SIZE = 8 * Addr::PAD_STRIDE;
+using RawPads = std::array<u8, RAW_PADS_SIZE>;
+// A record's controller type is a Wii Remote's (alone, Nunchuk, Classic Controller).
+bool IsWiiPad(const u8* pad);
+
+// Main thread, top of every game-loop iteration (any mode). `frame` is the game frame the
+// iteration produces (g_GameFrame.frameCounter + 1 in a match).
+void PadsOnLoopTop(Core::System& system);
+// Pad thread, when updateLowGC returns (BrawlbackCapturePadThreadReadHook): the SI reads it took
+// are the ones the pass is made of (bug report #173).
+void PadsOnPadRead();
+// Pad thread, after updateLow and P+'s post-processing wrote the slots (GprbPadThreadLoopHook):
+// keeps the newest sample (PadsLatestRaw) and puts the frame's slots back.
+void PadsOnPadThreadUpdated(Core::System& system);
+// The newest pads the pad thread produced (the local controllers' latest sample).
+RawPads PadsLatestRaw();
+// The pads of the newest of the pad thread's recent passes whose read of pad `chan` stands for an
+// instant at or before `t`, and that instant in `*sampled_at`; the newest pass when none is that
+// old. A GameCube port's read is the SI read behind it (ReadHostPad); a Wii Remote's (`chan` 4-7)
+// is the pass itself, as Wii Remote reports come over the emulated Bluetooth on their own clock.
+// A network session's local input (CaptureLocalInputs).
+RawPads PadsSampledBefore(int chan, Clock::time_point t, Clock::time_point* sampled_at);
+
+// Pad thread watchdog (main thread, every loop top, any mode). The pad thread suspends itself after
+// every pass and the pad alarm (an OSAlarm at gfPadSystem, period one field) resumes it; players
+// have lost their controller for good after a ranked stage select (2026-10-11: the thread made no
+// pass again, menus and match alike). Once no pass came for a second of emulated time, logs one
+// report of what keeps it stopped: the pad thread (state, suspend count, wait queue, backtrace), its
+// run flag and gfPadSystem's thread pointer, the pad alarm and the OS alarm queue, and every guest
+// thread; and again when passes resume. Emulated time, so a paused emulation reports nothing.
+void PadsWatchdog(const Core::CPUThreadGuard& guard);
+// The return addresses of the guest stack at `sp` (its back chain), oldest call last, each with a
+// leading space.
+std::string GuestBacktrace(const Core::CPUThreadGuard& guard, u32 sp, int depth);
+// A guest OSThread at `addr`: its state, suspend count, priority, wait queue, saved registers and
+// stack.
+std::string ThreadReport(const Core::CPUThreadGuard& guard, u32 addr);
+
+// Anchor (recorder): at every loop top the frame's slots become the pad thread's newest sample for
+// the ports in `port_mask`, and stay constant for the whole main-thread frame.
+void PadsSetAnchor(u32 port_mask);
+void PadsSetRecording(bool enabled);
+// Recorded slots (what each frame consumed at the loop top), frame >= since.
+std::vector<std::pair<u32, PadSlots>> PadsRecorded(u32 since);
+// Injection table: frame -> slots, for the ports in `port_mask`.
+void PadsInjectClear();
+void PadsInjectAdd(u32 frame, const PadSlots& slots);
+void PadsInjectSetPorts(u32 port_mask);
+// The injected slots of `frame` (game frame), if the table has them.
+std::optional<PadSlots> PadsInjectedFor(u32 frame);
+// Directly provide the slots the next loop tops and pad-thread reads use (session mode).
+void PadsSetCurrent(u32 port_mask, const PadSlots& slots);
+void PadsClearCurrent();
+u32 PadsInjectedCount();
+
+// ---------------------------------------------------------------------------------------------
+// Host controller reads on the throttle's schedule (network sessions; bug report #70: "against
+// players over 100 ping my L button feels unresponsive half the time ... full hopping when I try
+// to wavedash").
+//
+// The local player's input for a frame is a pad slot Brawl's pad thread made (CaptureLocalInputs),
+// from the SI poll a field before the frame's loop top. The throttle sleeps at that poll (Rush
+// Frame Presentation, present pacing), so the controller is read at its due time, one field after
+// the last. Two things broke that with rollbacks (harness/tests/test_diag_bug70.py, 57 ms each
+// way, auto delay 2, 60% of frames rolled back: 12% of the frames took the same controller sample
+// as the frame before and 12% skipped one; on a LAN 0.1%; presses moved by a frame against each
+// other, a jump held a frame too long, a press held one frame lost):
+// - A rollback runs its re-run passes and the presented one inside one real frame, with real SI
+//   polls in each (region snapshots do not rewind the ticks), and the poll the next frame's input
+//   came from was a live read the re-run's length late (~4 ms at depth 2).
+// - The pad thread's pass and the loop top come at nearly the same emulated time, in either order
+//   (a region load puts the guest's alarm times back, not the ticks), so the newest pass was made
+//   from the poll just before the loop top on some frames and from the one a field before on
+//   others: a sample taken twice, then one skipped (PadsSampledBefore fixes that side).
+//
+// With SetHostPadsScheduled on, every read of a local controller (CSIDevice_GCController and
+// CSIDevice_GCAdapter::GetPadStatus) stands for an instant on the throttle's schedule:
+// - in a rollback's re-run: the last read before it, the one taken at the frame's due time
+//   (unless older than 100 ms, after a long wait for the peer: then read now);
+// - more than a field behind schedule (a PC that cannot keep full speed runs up to MaxFallback
+//   behind on every frame): the controller now, standing for its due instant (HostPadFarLate);
+//   but a frame catching up after a hitch (more than a field behind for a few reads, then on
+//   schedule again) reads its due instant from the past, as below (PadCatchUpOn); and no read
+//   stands for an earlier state than the channel's newest one (PadMonotonicOn);
+// - behind schedule (the instant was due earlier, CoreTimingManager::ScheduledHostTime): the
+//   state the controller had then, from a timestamped history: the Wii U adapter's read thread
+//   keeps one (GCAdapter::InputAt), and the harness (Harness::PadOverrideAt). Pads mapped in
+//   Dolphin (keyboard, XInput, SDL...) are read when called and have no past, so such a read is
+//   taken now ("late live"). The polls that make a local input are not behind schedule in a
+//   session (the re-run's are latched, the others come after the throttle's sleep): only a
+//   frame that ran longer than a field makes one late. A sampler thread polling every input
+//   backend would give them a past, but ControllerInterface updates its devices under one mutex,
+//   so it would hold up the SI poll itself;
+// - otherwise (on schedule or ahead of it): now, as before.
+// Each frame's sample is then one field after the last, rolled back or not, and as old as on a
+// frame without a rollback (the loop top's due time minus a field; ~17.5 ms at the loop top,
+// against ~16 ms on a LAN and 12-14 ms under rollbacks before, when the late reads were fresher).
+enum class HostPadSource
+{
+  Mapped,   // Dolphin's controller mapping (Pad::GetStatus)
+  Adapter,  // the Wii U GameCube adapter (GCAdapter::Input)
+};
+// A network session's frames run (on) or not (off: every read is taken now).
+void SetHostPadsScheduled(bool scheduled);
+bool HostPadsScheduled();
+// CPU thread: SI channel `chan`'s host controller, as above.
+GCPadStatus ReadHostPad(Core::System& system, int chan, HostPadSource source);
+
+struct HostPadReadStats
+{
+  u64 on_time = 0;       // read now, on schedule (or ahead of it)
+  u64 late_history = 0;  // more than 1 ms behind schedule: from the history
+  u64 late_live = 0;     // more than 1 ms behind schedule, no history: read now
+  u64 late_far = 0;      // more than a field behind schedule: read now (stands for its due time)
+  // Host decode (PadsHostDecoded): local inputs taken from it, declined (none, too old, off or
+  // turned off), and pad-thread passes compared with it (and how many differed).
+  u64 decode_used = 0;
+  u64 decode_declined = 0;
+  u64 decode_checked = 0;
+  u64 decode_mismatched = 0;
+  // Pad-thread passes made of an older read than the newest (an SI poll came between updateLowGC
+  // and the end of the pass, bug report #173).
+  u64 pass_older = 0;
+  u64 latched = 0;       // in a re-run: the last read before it
+  u64 relatched = 0;     // in a re-run, the last read too old: read now
+  // HostDecodeReadAt: local inputs read after a rollback's re-runs, and declined (no decode).
+  u64 deferred_read = 0;
+  u64 deferred_declined = 0;
+  // More than a field behind but catching up after a hitch: from the history (PadCatchUpOn).
+  u64 catch_up = 0;
+  // Would have stood for an earlier state than the newest read: the newest again (PadMonotonicOn).
+  u64 held = 0;
+  double late_max_ms = 0;
+};
+// Since the last call.
+HostPadReadStats TakeHostPadReadStats();
+// Diagnostics (PPR_GPRB_PAD_READ_LOG): a line of the session's own (loop tops, captures).
+void HostPadLogLine(const char* kind, long long a, long long b, long long c);
+// Input trace (Rollback::InputTrace): the recent read of channel `chan` (0-3) that stands for
+// `instant`: when its state was the controller's and how it was taken (now, hist, live, far,
+// relatch, deferred...). False when no recent read stands for it. CPU thread.
+bool HostPadReadNote(int chan, Clock::time_point instant, Clock::time_point* data_at,
+                     const char** kind);
+// The due time of channel `chan`'s last scheduled read outside a re-run (the one the loop top's
+// local input came from), if any. CPU thread.
+std::optional<Clock::time_point> HostPadLastDue(int chan);
+// The read after a rollback (HostDecodeReadAt) stands for its due instant: from the past when it
+// comes behind it at all, and taken in a re-run pass once due (Session's deferred local input).
+// PPR_GPRB_DEFERRED_READ_DUE=0: off (an on-time read within 1 ms of it, after the re-runs).
+bool DeferredReadDueOn();
+
+// Host decode (GitHub issue #1, DHNishi): a GameCube controller's read made into the gfPadStatus
+// Brawl's pad thread makes of it (updateLowGC and P+'s post-processing: buttons at +0 and +4,
+// sticks at +0x30, triggers at +0x34, the error at +0x38, all else 0), so the loop top can take
+// the read the SI made just before it instead of the pass of a field earlier, which the pad
+// thread makes only after the loop top: the local input a field fresher, at the same point and
+// with the same delay. The sticks and triggers go through the SDK's origin (its PADRead clamps
+// them against the origin the controller reported, which a Wii U adapter takes from the
+// controller at rest), as reported to the game (HostPadOriginReported). Every pad-thread pass of a
+// decoded read is compared with the decode; after a few that differ, decoding stops for the
+// session (PPR_GPRB_HOST_DECODE=0: never decode). CPU thread.
+// P+'s "Light LR Button Presses when not Set to Shield" (ButtonPresses.asm, hooks at 0x80029700
+// and 0x80029708 in updateLowGC): a trigger pressed to 45 or more (after the origin) whose action
+// in the controller's layout is not Shield also presses its button (L 0x40, R 0x20) at +0 and +4.
+// The decode does the same for the buttons in `light` (bug report #143: a player with L on another
+// action lost its light presses whenever the decode was in use).
+// P+'s "Hold Start to Pause v3" (a hook at 0x801E6D24 on the pad read) takes a held START out of
+// the read in a match whose pause is off until it has been held 50 frames; the decode does too
+// (bug report #182: a START held in Ranked turned the decode off for the rest of the game).
+// SI channel `chan`'s controller told the game this origin (CMD_ORIGIN, CMD_RECALIBRATE).
+void HostPadOriginReported(int chan, u8 stick_x, u8 stick_y, u8 substick_x, u8 substick_y,
+                           u8 trigger_left, u8 trigger_right);
+// The decode of the newest read of `chan` (0-3) and the instant it stands for; false when there is
+// none (or decoding is off or turned off for the session).
+bool PadsHostDecoded(int chan, std::array<u8, Addr::PAD_STRIDE>* pad, Clock::time_point* instant);
+// CPU thread: channel `chan`'s controller read outside the SI, on the schedule as the SI's reads
+// are (ReadHostPad), at the due time of the SI's last read of it (it waits for that when it comes
+// a little early), from the history when late. Its decode and the instant it stands for; false
+// when the decode is not in use. Not kept for the passes' check: no pass is made of it. A frame
+// whose paced sleep ended early for a rollback reads its local input with it after the re-runs
+// (Session's deferred loop-top read): that SI read came early, the read is made again on time.
+bool HostDecodeReadAt(Core::System& system, int chan, std::array<u8, Addr::PAD_STRIDE>* pad,
+                      Clock::time_point* instant);
+// Any thread: whether channel `chan`'s newest decoded read came from `source` (input suggestions:
+// which of the channel's controllers the game reads).
+bool HostDecodeReads(int chan, HostPadSource source);
+// Any thread: `st`, channel `chan`'s controller from `source`, made into the pad a decode of it
+// would be now, with the context (origin, light presses, START hold) of the channel's newest
+// decoded read: what the local input would carry if the SI read `st` (input suggestions). False
+// when the decode is not in use for the channel or its newest read came from another source.
+bool HostDecodeLatest(int chan, HostPadSource source, const GCPadStatus& st, u8* pad);
+// The decode itself (tests).
+constexpr u8 HOST_DECODE_LIGHT_PRESS = 45;
+void HostDecodePadSlot(const GCPadStatus& st, const std::array<u8, 6>& origin, u16 light, u8* pad);
+// The local GameCube pad `chan` (0-3) plays in-game port `port` (bug report #283). The match puts
+// each port's controls at g_PadConfig + port * 0xC, and P+'s light trigger presses (above) read
+// those of the pad's own port: a P2 on controller port 1 got P1's. The pad thread's passes of
+// `chan` (FixLightPresses) and its decodes take the light presses of `port`'s layout instead.
+// -1 (or `chan`): its own. The session's, from the game's start to its end. Any thread.
+void SetHostPadPlaysPort(int chan, int port);
+void ClearHostPadPlaysPort();
+// A pass's gfPadStatus `pad` whose light presses were those of `applied` made those of `wanted`
+// (PAD_TRIGGER_L / R): a trigger at HOST_DECODE_LIGHT_PRESS or more presses its button when
+// `wanted` has it, and no longer when only `applied` had it and the read behind the pass
+// (`raw_buttons`, its digital buttons) did not press it. Without that read such a button stays.
+void FixLightPresses(u8* pad, u16 applied, u16 wanted, std::optional<u16> raw_buttons);
+
+// ---------------------------------------------------------------------------------------------
+// Interpreter instruction trace (debugging). Armed by the harness (`cpu_trace`); records, for the
+// game's main thread with external interrupts enabled (so no interrupt handlers), every executed
+// instruction: {u32 pc, u32 opcode, u32 effective address, u32 flags, u64 value}, where value is
+// the loaded value (after a load) or the stored value (before a store). Only the interpreter
+// (CPUCore = 0) records. The window is whole game-loop iterations: from the loop top of the
+// iteration whose g_GameFrame.frameCounter is `first_frame` - 1 to the end of the iteration that
+// reaches `first_frame` + `frames` - 1.
+
+struct CpuTraceRecord
+{
+  u32 pc;
+  u32 op;
+  u32 ea;
+  u32 flags;  // bit 0 load, bit 1 store, bit 2 float, bit 3 MSR.EE clear, bits 8-31 OSThread
+  u64 value;
+};
+static_assert(sizeof(CpuTraceRecord) == 24);
+
+std::optional<std::string> CpuTraceArm(const std::string& path, u32 first_frame, u32 frames,
+                                       u64 max_records, bool all_threads,
+                                       bool include_irq = false, u32 occurrences = 1);
+struct CpuTraceStatus
+{
+  bool armed;
+  bool recording;
+  bool done;
+  u64 records;
+  u32 main_thread;
+};
+CpuTraceStatus CpuTraceGetStatus();
+void CpuTraceOnLoopTop(Core::System& system);   // BrawlbackGekkoNetUnconditionalFrame
+void CpuTraceOnFrameEnd(Core::System& system);  // BrawlbackGekkoNetFrameEnd
+
+namespace detail
+{
+extern bool g_cpu_trace_recording;
+void CpuTracePre(Core::System& system, u32 pc, u32 op);
+void CpuTracePost(Core::System& system);
+}  // namespace detail
+
+inline bool CpuTraceRecording()
+{
+  return detail::g_cpu_trace_recording;
+}
+
+}  // namespace Gprb

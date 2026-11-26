@@ -1,0 +1,495 @@
+// Copyright 2009 Dolphin Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "Common/Logging/LogManager.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <utility>
+
+#include <fmt/chrono.h>
+#include <fmt/format.h>
+
+#include "Common/Config/Config.h"
+#include "Common/FileUtil.h"
+#include "Common/Logging/ConsoleListener.h"
+#include "Common/Logging/Log.h"
+#include "Common/StringUtil.h"
+#include "Common/Thread.h"
+
+namespace Common::Log
+{
+const Config::Info<bool> LOGGER_WRITE_TO_FILE{{Config::System::Logger, "Options", "WriteToFile"},
+                                              false};
+const Config::Info<bool> LOGGER_WRITE_TO_CONSOLE{
+    {Config::System::Logger, "Options", "WriteToConsole"}, true};
+const Config::Info<bool> LOGGER_WRITE_TO_WINDOW{
+    {Config::System::Logger, "Options", "WriteToWindow"}, true};
+const Config::Info<LogLevel> LOGGER_VERBOSITY{{Config::System::Logger, "Options", "Verbosity"},
+                                              LogLevel::LNOTICE};
+
+// The log starts fresh each run; the previous runs' logs are kept next to it, newest first
+// (dolphin.prev.log, dolphin.prev2.log, dolphin.prev3.log). A run that writes more than
+// MAX_LOG_FILE_SIZE moves its own log there and starts again, so the files never take more than
+// (KEPT_LOGS + 1) times that. Several runs: a player's report of a problem that happened a few
+// Dolphin sessions ago (2026-10-11: three controller freezes, only one still in the logs).
+constexpr u64 MAX_LOG_FILE_SIZE = 25 * 1024 * 1024;
+constexpr int KEPT_LOGS = 3;
+
+// "MM:SS:mmm", as each line starts (LogManager::GetTimestamp).
+static std::string Timestamp()
+{
+  // NOTE: the Qt LogWidget hardcodes the expected length of the timestamp portion of the log line,
+  // so ensure they stay in sync
+
+  // We want milliseconds *and not hours*, so can't directly use STL formatters
+  const auto now = std::chrono::system_clock::now();
+  const auto now_s = std::chrono::floor<std::chrono::seconds>(now);
+  const auto now_ms = std::chrono::floor<std::chrono::milliseconds>(now);
+  return fmt::format("{:%M:%S}:{:03}", now_s, (now_ms - now_s).count());
+}
+
+// The file is written by its own thread: a thread that logs only appends the line to a buffer, so
+// a disk that does not take a write for a while (another program's scan, a busy or sleeping
+// drive) no longer stops the thread that logged. Bug report #257 (2026-11-08): the CPU thread
+// waited 2.4 s in NtWriteFile for one line of dolphin.log in the middle of an Unranked game, and
+// the opponent saw the game stop and quit. Above MAX_PENDING bytes waiting (a disk that stopped
+// for minutes) lines are dropped and counted, and the file says so when it takes writes again.
+constexpr size_t MAX_PENDING = 8 * 1024 * 1024;
+// A write that took this long is noted in the file.
+constexpr auto SLOW_WRITE = std::chrono::milliseconds(250);
+
+class FileLogListener : public LogListener
+{
+public:
+  FileLogListener(const std::string& filename)
+      : m_filename(filename)
+  {
+    if (File::GetSize(m_filename) > 0)
+      MoveToPrev();
+    Open();
+    SetEnable(true);
+    m_thread = std::thread([this] { Loop(); });
+  }
+
+  ~FileLogListener() override
+  {
+    {
+      std::lock_guard lk(m_mutex);
+      m_quit = true;
+    }
+    m_cv.notify_one();
+    if (m_thread.joinable())
+      m_thread.join();
+  }
+
+  void Log(LogLevel, const char* msg) override
+  {
+    if (!IsEnabled() || !m_valid.load(std::memory_order_relaxed))
+      return;
+
+    const size_t length = std::strlen(msg);
+    {
+      std::lock_guard lk(m_mutex);
+      if (m_pending.size() + length > MAX_PENDING)
+      {
+        ++m_dropped;
+        return;
+      }
+      m_pending.append(msg, length);
+    }
+    m_cv.notify_one();
+  }
+
+  // Waits until the lines logged so far are in the file, for up to `timeout`.
+  void Flush(std::chrono::milliseconds timeout) override
+  {
+    std::unique_lock lk(m_mutex);
+    m_idle_cv.wait_for(lk, timeout, [this] { return m_pending.empty() && !m_writing; });
+  }
+
+  bool IsEnabled() const { return m_enable; }
+  void SetEnable(bool enable) { m_enable = enable; }
+
+private:
+  void Loop()
+  {
+    Common::SetCurrentThreadName("Log writer");
+    // Tests: each write waits this long first, as a disk that does not take writes.
+    const char* delay_env = std::getenv("PPR_LOG_WRITE_DELAY_MS");
+    const auto delay = std::chrono::milliseconds(delay_env ? std::atoi(delay_env) : 0);
+    std::string out;
+    std::unique_lock lk(m_mutex);
+    while (true)
+    {
+      m_cv.wait(lk, [this] { return m_quit || !m_pending.empty(); });
+      if (m_pending.empty())
+        return;
+      out.swap(m_pending);
+      const u64 dropped = std::exchange(m_dropped, 0);
+      m_writing = true;
+      lk.unlock();
+
+      if (dropped != 0)
+      {
+        out.insert(0, fmt::format("{} {}:{} W[MASTER]: dolphin.log: {} lines dropped here: the "
+                                  "file did not take writes and {} MiB were waiting\n",
+                                  Timestamp(), "Common/Logging/LogManager.cpp", __LINE__,
+                                  dropped, MAX_PENDING >> 20));
+      }
+      const auto start = std::chrono::steady_clock::now();
+      if (delay.count() > 0)
+        std::this_thread::sleep_for(delay);
+      Write(out);
+      const auto took = std::chrono::steady_clock::now() - start;
+      if (took >= SLOW_WRITE)
+      {
+        Write(fmt::format(
+            "{} {}:{} W[MASTER]: dolphin.log: a write took {} ms (the lines before this one; "
+            "nothing waited for it)\n",
+            Timestamp(), "Common/Logging/LogManager.cpp", __LINE__,
+            std::chrono::duration_cast<std::chrono::milliseconds>(took).count()));
+      }
+      out.clear();
+
+      lk.lock();
+      m_writing = false;
+      if (m_pending.empty())
+        m_idle_cv.notify_all();
+    }
+  }
+
+  // Writer thread only (and the constructor, before it starts).
+  void Write(const std::string& text)
+  {
+    if (!m_logfile.good())
+      return;
+    m_logfile << text << std::flush;
+    m_size += text.size();
+    if (m_size >= MAX_LOG_FILE_SIZE)
+    {
+      m_logfile.close();
+      MoveToPrev();
+      Open();
+    }
+    m_valid.store(m_logfile.good(), std::memory_order_relaxed);
+  }
+
+  // dolphin.prev.log for n = 1, dolphin.prev<n>.log after it.
+  static std::string PrevFilename(const std::string& filename, int n)
+  {
+    const std::string suffix = n == 1 ? ".prev" : ".prev" + std::to_string(n);
+    const auto dot = filename.rfind('.');
+    return dot == std::string::npos ? filename + suffix :
+                                      filename.substr(0, dot) + suffix + filename.substr(dot);
+  }
+
+  // Shifts the kept logs one older (the oldest is dropped) and moves the current one to the
+  // newest. Not File::Rename: that logs its failures, and this runs on the writer thread, which
+  // the log waits for.
+  void MoveToPrev()
+  {
+    std::error_code error;
+    for (int n = KEPT_LOGS; n > 1; --n)
+    {
+      std::filesystem::rename(StringToPath(PrevFilename(m_filename, n - 1)),
+                              StringToPath(PrevFilename(m_filename, n)), error);
+    }
+    std::filesystem::rename(StringToPath(m_filename), StringToPath(PrevFilename(m_filename, 1)), error);
+  }
+
+  // Truncates when the old log could not be moved away, so the size limit holds.
+  void Open()
+  {
+    File::OpenFStream(m_logfile, m_filename, std::ios::out | std::ios::trunc);
+    m_size = 0;
+    m_valid.store(m_logfile.good(), std::memory_order_relaxed);
+  }
+
+  const std::string m_filename;
+  std::ofstream m_logfile;
+  u64 m_size = 0;
+  std::atomic<bool> m_valid{false};
+  bool m_enable;
+
+  std::mutex m_mutex;
+  std::condition_variable m_cv, m_idle_cv;
+  std::string m_pending;
+  u64 m_dropped = 0;
+  bool m_writing = false;
+  bool m_quit = false;
+  std::thread m_thread;
+};
+
+void GenericLogFmtImpl(LogLevel level, LogType type, const char* file, int line,
+                       fmt::string_view format, const fmt::format_args& args)
+{
+  auto* instance = LogManager::GetInstance();
+  if (instance == nullptr)
+    return;
+
+  if (!instance->IsEnabled(type, level))
+    return;
+
+  const auto message = fmt::vformat(format, args);
+  instance->Log(level, type, file, line, message.c_str());
+}
+
+static size_t DeterminePathCutOffPoint()
+{
+  constexpr const char* pattern = "/source/core/";
+#ifdef _WIN32
+  constexpr const char* pattern2 = "\\source\\core\\";
+#endif
+  std::string path = __FILE__;
+  Common::ToLower(&path);
+  size_t pos = path.find(pattern);
+#ifdef _WIN32
+  if (pos == std::string::npos)
+    pos = path.find(pattern2);
+#endif
+  if (pos != std::string::npos)
+    return pos + strlen(pattern);
+  return 0;
+}
+
+LogManager::LogManager()
+{
+  // create log containers
+  m_log[LogType::ACHIEVEMENTS] = {"RetroAchievements", "Achievements"};
+  m_log[LogType::ACTIONREPLAY] = {"ActionReplay", "Action Replay"};
+  m_log[LogType::AUDIO] = {"Audio", "Audio Emulator"};
+  m_log[LogType::AUDIO_INTERFACE] = {"AI", "Audio Interface"};
+  m_log[LogType::BOOT] = {"BOOT", "Boot"};
+  m_log[LogType::COMMANDPROCESSOR] = {"CP", "Command Processor"};
+  m_log[LogType::COMMON] = {"COMMON", "Common"};
+  m_log[LogType::CONSOLE] = {"CONSOLE", "Dolphin Console"};
+  m_log[LogType::CONTROLLERINTERFACE] = {"CI", "Controller Interface"};
+  m_log[LogType::CORE] = {"CORE", "Core"};
+  m_log[LogType::DISCIO] = {"DIO", "Disc IO"};
+  m_log[LogType::DSPHLE] = {"DSPHLE", "DSP HLE"};
+  m_log[LogType::DSPLLE] = {"DSPLLE", "DSP LLE"};
+  m_log[LogType::DSP_MAIL] = {"DSPMails", "DSP Mails"};
+  m_log[LogType::DSPINTERFACE] = {"DSP", "DSP Interface"};
+  m_log[LogType::DVDINTERFACE] = {"DVD", "DVD Interface"};
+  m_log[LogType::AMMEDIABOARD] = {"AMMB", "AMMB Interface"};
+  m_log[LogType::AMMEDIABOARD_NET] = {"AMMB_NET", "AMMB - Network"};
+  m_log[LogType::DYNA_REC] = {"JIT", "JIT Dynamic Recompiler"};
+  m_log[LogType::EXPANSIONINTERFACE] = {"EXI", "Expansion Interface"};
+  m_log[LogType::FILEMON] = {"FileMon", "File Monitor"};
+  m_log[LogType::FRAMEDUMP] = {"FRAMEDUMP", "FrameDump"};
+  m_log[LogType::GDB_STUB] = {"GDB_STUB", "GDB Stub"};
+  m_log[LogType::GPFIFO] = {"GP", "GatherPipe FIFO"};
+  m_log[LogType::HARNESS] = {"HARNESS", "Automation Harness"};
+  m_log[LogType::HOST_GPU] = {"Host GPU", "Host GPU"};
+  m_log[LogType::HSP] = {"HSP", "High-Speed Port"};
+  m_log[LogType::IOS] = {"IOS", "IOS"};
+  m_log[LogType::IOS_DI] = {"IOS_DI", "IOS - Drive Interface"};
+  m_log[LogType::IOS_ES] = {"IOS_ES", "IOS - ETicket Services"};
+  m_log[LogType::IOS_FS] = {"IOS_FS", "IOS - Filesystem Services"};
+  m_log[LogType::IOS_SD] = {"IOS_SD", "IOS - SDIO"};
+  m_log[LogType::IOS_SSL] = {"IOS_SSL", "IOS - SSL"};
+  m_log[LogType::IOS_STM] = {"IOS_STM", "IOS - State Transition Manager"};
+  m_log[LogType::IOS_NET] = {"IOS_NET", "IOS - Network"};
+  m_log[LogType::IOS_USB] = {"IOS_USB", "IOS - USB"};
+  m_log[LogType::IOS_WC24] = {"IOS_WC24", "IOS - WiiConnect24"};
+  m_log[LogType::IOS_WFS] = {"IOS_WFS", "IOS - WFS"};
+  m_log[LogType::IOS_WIIMOTE] = {"IOS_WIIMOTE", "IOS - Wii Remote"};
+  m_log[LogType::MASTER_LOG] = {"MASTER", "Master Log"};
+  m_log[LogType::MEMCARD_MANAGER] = {"MemCard Manager", "Memory Card Manager"};
+  m_log[LogType::MEMMAP] = {"MI", "Memory Interface & Memory Map"};
+  m_log[LogType::NETPLAY] = {"NETPLAY", "Netplay"};
+  m_log[LogType::OSHLE] = {"HLE", "OSHLE"};
+  m_log[LogType::OSREPORT] = {"OSREPORT", "OSReport EXI"};
+  m_log[LogType::OSREPORT_HLE] = {"OSREPORT_HLE", "OSReport HLE"};
+  m_log[LogType::PIXELENGINE] = {"PE", "Pixel Engine"};
+  m_log[LogType::PROCESSORINTERFACE] = {"PI", "Processor Interface"};
+  m_log[LogType::POWERPC] = {"PowerPC", "PowerPC IBM CPU"};
+  m_log[LogType::SERIALINTERFACE] = {"SI", "Serial Interface"};
+  m_log[LogType::SERIALINTERFACE_AMBB] = {"SI_AMBB", "AMBB Interface"};
+  m_log[LogType::SERIALINTERFACE_CARD] = {"SI_CARD", "CARD Interface"};
+  m_log[LogType::SERIALINTERFACE_JVSIO] = {"SI_JVS", "JVS-I/O"};
+  m_log[LogType::SP1] = {"SP1", "Serial Port 1"};
+  m_log[LogType::SYMBOLS] = {"SYMBOLS", "Symbols"};
+  m_log[LogType::VIDEO] = {"Video", "Video Backend"};
+  m_log[LogType::VIDEOINTERFACE] = {"VI", "Video Interface"};
+  m_log[LogType::WIIMOTE] = {"Wiimote", "Wii Remote"};
+  m_log[LogType::WII_IPC] = {"WII_IPC", "WII IPC"};
+  m_log[LogType::BRAWLBACK] = {"Brawlback", "Brawlback"};
+
+  RegisterListener(LogListener::FILE_LISTENER,
+                   std::make_unique<FileLogListener>(File::GetUserPath(F_MAINLOG_IDX)));
+  RegisterListener(LogListener::CONSOLE_LISTENER, std::make_unique<ConsoleListener>());
+
+  // Set up log listeners
+  SetEffectiveLogLevel();
+  EnableListener(LogListener::FILE_LISTENER, Config::Get(LOGGER_WRITE_TO_FILE));
+  EnableListener(LogListener::CONSOLE_LISTENER, Config::Get(LOGGER_WRITE_TO_CONSOLE));
+  EnableListener(LogListener::LOG_WINDOW_LISTENER, Config::Get(LOGGER_WRITE_TO_WINDOW));
+
+  for (auto& container : m_log)
+  {
+    container.m_enable = Config::Get(
+        Config::Info<bool>{{Config::System::Logger, "Logs", container.m_short_name}, false});
+  }
+
+  m_path_cutoff_point = DeterminePathCutOffPoint();
+
+  m_config_changed_callback_id =
+      Config::AddConfigChangedCallback([this]() { SetEffectiveLogLevel(); });
+}
+
+LogManager::~LogManager()
+{
+  Config::RemoveConfigChangedCallback(m_config_changed_callback_id);
+}
+
+void LogManager::SaveSettings()
+{
+  Config::ConfigChangeCallbackGuard config_guard;
+
+  Config::SetBaseOrCurrent(LOGGER_WRITE_TO_FILE, IsListenerEnabled(LogListener::FILE_LISTENER));
+  Config::SetBaseOrCurrent(LOGGER_WRITE_TO_CONSOLE,
+                           IsListenerEnabled(LogListener::CONSOLE_LISTENER));
+  Config::SetBaseOrCurrent(LOGGER_WRITE_TO_WINDOW,
+                           IsListenerEnabled(LogListener::LOG_WINDOW_LISTENER));
+
+  for (const auto& container : m_log)
+  {
+    const Config::Info<bool> info{{Config::System::Logger, "Logs", container.m_short_name}, false};
+    Config::SetBaseOrCurrent(info, container.m_enable);
+  }
+
+  Config::Save();
+}
+
+void LogManager::Flush(std::chrono::milliseconds timeout)
+{
+  for (const auto listener_id : m_listener_ids)
+  {
+    if (m_listeners[listener_id])
+      m_listeners[listener_id]->Flush(timeout);
+  }
+}
+
+void LogManager::Log(LogLevel level, LogType type, const char* file, int line, const char* message)
+{
+  if (!IsEnabled(type, level) || !static_cast<bool>(m_listener_ids))
+    return;
+
+  LogWithFullPath(level, type, file + m_path_cutoff_point, line, message);
+}
+
+std::string LogManager::GetTimestamp()
+{
+  return Timestamp();
+}
+
+void LogManager::LogWithFullPath(LogLevel level, LogType type, const char* file, int line,
+                                 const char* message)
+{
+  const std::string msg =
+      fmt::format("{} {}:{} {}[{}]: {}\n", GetTimestamp(), file, line,
+                  LOG_LEVEL_TO_CHAR[static_cast<int>(level)], GetShortName(type), message);
+
+  for (const auto listener_id : m_listener_ids)
+  {
+    if (m_listeners[listener_id])
+      m_listeners[listener_id]->Log(level, msg.c_str());
+  }
+}
+
+LogLevel LogManager::GetEffectiveLogLevel() const
+{
+  return m_effective_level.load(std::memory_order_relaxed);
+}
+
+void LogManager::SetConfigLogLevel(const LogLevel level)
+{
+  Config::SetBaseOrCurrent(LOGGER_VERBOSITY, level);
+  SetEffectiveLogLevel();
+}
+
+void LogManager::SetEffectiveLogLevel()
+{
+  const LogLevel clamped_level =
+      std::clamp(Config::Get(LOGGER_VERBOSITY), LogLevel::LNOTICE, MAX_EFFECTIVE_LOGLEVEL);
+  m_effective_level.store(clamped_level, std::memory_order_relaxed);
+}
+
+void LogManager::SetEnable(LogType type, bool enable)
+{
+  m_log[type].m_enable = enable;
+}
+
+bool LogManager::IsEnabled(LogType type, LogLevel level) const
+{
+  return m_log[type].m_enable && GetEffectiveLogLevel() >= level;
+}
+
+std::vector<LogManager::LogContainer> LogManager::GetLogTypes()
+{
+  std::vector<LogContainer> log_types;
+  log_types.reserve(m_log.size());
+
+  for (const auto& container : m_log)
+    log_types.emplace_back(container);
+
+  return log_types;
+}
+
+const char* LogManager::GetShortName(LogType type) const
+{
+  return m_log[type].m_short_name;
+}
+
+const char* LogManager::GetFullName(LogType type) const
+{
+  return m_log[type].m_full_name;
+}
+
+void LogManager::RegisterListener(LogListener::LISTENER id, std::unique_ptr<LogListener> listener)
+{
+  m_listeners[id] = std::move(listener);
+}
+
+void LogManager::EnableListener(LogListener::LISTENER id, bool enable)
+{
+  m_listener_ids[id] = enable;
+}
+
+bool LogManager::IsListenerEnabled(LogListener::LISTENER id) const
+{
+  return m_listener_ids[id];
+}
+
+// Singleton. Ugh.
+static std::unique_ptr<LogManager> s_log_manager;
+
+LogManager* LogManager::GetInstance()
+{
+  return s_log_manager.get();
+}
+
+void LogManager::Init()
+{
+  s_log_manager = std::unique_ptr<LogManager>(new LogManager());
+}
+
+void LogManager::Shutdown()
+{
+  if (s_log_manager)
+    s_log_manager->SaveSettings();
+  s_log_manager.reset();
+}
+}  // namespace Common::Log

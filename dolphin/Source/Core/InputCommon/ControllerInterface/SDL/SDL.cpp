@@ -1,0 +1,505 @@
+// Copyright 2010 Dolphin Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "InputCommon/ControllerInterface/SDL/SDL.h"
+
+#include <cwctype>
+#include <span>
+#include <string>
+#include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+
+#include <windows.h>
+
+#include <cfgmgr32.h>
+#include <initguid.h>
+// initguid.h must be included before usbiodef.h
+#include <usbiodef.h>
+#endif
+
+#include <SDL3/SDL.h>
+
+#ifdef _WIN32
+#include "Common/CommonPaths.h"
+#include "Common/CommonTypes.h"
+#include "Common/Config/Config.h"
+#include "Common/FileUtil.h"
+#include "Common/WindowsDevice.h"
+#include "InputCommon/ControllerInterface/DInput/DInput.h"
+#endif
+
+#include "Common/Event.h"
+#include "Common/Logging/Log.h"
+#include "Common/ScopeGuard.h"
+#include "Common/Thread.h"
+
+#include "Core/Config/MainSettings.h"
+#include "Core/HW/SI/SI.h"
+#include "Core/HW/SI/SI_Device.h"
+
+#include "InputCommon/ControllerInterface/ControllerInterface.h"
+#include "InputCommon/ControllerInterface/SDL/SDLGamepad.h"
+
+namespace ciface::SDL
+{
+
+class InputBackend final : public ciface::InputBackend
+{
+public:
+  InputBackend(ControllerInterface* controller_interface);
+  ~InputBackend() override;
+  void PopulateDevices() override;
+  void UpdateInput(std::vector<std::weak_ptr<ciface::Core::Device>>& devices_to_remove) override;
+
+private:
+  void OpenAndAddDevice(SDL_JoystickID instance_id);
+
+  bool HandleEventAndContinue(const SDL_Event& e);
+
+  Common::Event m_init_event;
+  Uint32 m_stop_event_type;
+  Uint32 m_populate_event_type;
+  std::thread m_hotplug_thread;
+
+#ifdef _WIN32
+  void WatchUpdates();
+
+  // When the running SDL_UpdateGamepads started (steady clock, ms), 0 when none is running.
+  // ControllerInterface::UpdateInput holds its devices mutex around it, so one runs at a time.
+  std::atomic<s64> m_update_started_ms{0};
+  bool m_sdl_directinput = false;
+  std::thread m_update_watchdog;
+  std::mutex m_watchdog_mutex;
+  std::condition_variable m_watchdog_cv;
+  bool m_watchdog_stop = false;
+#endif
+};
+
+std::unique_ptr<ciface::InputBackend> CreateInputBackend(ControllerInterface* controller_interface)
+{
+  return std::make_unique<InputBackend>(controller_interface);
+}
+
+#ifdef _WIN32
+// Whether a Switch 2 controller (Pro Controller, Joy-Con 2, NSO GameCube controller) is plugged in
+// by USB, from the devices Windows' device manager has as present: nothing is asked of a device or
+// its hub, so a device that never answers cannot hold this.
+static bool IsSwitch2ControllerPluggedIn()
+{
+  GUID usb_device = GUID_DEVINTERFACE_USB_DEVICE;
+  for (const WCHAR* iface :
+       Common::GetDeviceInterfaceList(&usb_device, nullptr, CM_GET_DEVICE_INTERFACE_LIST_PRESENT))
+  {
+    std::wstring path = iface;
+    for (wchar_t& c : path)
+      c = std::towupper(c);
+    for (const wchar_t* ids : {L"VID_057E&PID_2066", L"VID_057E&PID_2067", L"VID_057E&PID_2068",
+                               L"VID_057E&PID_2069", L"VID_057E&PID_2073"})
+    {
+      if (path.contains(ids))
+        return true;
+    }
+  }
+  return false;
+}
+
+// Bug #251 (a Lenovo Legion Go's controller, 17EF:61ED, beside two Joy-Cons): SDL's DirectInput
+// joystick update re-acquires the device, and dinput8 (CDIDev_Acquire -> CEm_HID_Acquire ->
+// NudgeWorkerThreadPem) waited forever for its own worker thread, which sat idle. That update runs
+// in ControllerInterface::UpdateInput, which holds the devices mutex, so every thread that reads
+// or lists controllers waited behind it: the Controllers window froze (the hang dump), and every
+// game start stopped before its audio came up, where the emulation thread first takes those
+// mutexes, on a white window. Upstream's comment below names the same hang. A stuck
+// update leaves this file; the next start turns SDL's DirectInput off (the setting, saved) and
+// deletes it. Dolphin's own DirectInput backend still has those controllers (DInput/...).
+constexpr s64 SDL_UPDATE_STUCK_MS = 5000;
+
+static std::string SDLUpdateStuckMarkerPath()
+{
+  return File::GetUserPath(D_CONFIG_IDX) + "SDLDirectInputStuck.txt";
+}
+
+static s64 SteadyNowMs()
+{
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+#endif
+
+static void EnableSDLLogging()
+{
+  SDL_SetLogPriorities(SDL_LOG_PRIORITY_VERBOSE);
+  SDL_SetLogOutputFunction(
+      [](void*, int category, SDL_LogPriority priority, const char* message) {
+        std::string_view category_name{};
+        switch (category)
+        {
+        case SDL_LOG_CATEGORY_APPLICATION:
+          category_name = "app";
+          break;
+        case SDL_LOG_CATEGORY_ERROR:
+          category_name = "error";
+          break;
+        case SDL_LOG_CATEGORY_ASSERT:
+          category_name = "assert";
+          break;
+        case SDL_LOG_CATEGORY_SYSTEM:
+          category_name = "system";
+          break;
+        case SDL_LOG_CATEGORY_AUDIO:
+          category_name = "audio";
+          break;
+        case SDL_LOG_CATEGORY_VIDEO:
+          category_name = "video";
+          break;
+        case SDL_LOG_CATEGORY_RENDER:
+          category_name = "render";
+          break;
+        case SDL_LOG_CATEGORY_INPUT:
+          category_name = "input";
+          break;
+        case SDL_LOG_CATEGORY_TEST:
+          category_name = "test";
+          break;
+        case SDL_LOG_CATEGORY_GPU:
+          category_name = "gpu";
+          break;
+        default:
+          break;
+        }
+
+        auto log_level = Common::Log::LogLevel::LNOTICE;
+        switch (priority)
+        {
+        case SDL_LOG_PRIORITY_VERBOSE:
+        case SDL_LOG_PRIORITY_DEBUG:
+          log_level = Common::Log::LogLevel::LDEBUG;
+          break;
+        case SDL_LOG_PRIORITY_INFO:
+          log_level = Common::Log::LogLevel::LINFO;
+          break;
+        case SDL_LOG_PRIORITY_WARN:
+          log_level = Common::Log::LogLevel::LWARNING;
+          break;
+        case SDL_LOG_PRIORITY_ERROR:
+          log_level = Common::Log::LogLevel::LERROR;
+          break;
+        case SDL_LOG_PRIORITY_CRITICAL:
+        default:
+          log_level = Common::Log::LogLevel::LNOTICE;
+          break;
+        }
+
+        if (category_name.empty())
+        {
+          GENERIC_LOG_FMT(Common::Log::LogType::CONTROLLERINTERFACE, log_level, "unknown({}): {}",
+                          category, message);
+        }
+        else
+        {
+          GENERIC_LOG_FMT(Common::Log::LogType::CONTROLLERINTERFACE, log_level, "{}: {}",
+                          category_name, message);
+        }
+      },
+      nullptr);
+}
+
+InputBackend::InputBackend(ControllerInterface* controller_interface)
+    : ciface::InputBackend(controller_interface)
+{
+  EnableSDLLogging();
+
+  if (Config::Get(Config::MAIN_SDL_HINT_JOYSTICK_ENHANCED_REPORTS) == "")
+    Config::SetBase(Config::MAIN_SDL_HINT_JOYSTICK_ENHANCED_REPORTS, "1");
+
+  // We have our own WGI backend. Enabling SDL's WGI handling creates even more redundant devices.
+  if (Config::Get(Config::MAIN_SDL_HINT_JOYSTICK_WGI) == "")
+    Config::SetBase(Config::MAIN_SDL_HINT_JOYSTICK_WGI, "0");
+
+  // Disable DualSense Player LEDs; We already colorize the Primary LED
+  if (Config::Get(Config::MAIN_SDL_HINT_JOYSTICK_HIDAPI_PS5_PLAYER_LED) == "")
+    Config::SetBase(Config::MAIN_SDL_HINT_JOYSTICK_HIDAPI_PS5_PLAYER_LED, "0");
+
+  // Disabling DirectInput support apparently solves hangs on shutdown for users with
+  //  "8BitDo Ultimate 2" controllers, however, it also breaks hotplug support for Dual Sense
+  //  and DS4 Controllers, so we leave it enabled for now.
+  // It also works around a possibly related random hang on a IDirectInputDevice8_Acquire
+  //  call within SDL.
+  if (Config::Get(Config::MAIN_SDL_HINT_JOYSTICK_DIRECTINPUT) == "")
+    Config::SetBase(Config::MAIN_SDL_HINT_JOYSTICK_DIRECTINPUT, "1");
+
+#ifdef _WIN32
+  // An earlier run's SDL update got stuck in DirectInput (bug #251, SDLUpdateStuckMarkerPath):
+  // SDL's DirectInput off for good, as the SDL settings window's checkbox would. Saved now, so a
+  // run that ends badly again does not bring it back.
+  if (const std::string marker = SDLUpdateStuckMarkerPath(); File::Exists(marker))
+  {
+    std::string what;
+    File::ReadFileToString(marker, what);
+    Config::SetBase(Config::MAIN_SDL_HINT_JOYSTICK_DIRECTINPUT, "0");
+    Config::Save();
+    File::Delete(marker);
+    WARN_LOG_FMT(CORE, "SDL's DirectInput is off from now on: {}", what);
+  }
+#endif
+
+  // Pre-populate the default Joy-Con hints so they can be easily changed
+  if (Config::Get(Config::MAIN_SDL_HINT_JOYSTICK_HIDAPI_COMBINE_JOY_CONS) == "")
+    Config::SetBase(Config::MAIN_SDL_HINT_JOYSTICK_HIDAPI_COMBINE_JOY_CONS, "1");
+
+  if (Config::Get(Config::MAIN_SDL_HINT_JOYSTICK_HIDAPI_VERTICAL_JOY_CONS) == "")
+    Config::SetBase(Config::MAIN_SDL_HINT_JOYSTICK_HIDAPI_VERTICAL_JOY_CONS, "0");
+
+#ifdef _WIN32
+  // libusb in SDL's HIDAPI only with a Switch 2 controller plugged in ("auto"). At SDL_Init it
+  // lists every USB device, asking each one's hub with blocking requests that have no timeout, and
+  // a device that never answers (an old Switch Pro Controller, staging 2026-10-11) holds SDL_Init,
+  // and the UI waiting on it below, forever; without it devices are found through Windows' HID, as
+  // in P+ 3.2's release (built without it). But SDL's Switch 2 driver needs it: it starts a USB
+  // controller and reads its stick calibration over libusb, and without that driver the controller
+  // reads through Windows' HID uncalibrated, its sticks off center and reaching less far (a Switch 2
+  // Pro Controller felt like a large dead zone, 2026-10-15; fine in REX's Dolphin). "0" was this
+  // default from 2026-10-11 and becomes "auto"; "false" keeps libusb off, "1" always on.
+  if (const std::string libusb = Config::Get(Config::MAIN_SDL_HINT_HIDAPI_LIBUSB);
+      libusb == "" || libusb == "0")
+  {
+    Config::SetBase(Config::MAIN_SDL_HINT_HIDAPI_LIBUSB, "auto");
+  }
+#endif
+
+  // Disable SDL's GC Adapter handling when we want to handle it ourselves.
+  bool is_gc_adapter_configured = false;
+  for (int i = 0; i != SerialInterface::MAX_SI_CHANNELS; ++i)
+  {
+    if (Config::Get(Config::GetInfoForSIDevice(i)) == SerialInterface::SIDEVICE_WIIU_ADAPTER)
+    {
+      is_gc_adapter_configured = true;
+      break;
+    }
+  }
+  // TODO: This hint should be adjusted when the config changes,
+  //  but SDL requires it be set before joystick initialization,
+  //  and ControllerInterface isn't prepared for SDL to spontaneously re-initialize itself.
+  SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_GAMECUBE, is_gc_adapter_configured ? "0" : "1");
+
+  // Load all the hints from the config file
+  std::shared_ptr<Config::Layer> layer = Config::GetLayer(Config::LayerType::Base);
+  const Config::Section& section = layer->GetSection(Config::System::Main, "SDL_Hints");
+  for (auto& row_data : section)
+  {
+    const Config::Location& location = row_data.first;
+    const std::optional<std::string>& value = row_data.second;
+
+    if (value)
+      SDL_SetHint(location.key.c_str(), value->c_str());
+  }
+
+#ifdef _WIN32
+  // The Win32 backend, created before this one, gave up on DirectInput's device list: SDL's
+  // DirectInput would wait on the same unanswering device in SDL_Init below, and the UI on it.
+  // Dolphin's own DirectInput devices come in when DirectInput answers again.
+  if (!DInput::IsResponding())
+  {
+    WARN_LOG_FMT(CONTROLLERINTERFACE, "SDL without DirectInput: DirectInput is not answering");
+    SDL_SetHint(SDL_HINT_JOYSTICK_DIRECTINPUT, "0");
+  }
+
+  if (Config::Get(Config::MAIN_SDL_HINT_HIDAPI_LIBUSB) == "auto")
+  {
+    // Decided once: SDL reads the hint at SDL_Init only, so a Switch 2 controller plugged in later
+    // reads through Windows' HID until Dolphin is started again.
+    const bool switch2 = IsSwitch2ControllerPluggedIn();
+    NOTICE_LOG_FMT(CONTROLLERINTERFACE, "SDL libusb {}: {}", switch2 ? "on" : "off",
+                   switch2 ? "a Switch 2 controller is plugged in" : "no Switch 2 controller");
+    SDL_SetHint(SDL_HINT_HIDAPI_LIBUSB, switch2 ? "1" : "0");
+  }
+
+  m_sdl_directinput = SDL_GetHintBoolean(SDL_HINT_JOYSTICK_DIRECTINPUT, true);
+  m_update_watchdog = std::thread([this] { WatchUpdates(); });
+#endif
+
+  m_hotplug_thread = std::thread([this] {
+    Common::SetCurrentThreadName("SDL Hotplug Thread");
+
+    Common::ScopeGuard quit_guard([] {
+      // TODO: there seems to be some sort of memory leak with SDL, quit isn't freeing everything up
+      SDL_Quit();
+    });
+    {
+      Common::ScopeGuard init_guard([this] { m_init_event.Set(); });
+
+      if (!SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC | SDL_INIT_GAMEPAD))
+      {
+        ERROR_LOG_FMT(CONTROLLERINTERFACE, "SDL failed to initialize");
+        return;
+      }
+
+      const Uint32 custom_events_start = SDL_RegisterEvents(2);
+      if (custom_events_start == static_cast<Uint32>(-1))
+      {
+        ERROR_LOG_FMT(CONTROLLERINTERFACE, "SDL failed to register custom events");
+        return;
+      }
+      m_stop_event_type = custom_events_start;
+      m_populate_event_type = custom_events_start + 1;
+
+      // Drain all of the events and add the initial joysticks before returning. Otherwise, the
+      // individual joystick events as well as the custom populate event will be handled _after_
+      // ControllerInterface::Init/RefreshDevices has cleared its list of devices, resulting in
+      // duplicate devices. Adding devices will actually "fail" here, as the ControllerInterface
+      // hasn't finished initializing yet.
+      SDL_Event e;
+      while (SDL_PollEvent(&e))
+      {
+        if (!HandleEventAndContinue(e))
+          return;
+      }
+    }
+
+    SDL_Event e;
+    while (SDL_WaitEvent(&e))
+    {
+      if (!HandleEventAndContinue(e))
+        return;
+    }
+  });
+
+  m_init_event.Wait();
+}
+
+InputBackend::~InputBackend()
+{
+#ifdef _WIN32
+  {
+    std::lock_guard lk(m_watchdog_mutex);
+    m_watchdog_stop = true;
+  }
+  m_watchdog_cv.notify_all();
+  if (m_update_watchdog.joinable())
+    m_update_watchdog.join();
+#endif
+
+  if (!m_hotplug_thread.joinable())
+    return;
+
+  SDL_Event stop_event{m_stop_event_type};
+  SDL_PushEvent(&stop_event);
+
+  m_hotplug_thread.join();
+}
+
+void InputBackend::PopulateDevices()
+{
+  if (!m_hotplug_thread.joinable())
+    return;
+
+  SDL_Event populate_event{m_populate_event_type};
+  SDL_PushEvent(&populate_event);
+}
+
+void InputBackend::UpdateInput(std::vector<std::weak_ptr<ciface::Core::Device>>&)
+{
+#ifdef _WIN32
+  m_update_started_ms.store(SteadyNowMs(), std::memory_order_relaxed);
+  SDL_UpdateGamepads();
+  m_update_started_ms.store(0, std::memory_order_relaxed);
+#else
+  SDL_UpdateGamepads();
+#endif
+}
+
+#ifdef _WIN32
+// Nothing can unstick a stuck update (bug #251): this says so in the log and, with SDL's
+// DirectInput on, leaves the marker for the next start.
+void InputBackend::WatchUpdates()
+{
+  Common::SetCurrentThreadName("SDL update watchdog");
+  std::unique_lock lk(m_watchdog_mutex);
+  while (!m_watchdog_cv.wait_for(lk, std::chrono::seconds(1), [this] { return m_watchdog_stop; }))
+  {
+    const s64 started = m_update_started_ms.load(std::memory_order_relaxed);
+    if (started == 0 || SteadyNowMs() - started < SDL_UPDATE_STUCK_MS)
+      continue;
+
+    if (!m_sdl_directinput)
+    {
+      WARN_LOG_FMT(CORE, "SDL's controller update has not returned in {} s: controller input is "
+                         "stuck (SDL's DirectInput is already off)",
+                   SDL_UPDATE_STUCK_MS / 1000);
+      return;
+    }
+    const std::string what = fmt::format(
+        "an earlier run's SDL controller update did not return in {} s (stuck in DirectInput, "
+        "bug #251: the game stayed on a white screen and the Controllers window froze)",
+        SDL_UPDATE_STUCK_MS / 1000);
+    const bool written = File::WriteStringToFile(SDLUpdateStuckMarkerPath(), what);
+    WARN_LOG_FMT(CORE,
+                 "SDL's controller update has not returned in {} s: controller input is stuck, "
+                 "most likely in SDL's DirectInput. It is turned off from the next start{}",
+                 SDL_UPDATE_STUCK_MS / 1000, written ? "" : " (could not write the marker)");
+    return;
+  }
+}
+#endif
+
+void InputBackend::OpenAndAddDevice(SDL_JoystickID instance_id)
+{
+  SDL_Gamepad* gc = SDL_OpenGamepad(instance_id);
+  SDL_Joystick* js = SDL_OpenJoystick(instance_id);
+
+  if (js != nullptr)
+  {
+    if (SDL_GetNumJoystickButtons(js) > 255 || SDL_GetNumJoystickAxes(js) > 255 ||
+        SDL_GetNumJoystickHats(js) > 255 || SDL_GetNumJoystickBalls(js) > 255)
+    {
+      // This device is invalid, don't use it
+      // Some crazy devices (HP webcam 2100) end up as HID devices
+      // SDL tries parsing these as Joysticks
+      return;
+    }
+    auto gamepad = std::make_shared<Gamepad>(gc, js);
+    if (!gamepad->Inputs().empty() || !gamepad->Outputs().empty())
+      GetControllerInterface().AddDevice(std::move(gamepad));
+  }
+}
+
+bool InputBackend::HandleEventAndContinue(const SDL_Event& e)
+{
+  if (e.type == SDL_EVENT_JOYSTICK_ADDED)
+  {
+    OpenAndAddDevice(e.jdevice.which);
+  }
+  else if (e.type == SDL_EVENT_JOYSTICK_REMOVED)
+  {
+    GetControllerInterface().RemoveDevice([&e](const auto* device) {
+      return device->GetSource() == "SDL" &&
+             static_cast<const Gamepad*>(device)->GetSDLInstanceID() == e.jdevice.which;
+    });
+  }
+  else if (e.type == m_populate_event_type)
+  {
+    GetControllerInterface().PlatformPopulateDevices([this] {
+      int joystick_count = 0;
+      auto* const joystick_ids = SDL_GetJoysticks(&joystick_count);
+      for (auto instance_id : std::span(joystick_ids, joystick_count))
+        OpenAndAddDevice(instance_id);
+
+      SDL_free(joystick_ids);
+    });
+  }
+  else if (e.type == m_stop_event_type)
+  {
+    return false;
+  }
+
+  return true;
+}
+
+}  // namespace ciface::SDL
