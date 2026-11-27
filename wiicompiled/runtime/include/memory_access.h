@@ -195,7 +195,7 @@ MKW_MEMORY_FORCE_INLINE bool FlatWriteNeedsPolicy(uint32_t address) {
 // in double precision, and it has hardware-tested handling for tiny values.
 // ConvertPpcDoubleToSingleBits' subnormal-single arm (exponents 874..896), out of line: rare, and inlined at every
 // stfs it was most of the conversion's code.
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC inline uint32_t ConvertPpcDoubleToSubnormalSingleBits(uint64_t bits, uint32_t exponent) {
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC inline uint32_t ConvertPpcDoubleToSubnormalSingleBits(uint64_t bits, uint32_t exponent) {
     uint32_t narrowed = static_cast<uint32_t>(
         0x80000000ULL | ((bits & 0x000FFFFFFFFFFFFFULL) >> 21));
     narrowed >>= (905u - exponent);

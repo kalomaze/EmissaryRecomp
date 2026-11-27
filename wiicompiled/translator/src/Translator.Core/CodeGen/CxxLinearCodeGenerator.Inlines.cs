@@ -175,10 +175,18 @@ public sealed partial class CxxLinearCodeGenerator
                     IsSingleFprOperand(call.Arguments[1], localPaired))
                     helper = helper == "PpcFmulsInline" ? "PpcFmulsSingleCInline" : "PpcFmulsSingleCNoNiInline";
                 var expression = $"{helper}({string.Join(", ", arguments)})";
+                if (scalarSpec.Kind == ScalarInlineKind.RoundedHelper && !scalarSpec.NoNiVariant)
+                {
+                    // fadds/fsubs of two singles round by the plain conversion; the result's bits may be kept for a
+                    // store (CxxLinearCodeGenerator.SingleFpr.cs).
+                    var operandsSingle = helper is "PpcFaddInline" or "PpcFsubInline" && call.Arguments.Count == 2 &&
+                                         IsSingleFprValue(call.Arguments[0], localPaired) &&
+                                         IsSingleFprValue(call.Arguments[1], localPaired);
+                    EmitSingleResult(sb, pad, call.Destination!, dest!, RoundToSingleExpression(expression, operandsSingle));
+                    return true;
+                }
                 if (scalarSpec.Kind == ScalarInlineKind.RoundedHelper)
-                    expression = $"static_cast<double>({(scalarSpec.NoNiVariant
-                        ? $"static_cast<float>({expression})"
-                        : $"PpcForceSingleValueInline({expression})")})";
+                    expression = $"static_cast<double>(static_cast<float>({expression}))";
                 sb.AppendLine($"{pad}{dest} = {expression};");
             }
 
