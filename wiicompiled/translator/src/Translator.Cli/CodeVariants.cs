@@ -215,7 +215,9 @@ internal static class CodeVariants
         IReadOnlyDictionary<uint, GuestAbiContract> callContracts,
         bool allowUnsupportedInstructions,
         string outDir,
-        int threads)
+        int threads,
+        uint? sda1Base = null,
+        uint? sda2Base = null)
     {
         Directory.CreateDirectory(outDir);
         foreach (var stale in Directory.EnumerateFiles(outDir, "func_*_pp.cpp")) File.Delete(stale);
@@ -249,7 +251,9 @@ internal static class CodeVariants
                 GuestAbiContracts: contracts,
                 EnableLeafAbiSpillElision: true,
                 EnableLeafInlining: false,
-                InlineCodeRegions: regions);
+                InlineCodeRegions: regions,
+                Sda1Base: sda1Base,
+                Sda2Base: sda2Base);
             FunctionTranslationResult result;
             try
             {

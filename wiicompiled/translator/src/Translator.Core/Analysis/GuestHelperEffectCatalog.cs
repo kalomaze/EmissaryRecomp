@@ -86,7 +86,7 @@ public static class GuestHelperEffectCatalog
         "PPC_Fres", "PPC_Frsqrte", "PPC_Fsel", "PPC_Fsubs",
         "PPC_PsAbs", "PPC_PsAdd", "PPC_PsDiv", "PPC_PsMadd", "PPC_PsMadds0",
         "PPC_PsMadds1", "PPC_PsMerge00", "PPC_PsMerge01", "PPC_PsMerge10",
-        "PPC_PsMerge11", "PPC_PsMsub", "PPC_PsMul", "PPC_PsMuls0", "PPC_PsMuls1",
+        "PPC_PsMerge11", "PPC_PsMr", "PPC_PsMsub", "PPC_PsMul", "PPC_PsMuls0", "PPC_PsMuls1",
         "PPC_PsNabs", "PPC_PsNeg", "PPC_PsNmadd", "PPC_PsNmsub", "PPC_PsRes",
         "PPC_PsRsqrte", "PPC_PsSel", "PPC_PsSub", "PPC_PsSum0", "PPC_PsSum1",
         "PPC_Mftb", "PPC_Mftbu", "PPC_TrapWord"

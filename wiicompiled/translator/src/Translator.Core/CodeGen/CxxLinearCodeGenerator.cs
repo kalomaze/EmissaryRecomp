@@ -64,6 +64,23 @@ public sealed partial class CxxLinearCodeGenerator
     private static uint _variantEntry;
 
     /// <summary>
+    /// MKW_FOLD_SDA_BASES (default ON, set =0 to opt out): fold r13 (_SDA_BASE_) and r2 (_SDA2_BASE_) into
+    /// translate-time constant guest addresses in functions that never define them or call anything that can
+    /// mutate them.
+    /// </summary>
+    internal static readonly bool FoldSdaBases =
+        Environment.GetEnvironmentVariable("MKW_FOLD_SDA_BASES") != "0";
+
+    [ThreadStatic]
+    private static uint _currentEntryPoint;
+
+    [ThreadStatic]
+    private static uint? _fixedSda1Base;
+
+    [ThreadStatic]
+    private static uint? _fixedSda2Base;
+
+    /// <summary>
     /// Code variants: before an indirect jump leaves the frame through the dispatcher (a bctr without recognized
     /// targets, a jump table's unlisted case), stop with a report if the target lies in the variant's own code and is
     /// no entry of anything (runtime CheckVariantIndirectJump): a missed jump target, which the dispatcher would run in
@@ -135,7 +152,9 @@ public sealed partial class CxxLinearCodeGenerator
         IReadOnlySet<uint>? modOverridableCallTargets = null,
         bool enableGpuFifoBurstCoalescing = true,
         IReadOnlyDictionary<uint, GuestEabiVariant>? eabiVariants = null,
-        uint[]? variantOwnCode = null)
+        uint[]? variantOwnCode = null,
+        uint? sda1Base = null,
+        uint? sda2Base = null)
     {
         _variantOwnCode = variantOwnCode;
         _variantEntry = entryPoint;
@@ -180,6 +199,13 @@ public sealed partial class CxxLinearCodeGenerator
         func = GqrConstantPropagation.Specialize(
             func, gqrEntryConstants, gqrCalleeWriteMasks,
             gqrConstantsRequireRuntimeGuard);
+        var isCodeVariant = variantOwnCode is not null;
+        var fixedSda1Base = FoldSdaBases && sda1Base.HasValue &&
+            CanFoldSdaRegister(func, 13, entryPoint, guestAbiContracts, modOverridableCallTargets, isCodeVariant)
+            ? sda1Base : null;
+        var fixedSda2Base = FoldSdaBases && sda2Base.HasValue &&
+            CanFoldSdaRegister(func, 2, entryPoint, guestAbiContracts, modOverridableCallTargets, isCodeVariant)
+            ? sda2Base : null;
         // Call-free proven kernels amortize very small ranges. Ordinary functions
         // use the epoch-safe scalar form and a higher threshold to avoid adding
         // pointer locals for incidental field pairs.
@@ -189,10 +215,12 @@ public sealed partial class CxxLinearCodeGenerator
         // (memory_access.h, kLeanRangePolicyOffset). MKW_LEAN_RANGES=0: the earlier thresholds.
         func = LeanRanges
             ? GuestMemoryRangeLowering.Lower(
-                func, minimumAccesses: 2, ignoreDisabledPcTraces: true, scalarOnly: false, liveInRanges: false)
+                func, minimumAccesses: 2, ignoreDisabledPcTraces: true, scalarOnly: false, liveInRanges: false,
+                fixedSda1Base: fixedSda1Base, fixedSda2Base: fixedSda2Base)
             : GuestMemoryRangeLowering.Lower(
                 func, minimumAccesses: hasProvenKernelEntry ? 2 : 8, ignoreDisabledPcTraces: true,
-                scalarOnly: !hasProvenKernelEntry);
+                scalarOnly: !hasProvenKernelEntry,
+                fixedSda1Base: fixedSda1Base, fixedSda2Base: fixedSda2Base);
         var architecturalFunc = func;
         var guestAbiContract = GuestAbiContractAnalyzer.Analyze(architecturalFunc, guestAbiContracts);
         var cfg = IrCfg.Build(func);
@@ -309,7 +337,7 @@ public sealed partial class CxxLinearCodeGenerator
             }
         }
         var nextBlockLabels = BuildNextBlockLabelMap(func);
-        var knownConstants = BuildKnownUIntConstants(func);
+        var knownConstants = BuildKnownUIntConstants(func, fixedSda1Base, fixedSda2Base);
         // Burst coalescing is planned once against the final IR so every
         // emission of this body sees the same runs and the same buffer names.
         var gpuFifoBurstPlan = BuildGpuFifoBurstPlan(func, knownConstants, enableGpuFifoBurstCoalescing);
@@ -341,7 +369,7 @@ public sealed partial class CxxLinearCodeGenerator
         // emission assigns.
         var captureFprBarriers = FprCallIntactness && continuationCallCount == 0;
         string EmitFunctionBody(RegisterResidency? residency, int bufferBaseLength, bool discardResult = false,
-            GuestEabiVariant? variantBody = null,
+            GuestEabiVariant? variantBody = null, ResidencyBoundarySync? modSafeReturnSync = null,
             Dictionary<IrInstruction, uint>? fprBarrierClobbers = null)
         {
             var previousVariantBody = _eabiVariantBody;
@@ -355,6 +383,8 @@ public sealed partial class CxxLinearCodeGenerator
             var previousHoistedGqrIndices = _hoistedGqrIndices;
             var previousEabiConformantBody = _eabiConformantBody;
             _eabiConformantBody = eabiConformantBody;
+            var previousModSafeReturnSync = _modSafeReturnSync;
+            _modSafeReturnSync = modSafeReturnSync;
             var previousSingleFprValues = _singleFprValues;
             _singleFprValues = singleFprValues;
             var previousRawSingleStores = _rawSingleStores;
@@ -366,6 +396,12 @@ public sealed partial class CxxLinearCodeGenerator
             _rawSingleCopies = rawSingleCopies;
             var previousSegmentPsqStores = _segmentPsqStores;
             _segmentPsqStores = LeanRanges && !emitStateFreeLeafVariant;
+            var previousEntryPoint = _currentEntryPoint;
+            var previousFixedSda1Base = _fixedSda1Base;
+            var previousFixedSda2Base = _fixedSda2Base;
+            _currentEntryPoint = entryPoint;
+            _fixedSda1Base = fixedSda1Base;
+            _fixedSda2Base = fixedSda2Base;
             _activeResidency = residency;
             residency?.BeginEmission();
             _emittedDirectCallTargets = emittedDirectCallTargets;
@@ -431,6 +467,8 @@ public sealed partial class CxxLinearCodeGenerator
                 foreach (var block in func.Blocks)
                 {
                     var localConstants = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+                    if (_fixedSda1Base.HasValue) localConstants["r13"] = _fixedSda1Base.Value;
+                    if (_fixedSda2Base.HasValue) localConstants["r2"] = _fixedSda2Base.Value;
                     var label = labelNames[block.Label];
                     RecordEmittedLocalLabel(label);
                     residency?.BeginBlock(block.Label);
@@ -638,12 +676,16 @@ public sealed partial class CxxLinearCodeGenerator
                 _activeGpuFifoBurstSlot = previousFifoBurstSlot;
                 _hoistedGqrIndices = previousHoistedGqrIndices;
                 _eabiConformantBody = previousEabiConformantBody;
+                _modSafeReturnSync = previousModSafeReturnSync;
                 _singleFprValues = previousSingleFprValues;
                 _rawSingleStores = previousRawSingleStores;
                 _rawSingleRoots = previousRawSingleRoots;
                 _rawSingleCopies = previousRawSingleCopies;
                 _intactFprs = previousIntactFprs;
                 _segmentPsqStores = previousSegmentPsqStores;
+                _currentEntryPoint = previousEntryPoint;
+                _fixedSda1Base = previousFixedSda1Base;
+                _fixedSda2Base = previousFixedSda2Base;
                 _eabiVariantBody = previousVariantBody;
                 _eabiVariants = previousVariants;
             }
@@ -704,20 +746,63 @@ public sealed partial class CxxLinearCodeGenerator
                 residency = discovered;
             }
         }
+        // MKW_STACK_PRESERVED_CONTRACTS (mod-safe & PoyoJIT-safe return-flush elision): any mechanically preserved
+        // non-volatile register (r14-r31, f14-f31, cr2-cr4) that neither any non-return flush nor any callee/helper
+        // inside this base body ever modified in CpuContext still holds its exact entry value in CpuContext at every
+        // return. Omitting it from the return flush keeps CpuContext 100% invariant for PoyoJIT/interpreter/native
+        // callers while letting the host compiler dead-eliminate the epilogue stack restore and return store, and
+        // shrinking PpcNonvolatileFprGuard / PoyoJIT's JitCallTarget.fprMask.
+        ResidencyBoundarySync? modSafeReturnSync = null;
+        uint elidableReturnFprs = 0;
+        if (GuestAbiContractAnalyzer.StackPreservedContracts &&
+            !GuestEabi.Enabled &&
+            !isCodeVariant &&
+            residencyOwnsPrimaryBody &&
+            entryPoint != GuestAbiContractAnalyzer.GeckoCodeHandlerAddress &&
+            residency?.PossiblyTouchedInContextOutsideReturn is { } nonReturnTouched)
+        {
+            var preservedForReturn = GuestEabi.AnalyzePreservedFrameState(
+                architecturalFunc,
+                guestAbiContracts,
+                trustIndirectCalls: GuestAbiContractAnalyzer.ModSafeIndirectAbi,
+                allowPsqFprPreservation: false);
+            var elidableGprs = (preservedForReturn.Gprs & GuestEabi.NonvolatileGprMask) & ~(uint)nonReturnTouched;
+            elidableReturnFprs = (preservedForReturn.Fprs & GuestEabi.NonvolatileFprMask) & ~(uint)(nonReturnTouched >> 32);
+            var nonReturnCr = RegisterResidency.CrFieldsOfMask(nonReturnTouched);
+            var elidableCr = (byte)(preservedForReturn.CrFields & ~nonReturnCr);
+            if ((elidableGprs | elidableReturnFprs | elidableCr) != 0)
+            {
+                modSafeReturnSync = ResidencyBoundarySync.Full with
+                {
+                    FlushGprMask = ~elidableGprs,
+                    FlushFprMask = ~elidableReturnFprs,
+                    FlushCrFieldMask = (byte)~elidableCr
+                };
+            }
+        }
         // MKW_EABI_REGS, conformant bodies: the nonvolatile FPRs a call may change in CpuContext are the ones some flush
         // of this body stores (a conformant return publishes none, and nothing else in a residency-owned body writes
         // ctx->fpr[14..31]), not every one the body writes in its locals. The trait mask sizes the caller's
         // PpcNonvolatileFprGuard (abi_bridge.h), so a body whose flushes never store one needs no guard at all.
-        if (eabiConformantBody && residencyOwnsPrimaryBody && residency?.PossiblyStoredByFlushes is { } storedByFlushes &&
-            (ownEabiVariant is null || variantResidency?.PossiblyStoredByFlushes is not null))
+        if (residencyOwnsPrimaryBody && residency?.PossiblyStoredByFlushes is { } storedByFlushes)
         {
-            var stored = storedByFlushes | (variantResidency?.PossiblyStoredByFlushes ?? UInt128.Zero);
-            nonvolatileFprWriteMask = (uint)(stored >> 32) & 0xFFFFC000u;
-            preservesNonvolatileFprs = nonvolatileFprWriteMask == 0;
+            if (eabiConformantBody && (ownEabiVariant is null || variantResidency?.PossiblyStoredByFlushes is not null))
+            {
+                var stored = storedByFlushes | (variantResidency?.PossiblyStoredByFlushes ?? UInt128.Zero);
+                nonvolatileFprWriteMask = (uint)(stored >> 32) & 0xFFFFC000u;
+                preservesNonvolatileFprs = nonvolatileFprWriteMask == 0;
+            }
+            else if (GuestAbiContractAnalyzer.StackPreservedContracts && !GuestEabi.Enabled && !isCodeVariant &&
+                     entryPoint != GuestAbiContractAnalyzer.GeckoCodeHandlerAddress)
+            {
+                nonvolatileFprWriteMask = ((uint)(storedByFlushes >> 32) & 0xFFFFC000u) & ~elidableReturnFprs;
+                preservesNonvolatileFprs = nonvolatileFprWriteMask == 0;
+            }
         }
 
         sb.AppendLine(FunctionDefinitionSignature(implementationName));
-        sb.AppendLine(EmitFunctionBody(residencyOwnsPrimaryBody ? residency : null, bodyBufferBaseLength));
+        sb.AppendLine(EmitFunctionBody(residencyOwnsPrimaryBody ? residency : null, bodyBufferBaseLength,
+            modSafeReturnSync: modSafeReturnSync));
 
         if (ownEabiVariant is not null)
         {
@@ -888,17 +973,93 @@ public sealed partial class CxxLinearCodeGenerator
         return unchecked((uint)lrValue);
     }
 
+    private static bool CanFoldSdaRegister(
+        IrFunction func,
+        int gpr,
+        uint entryPoint,
+        IReadOnlyDictionary<uint, GuestAbiContract> guestAbiContracts,
+        IReadOnlySet<uint> modOverridableCallTargets,
+        bool isCodeVariant)
+    {
+        if (entryPoint == GuestAbiContractAnalyzer.GeckoCodeHandlerAddress) return false;
+        var bit = 1u << gpr;
+        var registerName = gpr == 13 ? "r13" : "r2";
+        foreach (var block in func.Blocks)
+        {
+            foreach (var instruction in block.Instructions)
+            {
+                if (instruction is IrUndefined) return false;
+                if (instruction is IrIndirectCall or IrIndirectJump)
+                {
+                    if (!GuestEabi.Enabled && (!GuestAbiContractAnalyzer.ModSafeIndirectAbi || isCodeVariant)) return false;
+                }
+                if (instruction is IrCall call)
+                {
+                    if (GuestTargetParser.TryParseAddress(call.Target, out var target))
+                    {
+                        if (!GuestAbiContractAnalyzer.TryGetInlineThunk(target, out _, out _))
+                        {
+                            if (modOverridableCallTargets.Contains(target)) return false;
+                            if (!guestAbiContracts.TryGetValue(target, out var contract)) return false;
+                            if (contract.HasFullSynchronizationFence || (contract.GprPossibleWriteMask & bit) != 0)
+                                return false;
+                        }
+                    }
+                    else
+                    {
+                        var effect = GuestEabi.HelperEffect(call);
+                        if (effect.BoundaryFlags.HasFlag(GuestCallBoundaryFlags.RequiresCompleteContext) ||
+                            (effect.GprWriteMask & bit) != 0)
+                            return false;
+                    }
+                }
+                if (instruction is IrPhi) continue;
+                foreach (var def in IrRegisterDataFlow.Definitions(instruction))
+                {
+                    if (IsCpuRegister(def) &&
+                        BaseRegisterSpan(def).Equals(registerName.AsSpan(), StringComparison.OrdinalIgnoreCase))
+                        return false;
+                }
+            }
+        }
+        return true;
+    }
+
     // Shared with GuestMemoryRangeLowering: the range hoister has to decide
     // whether a store is one the emitter will turn into a direct
     // GX_HLE_FIFO_Write*, and the only way to guarantee that decision agrees is
     // to consult the exact same constant map the emitter consults.
-    internal static Dictionary<string, uint> BuildKnownUIntConstants(IrFunction func)
+    internal static Dictionary<string, uint> BuildKnownUIntConstants(
+        IrFunction func,
+        uint? fixedSda1Base = null,
+        uint? fixedSda2Base = null)
     {
         var constants = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
         // A value read where some path carried it across a guest call that may change its register is not what the
         // register holds there (CallClobberedValues): nothing computed from such a read is a constant. The readers of
         // this map check their own address base the same way (TryGetKnownEffectiveAddress).
         CallClobberedValues.Analyze(func);
+
+        if (fixedSda1Base.HasValue) constants["r13"] = fixedSda1Base.Value;
+        if (fixedSda2Base.HasValue) constants["r2"] = fixedSda2Base.Value;
+        if (fixedSda1Base.HasValue || fixedSda2Base.HasValue)
+        {
+            foreach (var block in func.Blocks)
+            {
+                foreach (var instruction in block.Instructions)
+                {
+                    foreach (var used in IrRegisterDataFlow.Uses(instruction))
+                    {
+                        if (!IsCpuRegister(used)) continue;
+                        var baseName = BaseRegisterSpan(used);
+                        if (fixedSda1Base.HasValue && baseName.Equals("r13", StringComparison.OrdinalIgnoreCase))
+                            constants[used] = fixedSda1Base.Value;
+                        else if (fixedSda2Base.HasValue && baseName.Equals("r2", StringComparison.OrdinalIgnoreCase))
+                            constants[used] = fixedSda2Base.Value;
+                    }
+                }
+            }
+        }
 
         foreach (var block in func.Blocks)
         {

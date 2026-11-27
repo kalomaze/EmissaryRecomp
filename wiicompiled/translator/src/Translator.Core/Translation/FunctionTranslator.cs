@@ -78,7 +78,14 @@ public sealed record TranslationOptions(
     /// its branches may enter and that is decoded as part of the function, such as a Gecko code list's C2 hook bodies
     /// (the hooked function branches into the list and the body branches back). Null everywhere else.
     /// </summary>
-    IReadOnlyList<AddressRange>? InlineCodeRegions = null)
+    IReadOnlyList<AddressRange>? InlineCodeRegions = null,
+    /// <summary>
+    /// Optional fixed PowerPC small-data anchors (<c>r13 = _SDA_BASE_</c>, <c>r2 = _SDA2_BASE_</c>) from the
+    /// project configuration. When supplied, functions that never define or call mutators of r13/r2 constant-fold
+    /// SDA addressing directly.
+    /// </summary>
+    uint? Sda1Base = null,
+    uint? Sda2Base = null)
 {
     public static TranslationOptions Default { get; } = new();
 }
@@ -781,7 +788,9 @@ public sealed class FunctionTranslator
             enableLeafAbiSpillElision: options.EnableLeafAbiSpillElision,
             modOverridableCallTargets: options.ModOverridableCallTargets,
             eabiVariants: options.EabiVariants,
-            variantOwnCode: variantOwnCode);
+            variantOwnCode: variantOwnCode,
+            sda1Base: options.Sda1Base,
+            sda2Base: options.Sda2Base);
     }
 
     private static IrTracePpc CreateTrace(PpcInstruction instruction)

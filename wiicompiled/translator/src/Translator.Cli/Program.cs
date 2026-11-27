@@ -777,7 +777,30 @@ int RunTranslateRecursive(string[] argsTail)
             // Calls to a registered native observe the native implementation's
             // contract, not the excluded PPC body that happens to share its address.
             foreach (var pair in nativeGuestEffects.Contracts)
-                guestAbiContracts[pair.Key] = GuestEabi.Enabled ? GuestEabi.ClassifyNative(pair.Key, pair.Value).Contract : pair.Value;
+            {
+                guestAbiContracts[pair.Key] = GuestEabi.Enabled
+                    ? GuestEabi.ClassifyNative(pair.Key, pair.Value).Contract
+                    : GuestAbiContractAnalyzer.ModSafeIndirectAbi
+                        ? GuestEabi.ClassifyModSafeNative(pair.Key, pair.Value)
+                        : pair.Value;
+            }
+
+            {
+                var fencedFunctions = emissionAddresses.Count(address => guestAbiContracts[address].HasFullSynchronizationFence);
+                var nvGprWriters = emissionAddresses.Count(address =>
+                    !guestAbiContracts[address].HasFullSynchronizationFence &&
+                    (guestAbiContracts[address].GprPossibleWriteMask & GuestEabi.NonvolatileGprMask) != 0);
+                var r1Writers = emissionAddresses.Count(address =>
+                    !guestAbiContracts[address].HasFullSynchronizationFence &&
+                    (guestAbiContracts[address].GprPossibleWriteMask & (1u << 1)) != 0);
+                var sdaWriters = emissionAddresses.Count(address =>
+                    !guestAbiContracts[address].HasFullSynchronizationFence &&
+                    (guestAbiContracts[address].GprPossibleWriteMask & ((1u << 2) | (1u << 13))) != 0);
+                Console.WriteLine(
+                    $"[translator] Interprocedural ABI contracts: {emissionAddresses.Length:N0} total, " +
+                    $"{fencedFunctions:N0} fence=1, {emissionAddresses.Length - fencedFunctions:N0} precise " +
+                    $"(r14-r31 writers: {nvGprWriters:N0}, r1 writers: {r1Writers:N0}, r2/r13 writers: {sdaWriters:N0}).");
+            }
 
             if (GuestEabi.Enabled)
             {
@@ -1122,6 +1145,7 @@ int RunTranslateRecursive(string[] argsTail)
                     StringComparer.OrdinalIgnoreCase);
             }
 
+            var projectMemory = RequireProject().Memory;
             TranslationOptions BuildEmissionOptions(
                 uint address,
                 IReadOnlyDictionary<uint, GuestAbiContract> stateFreeAbiContracts)
@@ -1143,9 +1167,11 @@ int RunTranslateRecursive(string[] argsTail)
                         StateFreeAbiContracts: stateFreeAbiContracts,
                         StateFreeCallSymbols: stateFreeCallSymbols,
                         StateFreeCallSiteVariants: stateFreeCallSiteVariantsByCaller.GetValueOrDefault(address),
-                         StateFreeEntryVariants: stateFreeEntryVariantsByTarget.GetValueOrDefault(address),
-                         ModOverridableCallTargets: modOverridableCallTargets,
-                         EabiVariants: eabiVariants),
+                        StateFreeEntryVariants: stateFreeEntryVariantsByTarget.GetValueOrDefault(address),
+                        ModOverridableCallTargets: modOverridableCallTargets,
+                        EabiVariants: eabiVariants,
+                        Sda1Base: projectMemory.SdaBase,
+                        Sda2Base: projectMemory.Sda2Base),
                     residentPolicy,
                     address);
             }
@@ -1503,7 +1529,9 @@ int RunTranslateRecursive(string[] argsTail)
                     guestAbiContracts,
                     allowUnsupportedInstructions,
                     codeVariantOutDir,
-                    maxThreads);
+                    maxThreads,
+                    projectMemory.SdaBase,
+                    projectMemory.Sda2Base);
                 LogPhase("code variants");
             }
             // The float ABI translated callers assume of each translated function (EmitNormalizeGuestCallFloatArguments /

@@ -32,7 +32,7 @@ public sealed partial class CxxLinearCodeGenerator
         // CpuContext at each flush, and the real pass stores only those. Without a plan every flush stores the
         // whole write set, as before.
         private enum SyncEventKind { Write, Flush, Reload }
-        private readonly record struct SyncEvent(SyncEventKind Kind, UInt128 Mask, bool Unconditional);
+        private readonly record struct SyncEvent(SyncEventKind Kind, UInt128 Mask, bool Unconditional, bool IsReturn = false);
         private readonly List<string> _blockOrder = new();
         private readonly Dictionary<string, List<SyncEvent>> _blockEvents = new(StringComparer.OrdinalIgnoreCase);
         private string? _block;
@@ -40,7 +40,12 @@ public sealed partial class CxxLinearCodeGenerator
         private int _flushOrdinal;
         private FlushPlan? _flushPlan;
 
-        private sealed record FlushPlan(UInt128[] DirtyAtFlush, string[] BlockAtFlush, UInt128 StoredUnion);
+        private sealed record FlushPlan(
+            UInt128[] DirtyAtFlush,
+            string[] BlockAtFlush,
+            UInt128 StoredUnion,
+            UInt128 NonReturnStoredUnion,
+            UInt128 ReloadedUnion);
 
         /// <summary>
         /// Every register some flush of this body may store into CpuContext (dirty there and in that flush's mask),
@@ -48,10 +53,28 @@ public sealed partial class CxxLinearCodeGenerator
         /// </summary>
         public UInt128? PossiblyStoredByFlushes => _flushPlan?.StoredUnion;
 
+        /// <summary>
+        /// Every register that any non-return flush in this body may write to CpuContext OR any callee/helper
+        /// reload may have modified in CpuContext. Any preserved non-volatile absent from this set still holds its
+        /// exact entry value in CpuContext at every return, so its return flush can be elided while staying 100%
+        /// invariant for PoyoJIT, interpreter, code variants, and native callers.
+        /// </summary>
+        public UInt128? PossiblyTouchedInContextOutsideReturn =>
+            _flushPlan is { } plan ? plan.NonReturnStoredUnion | plan.ReloadedUnion : null;
+
         private const int CtrKey = 65;
         private const int XerKey = 66;
         private const int CrFieldKeyBase = 67;  // 67..74: CR fields 0..7, each synced on its own
         private static int CrFieldKey(int field) => CrFieldKeyBase + field;
+
+        public static byte CrFieldsOfMask(UInt128 mask)
+        {
+            byte fields = 0;
+            for (var field = 0; field < 8; ++field)
+                if (((mask >> CrFieldKey(field)) & UInt128.One) != UInt128.Zero)
+                    fields |= (byte)(1 << field);
+            return fields;
+        }
 
         private RegisterResidency(bool recording) => _recording = recording;
 
@@ -306,11 +329,11 @@ public sealed partial class CxxLinearCodeGenerator
         /// an emitted <c>if</c>, not before a <c>return</c>), so afterwards the flushed locals equal CpuContext.
         /// Only such flushes let later ones skip a register; a conditional one still stores what is dirty.
         /// </summary>
-        public void AppendFlush(StringBuilder sb, string pad, ResidencyBoundarySync sync, bool unconditional)
+        public void AppendFlush(StringBuilder sb, string pad, ResidencyBoundarySync sync, bool unconditional, bool isReturn = false)
         {
             if (_recording)
             {
-                RecordEvent(new SyncEvent(SyncEventKind.Flush, FlushMask(sync), unconditional));
+                RecordEvent(new SyncEvent(SyncEventKind.Flush, FlushMask(sync), unconditional, isReturn));
                 return;
             }
             var dirty = NextFlushDirtySet();
@@ -478,6 +501,8 @@ public sealed partial class CxxLinearCodeGenerator
             var dirtyIn = new UInt128[count];
             var dirtyOut = new UInt128[count];
             var storedUnion = UInt128.Zero;
+            var nonReturnStoredUnion = UInt128.Zero;
+            var reloadedUnion = UInt128.Zero;
             UInt128 Transfer(int block, UInt128 dirty, List<(UInt128 Dirty, string Block)>? flushes)
             {
                 foreach (var syncEvent in _blockEvents[_blockOrder[block]])
@@ -488,11 +513,17 @@ public sealed partial class CxxLinearCodeGenerator
                             dirty |= syncEvent.Mask;
                             break;
                         case SyncEventKind.Flush:
-                            if (flushes is not null) storedUnion |= dirty & syncEvent.Mask;
+                            if (flushes is not null)
+                            {
+                                var storedHere = dirty & syncEvent.Mask;
+                                storedUnion |= storedHere;
+                                if (!syncEvent.IsReturn) nonReturnStoredUnion |= storedHere;
+                            }
                             flushes?.Add((dirty, _blockOrder[block]));
                             if (syncEvent.Unconditional) dirty &= ~syncEvent.Mask;
                             break;
                         case SyncEventKind.Reload:
+                            if (flushes is not null) reloadedUnion |= syncEvent.Mask;
                             if (syncEvent.Unconditional) dirty &= ~syncEvent.Mask;
                             break;
                     }
@@ -528,7 +559,9 @@ public sealed partial class CxxLinearCodeGenerator
             target._flushPlan = new FlushPlan(
                 plan.Select(static item => item.Dirty).ToArray(),
                 plan.Select(static item => item.Block).ToArray(),
-                storedUnion & all);
+                storedUnion & all,
+                nonReturnStoredUnion & all,
+                reloadedUnion);
         }
 
         /// <summary>
@@ -613,6 +646,26 @@ public sealed partial class CxxLinearCodeGenerator
             uint.MaxValue, uint.MaxValue, true, true,
             uint.MaxValue, uint.MaxValue, true, true,
             FlushesXer: true, ReloadsXer: true);
+
+        /// <summary>
+        /// Mod-safe and JIT-safe base indirect call boundary: flushes all dirty locals (keeping CpuContext 100%
+        /// architectural for Project+ C2 hooks reading ancestor non-volatiles like func_80857648_pp, PoyoJIT, and
+        /// OSSaveContext) while reloading only PowerPC EABI volatiles, keeping r1, r2, r13, r14-r31, f14-f31, and
+        /// cr2-cr4 in host locals. Gecko handler (0x800018A8) and code variants keep <see cref="Full"/> instead.
+        /// </summary>
+        public static ResidencyBoundarySync ModSafeIndirectCall { get; } = new(
+            FlushGprMask: uint.MaxValue,
+            FlushFprMask: uint.MaxValue,
+            FlushesCr: true,
+            FlushesCtr: true,
+            ReloadGprMask: GuestEabi.VolatileGprMask,
+            ReloadFprMask: GuestEabi.VolatileFprMask,
+            ReloadsCr: true,
+            ReloadsCtr: true,
+            FlushesXer: true,
+            ReloadsXer: true,
+            FlushCrFieldMask: 0xFF,
+            ReloadCrFieldMask: GuestEabi.VolatileCrFields);
 
         /// <summary>
         /// MKW_EABI_REGS: an indirect call. The target reads its arguments (r3-r10, f1-f8, cr1 for varargs) and the
@@ -799,14 +852,23 @@ public sealed partial class CxxLinearCodeGenerator
     private static bool _eabiConformantBody;
 
     /// <summary>
+    /// Mod-safe and JIT-safe narrowed return flush for a base body: omits mechanically preserved non-volatile
+    /// registers whose <c>CpuContext</c> slots were never written by any non-return flush in this body.
+    /// </summary>
+    [ThreadStatic]
+    private static ResidencyBoundarySync? _modSafeReturnSync;
+
+    /// <summary>
     /// The flush before a return. A conformant body publishes only r1 and the EABI results; its callers keep
-    /// everything else in their own locals. Other bodies publish every written local.
+    /// everything else in their own locals. Other bodies publish every written local (except preserved non-volatiles
+    /// whose <c>CpuContext</c> slots were never touched in the body).
     /// </summary>
     private static void AppendReturnFlush(StringBuilder sb, string pad)
     {
-        if (_eabiVariantBody is not null) AppendFlush(sb, pad, ResidencyBoundarySync.EabiVariantReturn);
-        else if (_eabiConformantBody) AppendFlush(sb, pad, ResidencyBoundarySync.EabiReturn);
-        else AppendFlush(sb, pad);
+        if (_eabiVariantBody is not null) AppendFlush(sb, pad, ResidencyBoundarySync.EabiVariantReturn, unconditional: false, isReturn: true);
+        else if (_eabiConformantBody) AppendFlush(sb, pad, ResidencyBoundarySync.EabiReturn, unconditional: false, isReturn: true);
+        else if (_modSafeReturnSync is not null) AppendFlush(sb, pad, _modSafeReturnSync, unconditional: false, isReturn: true);
+        else AppendFlush(sb, pad, ResidencyBoundarySync.Full, unconditional: false, isReturn: true);
     }
 
     /// <summary>MKW_EABI_REGS: the register-passing entry being emitted, if any (see <see cref="GuestEabiVariant"/>).</summary>
@@ -914,9 +976,9 @@ public sealed partial class CxxLinearCodeGenerator
         if (_activeResidency is { } residency) residency.AppendReload(sb, pad);
     }
 
-    private static void AppendFlush(StringBuilder sb, string pad, ResidencyBoundarySync sync, bool unconditional = false)
+    private static void AppendFlush(StringBuilder sb, string pad, ResidencyBoundarySync sync, bool unconditional = false, bool isReturn = false)
     {
-        if (_activeResidency is { } residency) residency.AppendFlush(sb, pad, sync, unconditional);
+        if (_activeResidency is { } residency) residency.AppendFlush(sb, pad, sync, unconditional, isReturn);
     }
 
     private static void AppendReload(StringBuilder sb, string pad, ResidencyBoundarySync sync, bool unconditional = false)

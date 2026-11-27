@@ -62,7 +62,12 @@ public sealed partial class CxxLinearCodeGenerator
                 {
                     var dest = ToDestination(bin.Destination, types);
                     var scalarFloatOperation = IsFloatRegister(bin.Destination);
-                    if (scalarFloatOperation && bin.Op == "frsp")
+                    string expr;
+                    if (!scalarFloatOperation && TryFoldSdaBinary(bin, out var foldedSda))
+                    {
+                        expr = foldedSda;
+                    }
+                    else if (scalarFloatOperation && bin.Op == "frsp")
                     {
                         // frsp: a single operand rounds by the plain conversion, and the result's bits may be kept for
                         // a store (CxxLinearCodeGenerator.SingleFpr.cs).
@@ -72,13 +77,16 @@ public sealed partial class CxxLinearCodeGenerator
                         localPaired[GetRegisterBaseName(bin.Destination)] = false;
                         break;
                     }
-                    var left = scalarFloatOperation
-                        ? ToScalarFloatExpression(bin.Left, types, localPaired)
-                        : ToExpression(bin.Left, types);
-                    var right = scalarFloatOperation
-                        ? ToScalarFloatExpression(bin.Right, types, localPaired)
-                        : ToExpression(bin.Right, types);
-                    var expr = BinaryExpressionWithOperands(bin, left, right);
+                    else
+                    {
+                        var left = scalarFloatOperation
+                            ? ToScalarFloatExpression(bin.Left, types, localPaired)
+                            : ToExpression(bin.Left, types);
+                        var right = scalarFloatOperation
+                            ? ToScalarFloatExpression(bin.Right, types, localPaired)
+                            : ToExpression(bin.Right, types);
+                        expr = BinaryExpressionWithOperands(bin, left, right);
+                    }
                     sb.AppendLine($"{pad}{dest} = {expr};");
                     if (IsFloatRegister(bin.Destination))
                     {
@@ -189,10 +197,13 @@ public sealed partial class CxxLinearCodeGenerator
                         new IrAddress(resolve.Base.RegisterName!, resolve.MinOffset),
                         types, localConstants, linkedAddressRemap);
                     // MKW_LEAN_RANGES: segment ranges (memory_access.h, ResolveSegmentRange) and their accessors. A write
-                    // range off a proven stack address (the proof TryEmitStackStore uses) skips the policy byte, as
+                    // range off a proven stack address or proven RAM SDA range skips the policy byte, as
                     // FlatStoreRam does: ResolveSegmentStackRange.
-                    if (LeanRanges && resolve.NeedsWriteAccess &&
-                        stackFacts.TryResolve(resolve, new IrAddress(resolve.Base.RegisterName!, resolve.MinOffset), out _))
+                    var provenWriteRamRange = LeanRanges && resolve.NeedsWriteAccess &&
+                        (stackFacts.TryResolve(resolve, new IrAddress(resolve.Base.RegisterName!, resolve.MinOffset), out _) ||
+                         (TryGetFixedSdaBase(resolve.Base.RegisterName, out var sdaRangeBase) &&
+                          IsProvenRamRange(unchecked(sdaRangeBase + (uint)resolve.MinOffset), resolve.Length)));
+                    if (provenWriteRamRange)
                     {
                         sb.AppendLine($"{pad}{resolve.Destination} = MemoryInline::ResolveSegmentStackRange({start}, 0, {resolve.Length}u);");
                         break;
@@ -623,10 +634,20 @@ public sealed partial class CxxLinearCodeGenerator
             case IrIndirectCall icall:
                 {
                     var indirectTarget = ToExpression(icall.Target, types);
-                    // Full reload: an indirect callee need not follow the ABI. P+ switches Gecko code lists by
-                    // changing r15; reloading only volatiles left a stale r15 local and BOOST.GCT never ran.
-                    // MKW_EABI_REGS (vanilla only) trusts the EABI here as well.
-                    var indirectSync = GuestEabi.Enabled ? ResidencyBoundarySync.EabiUnknownCall : ResidencyBoundarySync.Full;
+                    // Gecko code handler (0x800018A8) keeps a full reload: P+ C0 codes mutate r15 across its bctrl
+                    // to switch code lists to BOOST.GCT. Code variants (_variantOwnCode != null) also keep a full
+                    // reload: P+ C2 hooks spliced into code variants invoke custom non-EABI ASM helpers (e.g.
+                    // 0x8058549C returning in r28, 0x80585750 returning in f29, 0x800018A8) via bctrl. Normal base
+                    // functions flush all dirty locals (keeping CpuContext 100% architectural for PoyoJIT, C2 hooks,
+                    // and OSSaveContext) and reload only PowerPC EABI volatiles, keeping r1, r2, r13, r14-r31,
+                    // f14-f31, and cr2-cr4 in host locals.
+                    var indirectSync = GuestEabi.Enabled
+                        ? ResidencyBoundarySync.EabiUnknownCall
+                        : (GuestAbiContractAnalyzer.ModSafeIndirectAbi &&
+                           _variantOwnCode is null &&
+                           _currentEntryPoint != GuestAbiContractAnalyzer.GeckoCodeHandlerAddress
+                            ? ResidencyBoundarySync.ModSafeIndirectCall
+                            : ResidencyBoundarySync.Full);
                     AppendFlush(sb, pad, indirectSync, unconditional: true);
                     sb.AppendLine($"{pad}MKW_INDIRECT_CALL({indirectTarget}, ctx);");
                     AppendReload(sb, pad, indirectSync, unconditional: true);

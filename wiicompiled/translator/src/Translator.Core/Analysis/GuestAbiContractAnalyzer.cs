@@ -118,6 +118,8 @@ public static class GuestAbiContractAnalyzer
             }
         }
 
+        var modSafeIndirect = !GuestEabi.Enabled && IsModSafeIndirectFunction(function);
+
         var definiteWritesByBlock = new GuestStateMask[blockCount];
         for (var index = 0; index < blockCount; ++index)
         {
@@ -125,7 +127,7 @@ public static class GuestAbiContractAnalyzer
             var set = GuestStateMask.Empty;
             for (var position = 0; position < instructions.Count; ++position)
             {
-                Writes(instructions[position], calleeContracts, out _, out var definiteWrite);
+                Writes(instructions[position], calleeContracts, modSafeIndirect, out _, out var definiteWrite);
                 set = set.Union(definiteWrite);
             }
             definiteWritesByBlock[index] = set;
@@ -204,7 +206,7 @@ public static class GuestAbiContractAnalyzer
                     eabiFprReads |= eabiRead.Fpr & ~written.Fpr;
                     eabiCtrRead |= eabiRead.Ctr && !written.Ctr;
                 }
-                Writes(instruction, calleeContracts, out var possibleInstructionWrites, out var definiteInstructionWrites);
+                Writes(instruction, calleeContracts, modSafeIndirect, out var possibleInstructionWrites, out var definiteInstructionWrites);
                 possibleWrites = possibleWrites.Union(possibleInstructionWrites);
                 written = written.Union(definiteInstructionWrites);
                 if (instruction is IrCall call && GuestTargetParser.TryParseAddress(call.Target, out var target))
@@ -219,9 +221,13 @@ public static class GuestAbiContractAnalyzer
                     boundaryFlags |= GuestEabi.HelperEffect(helperCall).BoundaryFlags;
                 }
                 if (instruction is IrUndefined ||
-                    (!GuestEabi.Enabled && instruction is IrIndirectCall or IrIndirectJump))
+                    (!GuestEabi.Enabled && !modSafeIndirect && instruction is IrIndirectCall or IrIndirectJump))
                 {
                     boundaryFlags |= GuestCallBoundaryFlags.RequiresCompleteContext;
+                }
+                else if (instruction is IrIndirectCall or IrIndirectJump)
+                {
+                    boundaryFlags |= GuestCallBoundaryFlags.InvokesGuestCode;
                 }
             }
         }
@@ -238,14 +244,42 @@ public static class GuestAbiContractAnalyzer
             sawExitBlock = true;
         }
 
-        if (StackPreservedContracts)
+        if (StackPreservedContracts && !GuestEabi.Enabled)
         {
-            // Writes only: callers stop reloading preserved registers after the call. Narrowing reads as well
-            // (saveOnlyReads) left state-free input planning inconsistent with caller contracts (0x8014734C passing
-            // an r31 it no longer held), so callers keep flushing them before the call.
-            var (preserved, _) = StackPreservedGprs(function, calleeContracts);
-            possibleWrites = possibleWrites with { Gpr = possibleWrites.Gpr & ~preserved };
-            definiteWrites = definiteWrites with { Gpr = definiteWrites.Gpr & ~preserved };
+            // Writes only: callers stop reloading mechanically proven stack-preserved registers (r1, r14-r31,
+            // f14-f31, cr2-cr4) after the call while keeping ReadBeforeWrite intact so CpuContext stays
+            // architecturally flushed on entry to callees, PoyoJIT/interpreter patches, and OSSaveContext.
+            var preserved = GuestEabi.AnalyzePreservedFrameState(
+                function,
+                calleeContracts,
+                trustIndirectCalls: modSafeIndirect,
+                allowPsqFprPreservation: false);
+            if (GuestEabi.IsNonLocalExit(function, preserved))
+            {
+                // C++ exception unwinder context restore (0x803F2948) jumps directly to the catch landing pad
+                // and never returns to its caller; keep its ReadBeforeWrite intact so inputs flush, while not
+                // polluting every function that can reach a throw (__dynamic_cast) with r1/r2/r13/NV writes.
+                possibleWrites = GuestStateMask.Empty;
+                definiteWrites = GuestStateMask.Empty;
+            }
+            else
+            {
+                // Writes only: callers stop reloading mechanically proven stack-preserved registers (r1, r14-r31,
+                // f14-f31, cr2-cr4) while ReadBeforeWrite stays intact so CpuContext remains architecturally
+                // flushed on entry to callees, Project+ C2 hooks, PoyoJIT patches, and OSSaveContext.
+                possibleWrites = possibleWrites with
+                {
+                    Gpr = possibleWrites.Gpr & ~preserved.Gprs,
+                    Fpr = possibleWrites.Fpr & ~preserved.Fprs,
+                    Cr = (byte)(possibleWrites.Cr & ~preserved.CrFields)
+                };
+                definiteWrites = definiteWrites with
+                {
+                    Gpr = definiteWrites.Gpr & ~preserved.Gprs,
+                    Fpr = definiteWrites.Fpr & ~preserved.Fprs,
+                    Cr = (byte)(definiteWrites.Cr & ~preserved.CrFields)
+                };
+            }
         }
 
         const uint gprReturnMask = (1u << 3) | (1u << 4);
@@ -421,6 +455,7 @@ public static class GuestAbiContractAnalyzer
     private static void Writes(
         IrInstruction instruction,
         IReadOnlyDictionary<uint, GuestAbiContract>? calleeContracts,
+        bool modSafeIndirect,
         out GuestStateMask possible,
         out GuestStateMask definite)
     {
@@ -478,18 +513,23 @@ public static class GuestAbiContractAnalyzer
             case IrIndirectCall value:
                 Add(ref shared, value.Destination);
                 if (GuestEabi.Enabled) possibleOnly = GuestEabi.UnknownCallWrites;
+                else if (modSafeIndirect) possibleOnly = ModSafeIndirectWrites;
                 else shared = shared.Union(FullState);
                 break;
             case IrIndirectJump when GuestEabi.Enabled:
                 // A tail dispatch: the target's results (r3/r4/f1/f2, volatile scratch) become this function's.
                 possibleOnly = GuestEabi.UnknownCallWrites;
                 break;
+            case IrIndirectJump when modSafeIndirect:
+                possibleOnly = ModSafeIndirectWrites;
+                break;
             case IrSetCrField value:
                 shared = shared with { Cr = (byte)(shared.Cr | (1 << value.FieldIndex)) };
                 break;
-            // MKW_EABI_REGS: a phi renames values its sources already wrote; counting it as a write made a merge
-            // of the untouched CR or r13 look like a write of all eight CR fields or of r13.
-            case IrPhi value when !GuestEabi.Enabled: Add(ref shared, value.Destination); break;
+            // A phi only merges values its incoming edges already wrote; counting it as a write made merges
+            // of untouched r2/r13/cr/non-volatiles look like spurious writes of those registers.
+            case IrPhi:
+                break;
             case IrUndefined:
                 shared = FullState;
                 break;
@@ -536,6 +576,14 @@ public static class GuestAbiContractAnalyzer
     private static GuestStateMask FullState =>
         new(uint.MaxValue, uint.MaxValue, byte.MaxValue, true, true, true, true, byte.MaxValue, byte.MaxValue);
 
+    /// <summary>
+    /// Mod-safe and JIT-safe possible writes of an indirect call or tail jump: all PowerPC EABI volatile
+    /// registers, FPSCR, and GQRs, leaving r1, r2, r13, r14-r31, f14-f31 and cr2-cr4 preserved.
+    /// </summary>
+    private static GuestStateMask ModSafeIndirectWrites =>
+        new(GuestEabi.VolatileGprMask, GuestEabi.VolatileFprMask, GuestEabi.VolatileCrFields,
+            true, true, true, true, byte.MaxValue, 0);
+
     private static GuestStateMask SpecialRegistersInRawExpression(string expression) =>
         new(
             0,
@@ -551,157 +599,32 @@ public static class GuestAbiContractAnalyzer
                    (expression.Contains("ctx->hid1", StringComparison.Ordinal) ? 2 : 0) |
                    (expression.Contains("ctx->hid2", StringComparison.Ordinal) ? 4 : 0)));
 
-    // MKW_STACK_PRESERVED_CONTRACTS=1: a nonvolatile GPR the function only saves in its frame and reloads before
-    // every return (stw rN,X(r1) ... lwz rN,X(r1)), and r1 itself when every return leaves it at its entry value, is
-    // not a write the caller can observe, so callers stop reloading it after the call; when the save is the entry
-    // value's only use it is not a read either, so callers stop flushing it before the call.
-    internal static readonly bool StackPreservedContracts =
-        Environment.GetEnvironmentVariable("MKW_STACK_PRESERVED_CONTRACTS") == "1";
+    // MKW_STACK_PRESERVED_CONTRACTS (default ON, set =0 to opt out): non-volatile registers (r1, r14-r31,
+    // f14-f31, cr2-cr4) mechanically proven to be stack-saved and restored before every reachable exit are
+    // removed from possible/definite writes so callers stop reloading them after direct calls.
+    public static readonly bool StackPreservedContracts =
+        Environment.GetEnvironmentVariable("MKW_STACK_PRESERVED_CONTRACTS") != "0";
 
-    /// <summary>
-    /// GPRs among r1 and r14-r31 whose value at every return is provably the value at entry (see
-    /// <see cref="StackPreservedContracts"/>), and the subset whose entry value is read only by its save.
-    /// SSA names make this exact without alias analysis beyond the frame slot: offsets are tracked relative to the
-    /// entry r1 through addi/mr, a save is a store of the never-defined entry name, and a restore is the last
-    /// definition of the register in a returning block, loaded from the same slot.
-    /// </summary>
-    private static (uint Preserved, uint SaveOnlyReads) StackPreservedGprs(
-        IrFunction function, IReadOnlyDictionary<uint, GuestAbiContract>? calleeContracts)
+    // MKW_MODSAFE_INDIRECT_ABI (default ON, set =0 to opt out): indirect calls/jumps keep architectural
+    // full-context reads/flushes (safe for PoyoJIT, C2 hooks, and OSSaveContext) while treating r1, r2, r13,
+    // r14-r31, f14-f31, and cr2-cr4 as preserved across indirect boundaries. The Gecko code handler
+    // (0x800018A8) is excluded because P+ C0 Gecko codes mutate r15 across its indirect call.
+    public static readonly bool ModSafeIndirectAbi =
+        Environment.GetEnvironmentVariable("MKW_MODSAFE_INDIRECT_ABI") != "0";
+
+    internal const uint GeckoCodeHandlerAddress = 0x800018A8u;
+
+    internal static bool IsGeckoCodeHandler(IrFunction function)
     {
-        static string Base(string name) => RegisterNameUtils.HardwareBase(name);
-        static int GprIndex(string name)
-        {
-            var b = Base(name);
-            return b.Length > 1 && b[0] == 'r' && int.TryParse(b.AsSpan(1), out var index) && index is >= 0 and < 32
-                ? index : -1;
-        }
-
-        var defined = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var block in function.Blocks)
-            foreach (var instruction in block.Instructions)
-                foreach (var name in IrRegisterDataFlow.Definitions(instruction))
-                    defined.Add(name);
-
-        // Offsets from the entry r1, for every SSA name that is entry-r1 plus a constant.
-        var offsets = new Dictionary<string, long>(StringComparer.Ordinal);
-        bool TryOffset(string name, out long offset)
-        {
-            if (offsets.TryGetValue(name, out offset)) return true;
-            if (GprIndex(name) == 1 && !defined.Contains(name)) { offset = 0; return true; }
-            offset = 0;
-            return false;
-        }
-        for (var pass = 0; pass < 2; ++pass)
-            foreach (var block in function.Blocks)
-                foreach (var instruction in block.Instructions)
-                {
-                    if (instruction is IrAssign { Value: { Kind: "register", RegisterName: { } source } } copy &&
-                        TryOffset(source, out var copied))
-                        offsets[copy.Destination] = copied;
-                    else if (instruction is IrBinary { Op: "add", Left: { Kind: "register", RegisterName: { } left },
-                                 Right: { Kind: "const", Constant: { } k } } sum && TryOffset(left, out var based))
-                        offsets[sum.Destination] = based + k;
-                }
-
-        bool SlotOf(IrAddress address, out long slot)
-        {
-            slot = 0;
-            if (!TryOffset(address.Base, out var baseOffset)) return false;
-            slot = baseOffset + address.Offset;
+        if (GuestTargetParser.TryParseAddress(function.EntryLabel, out var entryAddr) &&
+            entryAddr == GeckoCodeHandlerAddress)
             return true;
-        }
-
-        // Saves: entry names stored to one frame slot; any other use of an entry name is a real read.
-        var slots = new Dictionary<int, long>();
-        var conflicted = new HashSet<int>();
-        var otherUses = new HashSet<int>();
-        foreach (var block in function.Blocks)
-            foreach (var instruction in block.Instructions)
-            {
-                var savedIndex = -1;
-                if (instruction is IrStore { Source: { Kind: "register", RegisterName: { } stored }, SizeBytes: 4 } store &&
-                    !defined.Contains(stored) && GprIndex(stored) is var index and (1 or >= 14) &&
-                    SlotOf(store.Address, out var slot))
-                {
-                    savedIndex = index;
-                    if (slots.TryGetValue(index, out var previous) && previous != slot) conflicted.Add(index);
-                    slots[index] = slot;
-                }
-                else if (instruction is IrResolvedStore { Source: { Kind: "register", RegisterName: { } rstored }, SizeBytes: 4 } rstore &&
-                         !defined.Contains(rstored) && GprIndex(rstored) is var rindex and (1 or >= 14) &&
-                         SlotOf(rstore.OriginalAddress, out var rslot))
-                {
-                    savedIndex = rindex;
-                    if (slots.TryGetValue(rindex, out var previous) && previous != rslot) conflicted.Add(rindex);
-                    slots[rindex] = rslot;
-                }
-                // A callee reads the caller's registers implicitly (no IR use names them): whatever a callee's
-                // contract reads is a real read here too, and an unknown callee may read anything.
-                if (instruction is IrCall call)
-                {
-                    var calleeReads = GuestTargetParser.TryParseAddress(call.Target, out var callee) &&
-                                      calleeContracts?.TryGetValue(callee, out var calleeContract) == true
-                        ? calleeContract.GprReadBeforeWriteMask
-                        : uint.MaxValue;
-                    for (var r = 1; r < 32; ++r)
-                        if ((calleeReads & (1u << r)) != 0) otherUses.Add(r);
-                }
-                else if (instruction is IrIndirectCall or IrIndirectJump)
-                {
-                    for (var r = 1; r < 32; ++r) otherUses.Add(r);
-                }
-                foreach (var used in IrRegisterDataFlow.Uses(instruction))
-                {
-                    if (defined.Contains(used)) continue;
-                    var usedIndex = GprIndex(used);
-                    if (usedIndex < 0) continue;
-                    // The save's own source is the one tolerated use (r1 is also the save's address base: that use
-                    // reads the stack pointer, which the caller flushes anyway).
-                    if (usedIndex == savedIndex) { savedIndex = -1; continue; }
-                    otherUses.Add(usedIndex);
-                }
-            }
-
-        uint preserved = 0, saveOnly = 0;
-        var returning = function.Blocks.Where(static b => b.Instructions.Any(static i => i is IrReturn)).ToList();
-        if (returning.Count == 0) return (0, 0);
-        for (var reg = 1; reg < 32; ++reg)
-        {
-            if (reg is > 1 and < 14) continue;
-            var ok = true;
-            foreach (var block in returning)
-            {
-                IrInstruction? last = null;
-                foreach (var instruction in block.Instructions)
-                    if (IrRegisterDataFlow.Definitions(instruction).Any(name => GprIndex(name) == reg))
-                        last = instruction;
-                if (last is null)
-                {
-                    // Not redefined in this block: preserved only if never defined anywhere.
-                    if (defined.Any(name => GprIndex(name) == reg)) { ok = false; break; }
-                    continue;
-                }
-                if (reg == 1 && last is IrBinary or IrAssign && TryOffset(IrRegisterDataFlow.Definitions(last).First(), out var back) && back == 0)
-                    continue;  // addi r1,r1,frame: back at the entry stack pointer
-                long loadSlot;
-                var restored = last switch
-                {
-                    IrLoad { SizeBytes: 4 } load => SlotOf(load.Address, out loadSlot),
-                    IrResolvedLoad { SizeBytes: 4 } rload => SlotOf(rload.OriginalAddress, out loadSlot),
-                    _ => (loadSlot = 0) != 0
-                };
-                if (!restored || !slots.TryGetValue(reg, out var saved) || conflicted.Contains(reg) || saved != loadSlot)
-                {
-                    ok = false;
-                    break;
-                }
-            }
-            if (!ok) continue;
-            preserved |= 1u << reg;
-            if (!otherUses.Contains(reg)) saveOnly |= 1u << reg;
-        }
-        return (preserved, saveOnly);
+        return GuestTargetParser.TryParseAddress(function.Name, out var nameAddr) &&
+               nameAddr == GeckoCodeHandlerAddress;
     }
+
+    internal static bool IsModSafeIndirectFunction(IrFunction function) =>
+        ModSafeIndirectAbi && !IsGeckoCodeHandler(function);
 
     internal enum InlineThunkKind { SaveGpr, RestGpr, SaveFpr, RestFpr }
 

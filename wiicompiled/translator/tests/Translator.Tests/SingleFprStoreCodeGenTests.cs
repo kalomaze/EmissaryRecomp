@@ -178,6 +178,22 @@ public sealed class SingleFprStoreCodeGenTests
     }
 
     [Fact]
+    public void ANonvolatileSingleKeepsItsBitsAcrossAnIndirectCall()
+    {
+        // Indirect calls reload only the EABI volatiles (MKW_MODSAFE_INDIRECT_ABI): f20's local survives the call, so
+        // its loaded word is still the value to store, and it is still single for fmuls.
+        var code = Emit(
+            new IrLoad("f20", new IrAddress("r4", 0), 4),
+            new IrIndirectCall(string.Empty, IrValue.Register("r12"), Array.Empty<IrValue>()),
+            new IrStore(new IrAddress("r5", 0), IrValue.Register("f20"), 4),
+            new IrCall("f4", "PPC_Fmuls", new[] { IrValue.Register("f2"), IrValue.Register("f20") }));
+
+        Assert.Contains("MemoryInline::FlatWrite32(r5, fbits_f20", code, StringComparison.Ordinal);
+        Assert.DoesNotContain("FlatWriteFloat32", code, StringComparison.Ordinal);
+        Assert.Contains("PpcFmulsSingleCInline(", code, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void AVolatileSingleLosesItsBitsAcrossAnIndirectCall()
     {
         var code = Emit(
@@ -186,6 +202,39 @@ public sealed class SingleFprStoreCodeGenTests
             new IrStore(new IrAddress("r5", 0), IrValue.Register("f1"), 4));
 
         Assert.Contains("MemoryInline::FlatWriteFloat32(r5, f1.d);", code, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ASingleKeepsItsBitsIntoALaterBlock()
+    {
+        // Defined in the entry block, stored in both arms and after the merge: each store reuses the loaded word.
+        var code = EmitBlocks(
+            new IrBasicBlock("entry", new List<IrInstruction>
+            {
+                new IrLoad("f20", new IrAddress("r4", 0), 4),
+                new IrAssign("f21", IrValue.Register("f20")),
+                new IrBranch("ne", "left", "right")
+            }),
+            new IrBasicBlock("left", new List<IrInstruction>
+            {
+                new IrStore(new IrAddress("r5", 0), IrValue.Register("f20"), 4),
+                new IrJump("join")
+            }),
+            new IrBasicBlock("right", new List<IrInstruction>
+            {
+                new IrIndirectCall(string.Empty, IrValue.Register("r12"), Array.Empty<IrValue>()),
+                new IrJump("join")
+            }),
+            new IrBasicBlock("join", new List<IrInstruction>
+            {
+                new IrStore(new IrAddress("r5", 4), IrValue.Register("f21"), 4),
+                new IrReturn(null)
+            }));
+
+        Assert.Contains("MemoryInline::FlatWrite32(r5, fbits_f20", code, StringComparison.Ordinal);
+        Assert.Contains("fbits_f21_", code, StringComparison.Ordinal);
+        Assert.Contains("MemoryInline::FlatWrite32((r5 + 4), fbits_f21", code, StringComparison.Ordinal);
+        Assert.DoesNotContain("FlatWriteFloat32", code, StringComparison.Ordinal);
     }
 
     [Fact]

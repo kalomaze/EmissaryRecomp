@@ -60,7 +60,7 @@ public static class GuestEabi
     /// <summary>What an EABI call may change: every volatile register.</summary>
     public const uint VolatileGprMask = 1u | 0x1FF8u;                            // r0, r3..r12
     public const uint VolatileFprMask = 0x3FFFu;                                 // f0..f13
-    private const byte VolatileCrFields = 0xE3;                                  // cr0, cr1, cr5..cr7
+    public const byte VolatileCrFields = 0xE3;                                   // cr0, cr1, cr5..cr7
 
     /// <summary>
     /// Natives that replace the register file. OSLoadContext (0x801D80B4) loads all GPRs from an OSContext and jumps
@@ -353,6 +353,54 @@ public static class GuestEabi
     }
 
     /// <summary>
+    /// Mod-safe and JIT-safe view of a conservative registered native's contract when <see cref="Enabled"/> is off.
+    /// Every registered native except <c>OSLoadContext</c> (0x801D80B4) preserves r1, r2, r13, r14-r31, f14-f31, and
+    /// cr2-cr4 (runtime dispatch guards non-volatile GPRs/FPRs; fast-path mutex/IRQ overrides write only r3 and fiber
+    /// thread switches save/restore the complete CpuContext). Keeping full architectural reads ensures callers still
+    /// flush all dirty state before suspension, logging, callbacks, or PoyoJIT entry, while keeping
+    /// <see cref="GuestCallBoundaryFlags.InvokesGuestCode"/> keeps GQR hoisting and memory range lowering opaque.
+    /// </summary>
+    public static GuestAbiContract ClassifyModSafeNative(uint address, GuestAbiContract precise)
+    {
+        if (!precise.HasFullSynchronizationFence || ViolatingNatives.Contains(address))
+            return precise;
+        return precise with
+        {
+            GprReadBeforeWriteMask = uint.MaxValue,
+            GprPossibleWriteMask = VolatileGprMask,
+            GprReturnMask = (1u << 3) | (1u << 4),
+            GprDefiniteWriteMask = 0,
+            FprReadBeforeWriteMask = uint.MaxValue,
+            FprPossibleWriteMask = VolatileFprMask,
+            FprReturnMask = 1u << 1,
+            FprDefiniteWriteMask = 0,
+            CrReadBeforeWriteMask = byte.MaxValue,
+            CrPossibleWriteMask = VolatileCrFields,
+            CrDefiniteWriteMask = 0,
+            ReadsXerBeforeWrite = true,
+            MayWriteXer = true,
+            DefinitelyWritesXer = false,
+            ReadsCtrBeforeWrite = true,
+            MayWriteCtr = true,
+            DefinitelyWritesCtr = false,
+            ReadsLrBeforeWrite = true,
+            MayWriteLr = true,
+            DefinitelyWritesLr = false,
+            ReadsFpscrBeforeWrite = true,
+            MayWriteFpscr = true,
+            DefinitelyWritesFpscr = false,
+            GqrReadBeforeWriteMask = byte.MaxValue,
+            GqrPossibleWriteMask = byte.MaxValue,
+            GqrDefiniteWriteMask = 0,
+            HidReadBeforeWriteMask = byte.MaxValue,
+            HidPossibleWriteMask = byte.MaxValue,
+            HidDefiniteWriteMask = 0,
+            BoundaryFlags = (precise.BoundaryFlags & ~GuestCallBoundaryFlags.RequiresCompleteContext) |
+                            GuestCallBoundaryFlags.InvokesGuestCode
+        };
+    }
+
+    /// <summary>
     /// MKW_EABI_FRAME_SAVES=elide (opt-in): conformant bodies drop their nonvolatile frame saves (see
     /// <see cref="ElideFrameSaves"/>). Off by default: the save slots' bytes change (they keep older stack contents),
     /// and vanilla Training's character select diverged with it on (the cursor never reached
@@ -636,18 +684,60 @@ public static class GuestEabi
     }
 
     /// <summary>
-    /// Frame save/restore facts for r1, r14-r31 and f14-f31 from SSA. Every address is an affine form
+    /// Mechanically proven preserved non-volatile registers for one function (stack-saved and restored along every
+    /// reachable exit path, or untouched along every reachable path).
+    /// </summary>
+    internal readonly record struct PreservedFrameState(
+        uint Gprs,
+        uint Fprs,
+        byte CrFields,
+        bool WritesSdaBase);
+
+    internal static PreservedFrameState AnalyzePreservedFrameState(
+        IrFunction function,
+        IReadOnlyDictionary<uint, GuestAbiContract>? callees,
+        bool trustIndirectCalls,
+        bool allowPsqFprPreservation)
+    {
+        var facts = FrameFacts.Analyze(
+            function,
+            callees,
+            strictUnknownCallees: true,
+            trustIndirectCalls: trustIndirectCalls,
+            allowPsqFprPreservation: allowPsqFprPreservation);
+        return new PreservedFrameState(
+            facts.PreservedGprs,
+            facts.PreservedFprs,
+            facts.PreservedCrFields,
+            facts.WritesSdaBase);
+    }
+
+    internal static bool IsNonLocalExit(IrFunction function, PreservedFrameState preserved)
+    {
+        if ((preserved.Gprs & (1u << 1)) != 0 || !preserved.WritesSdaBase)
+            return false;
+        if (GuestTargetParser.TryParseAddress(function.EntryLabel, out var entryAddr) &&
+            NonLocalExits.Contains(entryAddr))
+            return true;
+        return GuestTargetParser.TryParseAddress(function.Name, out var nameAddr) &&
+               NonLocalExits.Contains(nameAddr);
+    }
+
+    /// <summary>
+    /// Frame save/restore facts for r1, r14-r31, f14-f31 and cr2-cr4 from SSA. Every address is an affine form
     /// (root, offset): root "" is the entry stack pointer, followed through mr/addi and through a load of the back
     /// chain the prologue stored (lwz rX,0(r1) of an aligned stwux frame); any other definition is its own root. A
-    /// save is a store of a register's entry value to a slot (stw/stmw/stfd/psq_st, or a _savegpr/_savefpr thunk at
-    /// r11's form); a forward may-clobber dataflow treats a definition whose value (through copies) was loaded from
-    /// that register's save slot (lwz/lmw/lfd/psq_l or a _restgpr/_restfpr thunk) as a restore.
+    /// save is a store of a register's entry value to a slot (stw/stmw/stfd/psq_st, mfcr+stw, or a _savegpr/_savefpr
+    /// thunk at r11's form) whose byte span is never overwritten by another frame store; a forward may-clobber
+    /// dataflow treats a definition whose value (through copies) was loaded from that register's save slot
+    /// (lwz/lmw/lfd/psq_l, lwz+mtcrf, or a _restgpr/_restfpr thunk) as a restore.
     /// </summary>
     private sealed class FrameFacts
     {
         public string? IntrinsicViolation;
         public uint PreservedGprs;
         public uint PreservedFprs;
+        public byte PreservedCrFields;
         public uint SaveOnlyGprs;
         public uint SaveOnlyFprs;
         public bool HasMtcrf;
@@ -655,12 +745,14 @@ public static class GuestEabi
         public bool WritesSdaBase;
 
         private const ulong Tracked = 0xFFFFC000_FFFFC002ul;  // r1, r14-r31, f14-f31
+        private const int CrRegisterSlot = -2;
 
         private readonly Dictionary<string, IrInstruction> _definitions = new(StringComparer.Ordinal);
         private readonly Dictionary<string, (string Root, long Offset)> _affine = new(StringComparer.Ordinal);
         private readonly HashSet<(string, long)> _backChainSlots = new();
         private readonly Dictionary<int, HashSet<(string, long, char)>> _saves = new();
         private readonly Dictionary<string, bool> _possiblyEntry = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, bool> _holdsEntryCr = new(StringComparer.Ordinal);
 
         private bool IsEntryName(string name) => !_definitions.ContainsKey(name);
 
@@ -680,6 +772,9 @@ public static class GuestEabi
                             Right: { Kind: "const", Constant: { } k } } => Shift(Affine(left, depth + 1), k),
                         IrLoad { SizeBytes: 4 } load when _backChainSlots.Contains(Slot(load.Address, depth)) => ("", 0),
                         IrResolvedLoad { SizeBytes: 4 } rload when _backChainSlots.Contains(Slot(rload.OriginalAddress, depth)) => ("", 0),
+                        IrResolvedLoadPair { ElementSizeBytes: 4 } rpair when
+                            (rpair.FirstDestination == name && _backChainSlots.Contains(Slot(rpair.FirstOriginalAddress, depth))) ||
+                            (rpair.SecondDestination == name && _backChainSlots.Contains(Slot(rpair.SecondOriginalAddress, depth))) => ("", 0),
                         _ => (name, 0)
                     };
             }
@@ -704,8 +799,95 @@ public static class GuestEabi
         private bool IsSave(int register, (string Root, long Offset) slot, char kind) =>
             _saves.TryGetValue(register, out var set) && set.Contains((slot.Root, slot.Offset, kind));
 
+        private static bool IsWholeCrName(string? name) =>
+            !string.IsNullOrEmpty(name) &&
+            RegisterNameUtils.StripNumericSuffixSpan(name.AsSpan()).Equals("cr", StringComparison.OrdinalIgnoreCase);
+
+        private bool IsEntryCrBeforeLoads(string name, int depth = 0)
+        {
+            if (depth > 64) return false;
+            if (!_definitions.TryGetValue(name, out var definition)) return IsWholeCrName(name);
+            return definition is IrAssign { Value: { Kind: "register", RegisterName: { } source } } &&
+                   IsEntryCrBeforeLoads(source, depth + 1);
+        }
+
+        private bool HoldsEntryCr(string name, int depth = 0)
+        {
+            if (_holdsEntryCr.TryGetValue(name, out var known)) return known;
+            if (depth > 64) return false;
+            _holdsEntryCr[name] = false; // cycle guard
+            bool result;
+            if (!_definitions.TryGetValue(name, out var definition))
+            {
+                result = IsWholeCrName(name);
+            }
+            else
+            {
+                result = definition switch
+                {
+                    IrAssign { Value: { Kind: "register", RegisterName: { } source } } => HoldsEntryCr(source, depth + 1),
+                    IrLoad { SizeBytes: 4 } load => IsSave(CrRegisterSlot, Slot(load.Address), 'w'),
+                    IrResolvedLoad { SizeBytes: 4 } rload => IsSave(CrRegisterSlot, Slot(rload.OriginalAddress), 'w'),
+                    IrResolvedLoadPair { ElementSizeBytes: 4 } rpair =>
+                        (rpair.FirstDestination == name && IsSave(CrRegisterSlot, Slot(rpair.FirstOriginalAddress), 'w')) ||
+                        (rpair.SecondDestination == name && IsSave(CrRegisterSlot, Slot(rpair.SecondOriginalAddress), 'w')),
+                    _ => false
+                };
+            }
+            _holdsEntryCr[name] = result;
+            return result;
+        }
+
+        private bool TryMatchMtcrf(IrBinary orInstruction, out byte touchedCrFields, out string? sourceRegister)
+        {
+            touchedCrFields = 0;
+            sourceRegister = null;
+            if (!string.Equals(orInstruction.Op, "or", StringComparison.Ordinal) ||
+                !IsWholeCrName(orInstruction.Destination) ||
+                orInstruction.Left.Kind != "register" || orInstruction.Right.Kind != "register" ||
+                orInstruction.Left.RegisterName is not { } leftName ||
+                orInstruction.Right.RegisterName is not { } rightName)
+            {
+                return false;
+            }
+
+            bool TryInspect(string preserveCandidate, string srcCandidate, out byte fields, out string? src)
+            {
+                fields = 0;
+                src = null;
+                if (!preserveCandidate.Contains("_mtcrf_preserve", StringComparison.Ordinal) ||
+                    !srcCandidate.Contains("_mtcrf_src", StringComparison.Ordinal) ||
+                    !_definitions.TryGetValue(preserveCandidate, out var preserveDef) ||
+                    !_definitions.TryGetValue(srcCandidate, out var srcDef) ||
+                    preserveDef is not IrBinary { Op: "and", Left: { Kind: "register", RegisterName: { } crName }, Right: { Kind: "const", Constant: { } preserveMask } } ||
+                    !IsWholeCrName(crName) ||
+                    srcDef is not IrBinary { Op: "and", Left: { Kind: "register", RegisterName: { } valueName }, Right: { Kind: "const", Constant: { } srcMask } })
+                {
+                    return false;
+                }
+
+                var mask = unchecked((uint)srcMask);
+                if (unchecked((uint)preserveMask) != ~mask) return false;
+                fields = FieldsOfCrMask(mask);
+                src = valueName;
+                return true;
+            }
+
+            return TryInspect(leftName, rightName, out touchedCrFields, out sourceRegister) ||
+                   TryInspect(rightName, leftName, out touchedCrFields, out sourceRegister);
+        }
+
+        private static byte FieldsOfCrMask(uint mask)
+        {
+            byte fields = 0;
+            for (var field = 0; field < 8; ++field)
+                if (((mask >> ((7 - field) * 4)) & 0xFu) != 0)
+                    fields |= (byte)(1 << field);
+            return fields;
+        }
+
         /// <summary>The value of <paramref name="name"/> is <paramref name="register"/>'s entry value, restored.</summary>
-        private bool HoldsEntryValue(string name, int register, int depth = 0)
+        private bool HoldsEntryValue(string name, int register, bool allowPsqFprPreservation, int depth = 0)
         {
             if (depth > 64) return false;
             if (register == 1) return Affine(name) == ("", 0);
@@ -713,12 +895,16 @@ public static class GuestEabi
             var gpr = register < 32;
             return definition switch
             {
-                IrAssign { Value: { Kind: "register", RegisterName: { } source } } => HoldsEntryValue(source, register, depth + 1),
+                IrAssign { Value: { Kind: "register", RegisterName: { } source } } =>
+                    HoldsEntryValue(source, register, allowPsqFprPreservation, depth + 1),
                 IrLoad load => (gpr ? load.SizeBytes == 4 : load.SizeBytes == 8) &&
                                IsSave(register, Slot(load.Address), gpr ? 'w' : 'd'),
                 IrResolvedLoad rload => (gpr ? rload.SizeBytes == 4 : rload.SizeBytes == 8) &&
                                         IsSave(register, Slot(rload.OriginalAddress), gpr ? 'w' : 'd'),
-                IrCall { Target: "PPC_PsqL" } psql when !gpr && psql.Arguments.Count >= 1 &&
+                IrResolvedLoadPair rpair => (gpr ? rpair.ElementSizeBytes == 4 : rpair.ElementSizeBytes == 8) &&
+                    ((rpair.FirstDestination == name && IsSave(register, Slot(rpair.FirstOriginalAddress), gpr ? 'w' : 'd')) ||
+                     (rpair.SecondDestination == name && IsSave(register, Slot(rpair.SecondOriginalAddress), gpr ? 'w' : 'd'))),
+                IrCall { Target: "PPC_PsqL" } psql when allowPsqFprPreservation && !gpr && psql.Arguments.Count >= 1 &&
                     psql.Arguments[0] is { Kind: "register", RegisterName: { } address } =>
                     IsSave(register, Affine(address), 'p'),
                 _ => false
@@ -766,7 +952,14 @@ public static class GuestEabi
         public (string Root, long Offset) SlotOf(IrAddress address) => Slot(address);
         public (string Root, long Offset) FormOf(string name) => Affine(name);
 
-        public static FrameFacts Analyze(IrFunction function, IReadOnlyDictionary<uint, GuestAbiContract>? callees)
+        private readonly record struct RecordedStore(string Root, long Offset, int Size, int SavedRegister, char Kind);
+
+        public static FrameFacts Analyze(
+            IrFunction function,
+            IReadOnlyDictionary<uint, GuestAbiContract>? callees,
+            bool strictUnknownCallees = false,
+            bool trustIndirectCalls = true,
+            bool allowPsqFprPreservation = true)
         {
             var facts = new FrameFacts();
             foreach (var block in function.Blocks)
@@ -785,12 +978,50 @@ public static class GuestEabi
                     else if (instruction is IrResolvedStore { SizeBytes: 4, Source: { Kind: "register", RegisterName: { } rstored } } rstore &&
                              ArchIndex(rstored) == 1 && facts.IsEntryName(rstored))
                         facts._backChainSlots.Add(facts.Slot(rstore.OriginalAddress));
+                    else if (instruction is IrResolvedStorePair { ElementSizeBytes: 4 } rpair)
+                    {
+                        if (rpair.FirstSource is { Kind: "register", RegisterName: { } first } &&
+                            ArchIndex(first) == 1 && facts.IsEntryName(first))
+                            facts._backChainSlots.Add(facts.Slot(rpair.FirstOriginalAddress));
+                        if (rpair.SecondSource is { Kind: "register", RegisterName: { } second } &&
+                            ArchIndex(second) == 1 && facts.IsEntryName(second))
+                            facts._backChainSlots.Add(facts.Slot(rpair.SecondOriginalAddress));
+                    }
                 }
             facts._affine.Clear();
 
             // Entry values of r14-r31/f14-f31 used other than as a frame save, and nonvolatiles read by violator callees.
             var otherUses = 0ul;
             var violatorReads = 0ul;
+            var recordedStores = new List<RecordedStore>();
+            var candidateSaves = new List<RecordedStore>();
+
+            void RecordSingleStore(IrValue source, IrAddress address, int sizeBytes, out string? savedSource)
+            {
+                savedSource = null;
+                var slot = facts.Slot(address);
+                if (source is { Kind: "register", RegisterName: { } regName })
+                {
+                    if (sizeBytes is 4 or 8 && facts.IsEntryName(regName) && ArchIndex(regName) is var regIndex and >= 0)
+                    {
+                        var kind = sizeBytes == 8 ? 'd' : 'w';
+                        var entry = new RecordedStore(slot.Item1, slot.Item2, sizeBytes, regIndex, kind);
+                        recordedStores.Add(entry);
+                        candidateSaves.Add(entry);
+                        savedSource = regName;
+                        return;
+                    }
+                    if (sizeBytes == 4 && facts.IsEntryCrBeforeLoads(regName))
+                    {
+                        var entry = new RecordedStore(slot.Item1, slot.Item2, 4, CrRegisterSlot, 'w');
+                        recordedStores.Add(entry);
+                        candidateSaves.Add(entry);
+                        return;
+                    }
+                }
+                recordedStores.Add(new RecordedStore(slot.Item1, slot.Item2, sizeBytes, -1, '\0'));
+            }
+
             foreach (var block in function.Blocks)
             {
                 var instructions = block.Instructions;
@@ -798,6 +1029,7 @@ public static class GuestEabi
                 {
                     var instruction = instructions[position];
                     string? saveSource = null;
+                    string? secondSaveSource = null;
                     switch (instruction)
                     {
                         case IrUndefined:
@@ -810,27 +1042,42 @@ public static class GuestEabi
                             facts.HasMtcrf = true;
                             break;
                     }
-                    if (instruction is IrStore { Source: { Kind: "register", RegisterName: { } stored } } store &&
-                        facts.IsEntryName(stored) && ArchIndex(stored) is var storedRegister and >= 0 &&
-                        store.SizeBytes is 4 or 8)
+                    if (instruction is IrStore store)
                     {
-                        facts.AddSave(storedRegister, facts.Slot(store.Address), store.SizeBytes == 8 ? 'd' : 'w');
-                        saveSource = stored;
+                        RecordSingleStore(store.Source, store.Address, store.SizeBytes, out saveSource);
                     }
-                    else if (instruction is IrResolvedStore { Source: { Kind: "register", RegisterName: { } rstored } } rstore &&
-                             facts.IsEntryName(rstored) && ArchIndex(rstored) is var rstoredRegister and >= 0 &&
-                             rstore.SizeBytes is 4 or 8)
+                    else if (instruction is IrResolvedStore rstore)
                     {
-                        facts.AddSave(rstoredRegister, facts.Slot(rstore.OriginalAddress), rstore.SizeBytes == 8 ? 'd' : 'w');
-                        saveSource = rstored;
+                        RecordSingleStore(rstore.Source, rstore.OriginalAddress, rstore.SizeBytes, out saveSource);
+                    }
+                    else if (instruction is IrResolvedStorePair rpair)
+                    {
+                        RecordSingleStore(rpair.FirstSource, rpair.FirstOriginalAddress, rpair.ElementSizeBytes, out saveSource);
+                        RecordSingleStore(rpair.SecondSource, rpair.SecondOriginalAddress, rpair.ElementSizeBytes, out secondSaveSource);
                     }
                     else if (instruction is IrCall { Target: "PPC_PsqSt" } psq && psq.Arguments.Count >= 2 &&
-                             psq.Arguments[1] is { Kind: "register", RegisterName: { } psqSource } &&
-                             facts.IsEntryName(psqSource) && ArchIndex(psqSource) is var psqRegister and >= 0 &&
                              psq.Arguments[0] is { Kind: "register", RegisterName: { } psqAddress })
                     {
-                        facts.AddSave(psqRegister, facts.Affine(psqAddress), 'p');
-                        saveSource = psqSource;
+                        var slot = facts.Affine(psqAddress);
+                        if (allowPsqFprPreservation &&
+                            psq.Arguments[1] is { Kind: "register", RegisterName: { } psqSource } &&
+                            facts.IsEntryName(psqSource) && ArchIndex(psqSource) is var psqRegister and >= 32)
+                        {
+                            var recorded = new RecordedStore(slot.Root, slot.Offset, 8, psqRegister, 'p');
+                            recordedStores.Add(recorded);
+                            candidateSaves.Add(recorded);
+                            saveSource = psqSource;
+                        }
+                        else
+                        {
+                            recordedStores.Add(new RecordedStore(slot.Root, slot.Offset, 8, -1, '\0'));
+                        }
+                    }
+                    else if (instruction is IrResolvedPsqStore rpsq &&
+                             rpsq.OriginalAddress is { Kind: "register", RegisterName: { } rpsqAddress })
+                    {
+                        var slot = facts.Affine(rpsqAddress);
+                        recordedStores.Add(new RecordedStore(slot.Root, slot.Offset, 8, -1, '\0'));
                     }
                     else if (instruction is IrCall thunkCall && GuestTargetParser.TryParseAddress(thunkCall.Target, out var thunkAddress) &&
                              TryGetFrameThunk(thunkAddress, out var thunkKind, out var start))
@@ -842,15 +1089,64 @@ public static class GuestEabi
                             ReachingR11(instructions, position) is { } r11Name)
                         {
                             var (root, offset) = facts.Affine(r11Name);
+                            var stride = gpr ? 4 : 8;
+                            var kind = gpr ? 'w' : 'd';
                             for (var r = start; r < 32; ++r)
-                                facts.AddSave(gpr ? r : 32 + r, (root, offset - (gpr ? 4 : 8) * (32 - r)), gpr ? 'w' : 'd');
+                            {
+                                var recorded = new RecordedStore(root, offset - stride * (32 - r), stride, gpr ? r : 32 + r, kind);
+                                recordedStores.Add(recorded);
+                                candidateSaves.Add(recorded);
+                            }
                         }
                     }
-                    else if (instruction is IrCall call && GuestTargetParser.TryParseAddress(call.Target, out var callee) &&
-                             callees?.TryGetValue(callee, out var calleeContract) == true && !calleeContract.EabiConformant)
+                    else if (instruction is IrCall call)
                     {
-                        violatorReads |= calleeContract.EabiGprReadMask & NonvolatileGprMask;
-                        violatorReads |= (ulong)(calleeContract.EabiFprReadMask & NonvolatileFprMask) << 32;
+                        if (GuestTargetParser.TryParseAddress(call.Target, out var callee))
+                        {
+                            if (callees?.TryGetValue(callee, out var calleeContract) == true)
+                            {
+                                if (!calleeContract.EabiConformant)
+                                {
+                                    if (strictUnknownCallees)
+                                    {
+                                        var gprRead = calleeContract.HasFullSynchronizationFence
+                                            ? NonvolatileGprMask
+                                            : calleeContract.GprReadBeforeWriteMask & NonvolatileGprMask;
+                                        var fprRead = calleeContract.HasFullSynchronizationFence
+                                            ? NonvolatileFprMask
+                                            : calleeContract.FprReadBeforeWriteMask & NonvolatileFprMask;
+                                        violatorReads |= gprRead | ((ulong)fprRead << 32);
+                                    }
+                                    else
+                                    {
+                                        violatorReads |= calleeContract.EabiGprReadMask & NonvolatileGprMask;
+                                        violatorReads |= (ulong)(calleeContract.EabiFprReadMask & NonvolatileFprMask) << 32;
+                                    }
+                                }
+                            }
+                            else if (strictUnknownCallees)
+                            {
+                                violatorReads |= NonvolatileGprMask | ((ulong)NonvolatileFprMask << 32);
+                            }
+                        }
+                        else if (strictUnknownCallees)
+                        {
+                            var effect = HelperEffect(call);
+                            if (effect.BoundaryFlags.HasFlag(GuestCallBoundaryFlags.RequiresCompleteContext))
+                            {
+                                violatorReads |= NonvolatileGprMask | ((ulong)NonvolatileFprMask << 32);
+                            }
+                            else
+                            {
+                                violatorReads |= (effect.GprReadMask & NonvolatileGprMask) |
+                                                 ((ulong)(effect.FprReadMask & NonvolatileFprMask) << 32);
+                            }
+                        }
+                    }
+                    else if (instruction is IrUndefined ||
+                             (!trustIndirectCalls && instruction is IrIndirectCall or IrIndirectJump))
+                    {
+                        violatorReads |= NonvolatileGprMask | ((ulong)NonvolatileFprMask << 32);
                     }
 
                     foreach (var used in IrRegisterDataFlow.Uses(instruction))
@@ -863,6 +1159,7 @@ public static class GuestEabi
                         var index = ArchIndex(used);
                         if (index < 0 || !facts.PossiblyEntry(used)) continue;
                         if (used == saveSource) { saveSource = null; continue; }
+                        if (used == secondSaveSource) { secondSaveSource = null; continue; }
                         otherUses |= 1ul << index;
                     }
                     foreach (var name in IrRegisterDataFlow.Definitions(instruction))
@@ -875,7 +1172,41 @@ public static class GuestEabi
                 }
             }
 
-            // Forward may-clobber dataflow over the tracked registers (bit 1: r1 differs from its entry value).
+            // Retain only save slots whose byte span is never overwritten by a conflicting store off the same base.
+            if (candidateSaves.Count != 0)
+            {
+                var storesByRoot = new Dictionary<string, List<RecordedStore>>(StringComparer.Ordinal);
+                foreach (var st in recordedStores)
+                {
+                    if (!storesByRoot.TryGetValue(st.Root, out var list))
+                        storesByRoot[st.Root] = list = new List<RecordedStore>();
+                    list.Add(st);
+                }
+
+                foreach (var save in candidateSaves)
+                {
+                    var conflicted = false;
+                    foreach (var other in storesByRoot[save.Root])
+                    {
+                        if (other.Offset < save.Offset + save.Size && save.Offset < other.Offset + other.Size)
+                        {
+                            if (other.SavedRegister != save.SavedRegister ||
+                                other.Offset != save.Offset ||
+                                other.Size != save.Size ||
+                                other.Kind != save.Kind)
+                            {
+                                conflicted = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!conflicted)
+                        facts.AddSave(save.SavedRegister, (save.Root, save.Offset), save.Kind);
+                }
+            }
+
+            // Forward may-clobber dataflow over the tracked registers (bit 1: r1 differs from its entry value)
+            // and cr2-cr4.
             var blocks = function.Blocks;
             var ordinals = new Dictionary<string, int>(blocks.Count, StringComparer.Ordinal);
             for (var i = 0; i < blocks.Count; ++i) ordinals[blocks[i].Label] = i;
@@ -913,52 +1244,128 @@ public static class GuestEabi
             var entry = ordinals.TryGetValue(function.EntryLabel, out var entryIndex) ? entryIndex : 0;
             var clobberIn = new ulong[blocks.Count];
             var clobberOut = new ulong[blocks.Count];
+            var crIn = new byte[blocks.Count];
+            var crOut = new byte[blocks.Count];
             var reached = new bool[blocks.Count];
-            reached[entry] = true;
+            if (blocks.Count > 0) reached[entry] = true;
 
-            ulong Transfer(int blockIndex, ulong state)
+            (ulong State, byte CrState) Transfer(int blockIndex, ulong state, byte crState)
             {
                 var instructions = blocks[blockIndex].Instructions;
                 for (var position = 0; position < instructions.Count; ++position)
                 {
                     var instruction = instructions[position];
                     if (instruction is IrPhi) continue;
-                    if (instruction is IrCall call && GuestTargetParser.TryParseAddress(call.Target, out var target))
+                    if (instruction is IrUndefined)
                     {
-                        if (TryGetFrameThunk(target, out var kind, out var start))
+                        state |= Tracked;
+                        crState |= NonvolatileCrFields;
+                        continue;
+                    }
+                    if (instruction is IrIndirectCall or IrIndirectJump)
+                    {
+                        if (!trustIndirectCalls)
                         {
-                            if (kind is ThunkKind.RestGpr or ThunkKind.RestFpr)
+                            state |= Tracked;
+                            crState |= NonvolatileCrFields;
+                        }
+                        // An indirect call/jump can still have an explicit IR destination (e.g. lr).
+                    }
+                    if (instruction is IrSetCrField setCr)
+                    {
+                        crState |= (byte)((1 << (setCr.FieldIndex & 7)) & NonvolatileCrFields);
+                        continue;
+                    }
+                    if (instruction is IrBinary mtcrfOr && facts.TryMatchMtcrf(mtcrfOr, out var touchedCrFields, out var mtcrfSource))
+                    {
+                        var nonvolTouched = (byte)(touchedCrFields & NonvolatileCrFields);
+                        if (nonvolTouched != 0)
+                        {
+                            if (mtcrfSource is not null && facts.HoldsEntryCr(mtcrfSource))
+                                crState &= (byte)~nonvolTouched;
+                            else
+                                crState |= nonvolTouched;
+                        }
+                        continue;
+                    }
+                    var helperHandledCr = false;
+                    if (instruction is IrCall call)
+                    {
+                        if (GuestTargetParser.TryParseAddress(call.Target, out var target))
+                        {
+                            if (TryGetFrameThunk(target, out var kind, out var start))
                             {
-                                var gpr = kind == ThunkKind.RestGpr;
-                                var r11Name = ReachingR11(instructions, position);
-                                var (root, offset) = r11Name is null ? ("?", 0L) : facts.Affine(r11Name);
-                                for (var r = start; r < 32; ++r)
+                                if (kind is ThunkKind.RestGpr or ThunkKind.RestFpr)
                                 {
-                                    var register = gpr ? r : 32 + r;
-                                    if (r11Name is not null &&
-                                        facts.IsSave(register, (root, offset - (gpr ? 4 : 8) * (32 - r)), gpr ? 'w' : 'd'))
-                                        state &= ~(1ul << register);
+                                    var gpr = kind == ThunkKind.RestGpr;
+                                    var r11Name = ReachingR11(instructions, position);
+                                    var (root, offset) = r11Name is null ? ("?", 0L) : facts.Affine(r11Name);
+                                    for (var r = start; r < 32; ++r)
+                                    {
+                                        var register = gpr ? r : 32 + r;
+                                        if (r11Name is not null &&
+                                            facts.IsSave(register, (root, offset - (gpr ? 4 : 8) * (32 - r)), gpr ? 'w' : 'd'))
+                                            state &= ~(1ul << register);
+                                        else
+                                            state |= 1ul << register;
+                                    }
+                                }
+                                continue;
+                            }
+                            if (callees?.TryGetValue(target, out var contract) == true)
+                            {
+                                if (!contract.EabiConformant)
+                                {
+                                    if (contract.HasFullSynchronizationFence)
+                                    {
+                                        state |= Tracked;
+                                        crState |= NonvolatileCrFields;
+                                    }
                                     else
-                                        state |= 1ul << register;
+                                    {
+                                        state |= contract.GprPossibleWriteMask & (NonvolatileGprMask | (1u << 1));
+                                        state |= (ulong)(contract.FprPossibleWriteMask & NonvolatileFprMask) << 32;
+                                        crState |= (byte)(contract.CrPossibleWriteMask & NonvolatileCrFields);
+                                    }
                                 }
                             }
-                            continue;
+                            else if (strictUnknownCallees)
+                            {
+                                state |= Tracked;
+                                crState |= NonvolatileCrFields;
+                            }
                         }
-                        if (callees?.TryGetValue(target, out var contract) == true && !contract.EabiConformant)
+                        else
                         {
-                            state |= contract.GprPossibleWriteMask & (NonvolatileGprMask | (1u << 1));
-                            state |= (ulong)(contract.FprPossibleWriteMask & NonvolatileFprMask) << 32;
+                            var effect = HelperEffect(call);
+                            if (effect.BoundaryFlags.HasFlag(GuestCallBoundaryFlags.RequiresCompleteContext))
+                            {
+                                state |= Tracked;
+                                crState |= NonvolatileCrFields;
+                            }
+                            else
+                            {
+                                state |= effect.GprWriteMask & (NonvolatileGprMask | (1u << 1));
+                                state |= (ulong)(effect.FprWriteMask & NonvolatileFprMask) << 32;
+                                crState |= (byte)(effect.CrWriteMask & NonvolatileCrFields);
+                                if (effect.CrWriteMask != 0) helperHandledCr = true;
+                            }
                         }
                     }
                     foreach (var name in IrRegisterDataFlow.Definitions(instruction))
                     {
+                        if (IsWholeCrName(name))
+                        {
+                            if (!helperHandledCr) crState |= NonvolatileCrFields;
+                            continue;
+                        }
                         var register = ArchIndex(name);
                         if (register < 0 || ((Tracked >> register) & 1) == 0) continue;
-                        if (facts.HoldsEntryValue(name, register)) state &= ~(1ul << register);
+                        if (facts.HoldsEntryValue(name, register, allowPsqFprPreservation)) state &= ~(1ul << register);
                         else state |= 1ul << register;
                     }
                 }
-                return state;
+                return (state, crState);
             }
 
             bool changed;
@@ -968,15 +1375,22 @@ public static class GuestEabi
                 for (var i = 0; i < blocks.Count; ++i)
                 {
                     if (!reached[i]) continue;
-                    var outgoing = Transfer(i, clobberIn[i]);
-                    if (outgoing != clobberOut[i]) { clobberOut[i] = outgoing; changed = true; }
+                    var (outgoing, outgoingCr) = Transfer(i, clobberIn[i], crIn[i]);
+                    if (outgoing != clobberOut[i] || outgoingCr != crOut[i])
+                    {
+                        clobberOut[i] = outgoing;
+                        crOut[i] = outgoingCr;
+                        changed = true;
+                    }
                     foreach (var successor in successors[i])
                     {
                         var merged = clobberIn[successor] | outgoing;
-                        if (!reached[successor] || merged != clobberIn[successor])
+                        var mergedCr = (byte)(crIn[successor] | outgoingCr);
+                        if (!reached[successor] || merged != clobberIn[successor] || mergedCr != crIn[successor])
                         {
                             reached[successor] = true;
                             clobberIn[successor] = merged;
+                            crIn[successor] = mergedCr;
                             changed = true;
                         }
                     }
@@ -984,11 +1398,28 @@ public static class GuestEabi
             } while (changed);
 
             var clobberedAtExit = 0ul;
+            byte clobberedCrAtExit = 0;
+            var anyReachableExit = false;
             foreach (var exit in exits)
-                if (reached[exit]) clobberedAtExit |= clobberOut[exit];
-            var preserved = Tracked & ~clobberedAtExit;
-            facts.PreservedGprs = (uint)preserved;
-            facts.PreservedFprs = (uint)(preserved >> 32);
+            {
+                if (!reached[exit]) continue;
+                anyReachableExit = true;
+                clobberedAtExit |= clobberOut[exit];
+                clobberedCrAtExit |= crOut[exit];
+            }
+            if (!anyReachableExit && strictUnknownCallees)
+            {
+                facts.PreservedGprs = 0;
+                facts.PreservedFprs = 0;
+                facts.PreservedCrFields = 0;
+            }
+            else
+            {
+                var preserved = Tracked & ~clobberedAtExit;
+                facts.PreservedGprs = (uint)preserved;
+                facts.PreservedFprs = (uint)(preserved >> 32);
+                facts.PreservedCrFields = (byte)(NonvolatileCrFields & ~clobberedCrAtExit);
+            }
             var saveOnly = ~(otherUses | violatorReads);
             facts.SaveOnlyGprs = (uint)saveOnly & NonvolatileGprMask;
             facts.SaveOnlyFprs = (uint)(saveOnly >> 32) & NonvolatileFprMask;

@@ -146,6 +146,47 @@ public sealed partial class CxxLinearCodeGenerator
         return name;
     }
 
+    private static bool TryGetFixedSdaBase(string? name, out uint value)
+    {
+        if (!string.IsNullOrEmpty(name) && IsCpuRegister(name))
+        {
+            var baseName = BaseRegisterSpan(name);
+            if (_fixedSda1Base.HasValue && baseName.Equals("r13", StringComparison.OrdinalIgnoreCase))
+            {
+                value = _fixedSda1Base.Value;
+                return true;
+            }
+            if (_fixedSda2Base.HasValue && baseName.Equals("r2", StringComparison.OrdinalIgnoreCase))
+            {
+                value = _fixedSda2Base.Value;
+                return true;
+            }
+        }
+        value = 0;
+        return false;
+    }
+
+    private static bool TryFoldSdaBinary(IrBinary bin, out string expression)
+    {
+        if (string.Equals(bin.Op, "add", StringComparison.Ordinal))
+        {
+            if (bin.Left.Kind == "register" && bin.Right.Kind == "const" && bin.Right.Constant.HasValue &&
+                TryGetFixedSdaBase(bin.Left.RegisterName, out var leftBase))
+            {
+                expression = $"0x{unchecked(leftBase + (uint)bin.Right.Constant.Value):X8}u";
+                return true;
+            }
+            if (bin.Right.Kind == "register" && bin.Left.Kind == "const" && bin.Left.Constant.HasValue &&
+                TryGetFixedSdaBase(bin.Right.RegisterName, out var rightBase))
+            {
+                expression = $"0x{unchecked(rightBase + (uint)bin.Left.Constant.Value):X8}u";
+                return true;
+            }
+        }
+        expression = string.Empty;
+        return false;
+    }
+
     private static string RegisterToCtxExpression(string name, bool written)
     {
         var baseName = BaseRegisterSpan(name);
@@ -153,6 +194,11 @@ public sealed partial class CxxLinearCodeGenerator
 
         if (baseName.Length > 1 && baseName[0] == 'r' && int.TryParse(baseName[1..], out var gpr) && gpr is >= 0 and < 32)
         {
+            if (!written)
+            {
+                if (gpr == 13 && _fixedSda1Base.HasValue) return $"0x{_fixedSda1Base.Value:X8}u";
+                if (gpr == 2 && _fixedSda2Base.HasValue) return $"0x{_fixedSda2Base.Value:X8}u";
+            }
             return residency is null ? CtxGprName(gpr) : residency.Gpr(gpr, written: written);
         }
 
@@ -323,6 +369,11 @@ public sealed partial class CxxLinearCodeGenerator
 
     private static string Address(IrAddress addr, RepresentationEnvironment types)
     {
+        if (TryGetFixedSdaBase(addr.Base, out var sdaBase))
+        {
+            return $"0x{unchecked(sdaBase + (uint)addr.Offset):X8}u";
+        }
+
         var baseExpr = IsCpuRegister(addr.Base)
             ? RegisterToCtxExpression(addr.Base, written: false)
             : addr.Base;

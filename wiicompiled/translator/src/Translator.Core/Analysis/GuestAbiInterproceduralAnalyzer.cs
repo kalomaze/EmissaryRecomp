@@ -43,6 +43,13 @@ public static class GuestAbiInterproceduralAnalyzer
             }
             externalContracts = classifiedExternal;
         }
+        else if (GuestAbiContractAnalyzer.ModSafeIndirectAbi && externalContracts.Count != 0)
+        {
+            var classifiedExternal = new Dictionary<uint, GuestAbiContract>(externalContracts.Count);
+            foreach (var (address, contract) in externalContracts)
+                classifiedExternal[address] = GuestEabi.ClassifyModSafeNative(address, contract);
+            externalContracts = classifiedExternal;
+        }
 
         // GuestAbiContractAnalyzer.Analyze is pure and the round's contract snapshot is frozen, so
         // per-function analyses within a round can run on any thread. Determinism comes from
@@ -107,9 +114,9 @@ public static class GuestAbiInterproceduralAnalyzer
         }
 
         var visible = new Dictionary<uint, GuestAbiContract>(externalContracts);
-        // MKW_EABI_REGS: a registered native is what runs at its address, so callers see its contract, not that of
-        // the replaced PPC body (OS routines reading MSR would otherwise mark every caller non-conformant).
-        var nativeWins = GuestEabi.Enabled ? new HashSet<uint>(externalContracts.Keys) : new HashSet<uint>();
+        // A registered native is what runs at its address, so callers observe its contract rather than that of
+        // the replaced PPC body (e.g. OSDisableInterrupts's PPC body has mfmsr/mtmsr, which would fence every caller).
+        var nativeWins = new HashSet<uint>(externalContracts.Keys);
         foreach (var (address, contract) in contracts)
             if (!nativeWins.Contains(address)) visible[address] = contract;
 
@@ -146,13 +153,13 @@ public static class GuestAbiInterproceduralAnalyzer
                 var contract = roundResults[position];
                 if (contract is null) continue;
                 var ordinal = worklist[position];
-                if (GuestEabi.Enabled && ++changeCounts[ordinal] > 8)
+                if (++changeCounts[ordinal] > 8)
                 {
-                    // MKW_EABI_REGS: a contract that keeps changing (classification interacts with recursion) is
-                    // joined with its previous value from now on: a monotone, conservative step that must settle.
+                    // A contract that keeps changing across rounds (e.g. stack-preserved proofs or EABI
+                    // classification interacting with recursion) is joined monotonically so the fixpoint settles.
                     contract = GuestEabi.Join(current[ordinal], contract);
                     if (Equivalent(current[ordinal], contract)) continue;
-                    if (!contract.EabiConformant) eabiReasons[ordinal] ??= "unstable contract (joined)";
+                    if (GuestEabi.Enabled && !contract.EabiConformant) eabiReasons[ordinal] ??= "unstable contract (joined)";
                 }
                 updated = true;
                 ++updatedCount;
