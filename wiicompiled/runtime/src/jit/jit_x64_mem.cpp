@@ -151,13 +151,38 @@ bool IntStoreShape(K k, Shape& s) {
 void EmitEa(BlockEmitter& e, const Op& o, bool indexed, bool zeroBase = false) {
     Xbyak::CodeGenerator& a = e.a;
     if (zeroBase) {
-        if (indexed) a.mov(eax, e.Gpr(o.b));
-        else a.mov(eax, o.imm);
+        if (indexed) {
+            if (e.WantCacheGpr(o.b)) a.mov(eax, e.ReadGpr(o.b));
+            else a.mov(eax, e.Gpr(o.b));
+        } else {
+            a.mov(eax, o.imm);
+        }
         return;
     }
-    a.mov(eax, e.Gpr(o.a));
-    if (indexed) a.add(eax, e.Gpr(o.b));
-    else if (o.imm != 0) a.add(eax, o.imm);
+    if (e.WantCacheGpr(o.a)) {
+        const Xbyak::Reg32& ra = e.ReadGpr(o.a);
+        if (indexed) {
+            if (e.WantCacheGpr(o.b)) {
+                const Xbyak::Reg32& rb = e.ReadGpr(o.b, 1u << o.a);
+                a.lea(eax, a.ptr[ra.cvt64() + rb.cvt64()]);
+            } else {
+                a.mov(eax, ra);
+                a.add(eax, e.Gpr(o.b));
+            }
+        } else if (o.imm != 0) {
+            a.lea(eax, a.ptr[ra.cvt64() + static_cast<int32_t>(o.imm)]);
+        } else {
+            a.mov(eax, ra);
+        }
+    } else {
+        a.mov(eax, e.Gpr(o.a));
+        if (indexed) {
+            if (e.WantCacheGpr(o.b)) a.add(eax, e.ReadGpr(o.b));
+            else a.add(eax, e.Gpr(o.b));
+        } else if (o.imm != 0) {
+            a.add(eax, o.imm);
+        }
+    }
 }
 
 // ecx = the canonical offset of the address in eax.
@@ -171,54 +196,83 @@ void EmitCanonical(BlockEmitter& e) {
 void EmitCanonicalEa(BlockEmitter& e, const Op& o, bool indexed, bool zeroBase = false) {
     Xbyak::CodeGenerator& a = e.a;
     if (zeroBase) {
-        if (indexed) a.mov(ecx, e.Gpr(o.b));
-        else a.mov(ecx, o.imm);
+        if (indexed) {
+            if (e.WantCacheGpr(o.b)) a.mov(ecx, e.ReadGpr(o.b));
+            else a.mov(ecx, e.Gpr(o.b));
+        } else {
+            a.mov(ecx, o.imm);
+        }
         a.and_(ecx, kMask);
         return;
     }
-    a.mov(ecx, e.Gpr(o.a));
-    if (indexed) a.add(ecx, e.Gpr(o.b));
-    else if (o.imm != 0) a.add(ecx, o.imm);
+    if (e.WantCacheGpr(o.a)) {
+        const Xbyak::Reg32& ra = e.ReadGpr(o.a);
+        if (indexed) {
+            if (e.WantCacheGpr(o.b)) {
+                const Xbyak::Reg32& rb = e.ReadGpr(o.b, 1u << o.a);
+                a.lea(ecx, a.ptr[ra.cvt64() + rb.cvt64()]);
+            } else {
+                a.mov(ecx, ra);
+                a.add(ecx, e.Gpr(o.b));
+            }
+        } else if (o.imm != 0) {
+            a.lea(ecx, a.ptr[ra.cvt64() + static_cast<int32_t>(o.imm)]);
+        } else {
+            a.mov(ecx, ra);
+        }
+    } else {
+        a.mov(ecx, e.Gpr(o.a));
+        if (indexed) {
+            if (e.WantCacheGpr(o.b)) a.add(ecx, e.ReadGpr(o.b));
+            else a.add(ecx, e.Gpr(o.b));
+        } else if (o.imm != 0) {
+            a.add(ecx, o.imm);
+        }
+    }
     a.and_(ecx, kMask);
 }
 
-// An update form's write of rA (the address is in eax; a slow path that clobbered it rebuilds it first).
+// An update form's write of rA (the address is in eax; a slow path that clobbered it rebuilds it first from memory).
 void EmitRebuildEa(Xbyak::CodeGenerator& a, BlockEmitter& e, uint32_t ra, uint32_t imm, bool indexed = false, uint32_t rb = 0) {
     a.mov(eax, e.Gpr(ra));
     if (indexed) a.add(eax, e.Gpr(rb));
     else if (imm != 0) a.add(eax, imm);
 }
 
-// The byte-swapped load of `width` bytes at [r12 + rcx] into edx (rdx for 8), zero-extended.
-void EmitLoadSwapped(Xbyak::CodeGenerator& a, unsigned width, bool reverse = false) {
+// The byte-swapped load of `width` bytes at [r12 + rcx] into `dst` (rdx for 8), zero-extended.
+void EmitLoadSwappedTo(Xbyak::CodeGenerator& a, unsigned width, const Xbyak::Reg32& dst, bool reverse = false) {
     const Xbyak::RegExp at = kLean + rcx;
     switch (width) {
-    case 1: a.movzx(edx, a.byte[at]); break;
+    case 1: a.movzx(dst, a.byte[at]); break;
     case 2:
-        a.movzx(edx, a.word[at]);
-        if (!reverse) a.rol(dx, 8);
+        a.movzx(dst, a.word[at]);
+        if (!reverse) a.rol(dst.cvt16(), 8);
         break;
     case 4:
         if (reverse) {  // lwbrx: the bytes as memory holds them
-            a.mov(edx, a.dword[at]);
+            a.mov(dst, a.dword[at]);
             break;
         }
 #if defined(__MOVBE__)
-        a.movbe(edx, a.dword[at]);
+        a.movbe(dst, a.dword[at]);
 #else
-        a.mov(edx, a.dword[at]);
-        a.bswap(edx);
+        a.mov(dst, a.dword[at]);
+        a.bswap(dst);
 #endif
         break;
     default:
 #if defined(__MOVBE__)
-        a.movbe(rdx, a.qword[at]);
+        a.movbe(dst.cvt64(), a.qword[at]);
 #else
-        a.mov(rdx, a.qword[at]);
-        a.bswap(rdx);
+        a.mov(dst.cvt64(), a.qword[at]);
+        a.bswap(dst.cvt64());
 #endif
         break;
     }
+}
+
+void EmitLoadSwapped(Xbyak::CodeGenerator& a, unsigned width, bool reverse = false) {
+    EmitLoadSwappedTo(a, width, edx, reverse);
 }
 
 // --- forward jumps to cold code ----------------------------------------------------------------------------------------
@@ -289,9 +343,11 @@ struct StoreCold {
     uint32_t join, pcIndex, imm;
     uint8_t ra, rb, width;
     bool update, indexed, reverse;
+    BlockEmitter::GprSnapshot snap;
     void operator()(BlockEmitter& e) const {
         Xbyak::CodeGenerator& a = e.a;
         Resolve(a, slow);
+        e.EmitFlushSnapshot(snap);
         e.StorePc(pcIndex);
         if (reverse) {  // the shim writes big-endian: hand it the value swapped, so memory gets the register's own byte order
             if (width == 4) a.bswap(edx);
@@ -299,6 +355,7 @@ struct StoreCold {
         }
         e.CallHelper(ShimFor(width), kFrame, eax, rdx);
         EmitPendingCheck(e);
+        e.EmitReloadSnapshotVolatile(snap);
         if (update) EmitRebuildEa(a, e, ra, imm, indexed, rb);
         JmpTo(a, join);
     }
@@ -358,10 +415,20 @@ uint32_t EmitIntLoad(BlockEmitter& e, const Op& o, const Shape& s) {
     } else {
         EmitCanonicalEa(e, o, s.indexed, s.zeroBase);
     }
-    EmitLoadSwapped(a, s.width, s.reverse);
-    if (s.sign) a.movsx(edx, dx);
-    a.mov(e.Gpr(o.d), edx);
-    if (s.update) a.mov(e.Gpr(o.a), eax);
+    if (e.GprReadLater(o.d)) {
+        const Xbyak::Reg32& dst = e.WriteGpr(o.d);
+        EmitLoadSwappedTo(a, s.width, dst, s.reverse);
+        if (s.sign) a.movsx(dst, dst.cvt16());
+    } else {
+        e.DropGpr(o.d);
+        EmitLoadSwappedTo(a, s.width, edx, s.reverse);
+        if (s.sign) a.movsx(edx, dx);
+        a.mov(e.Gpr(o.d), edx);
+    }
+    if (s.update) {
+        if (e.GprReadLater(o.a)) a.mov(e.WriteGpr(o.a, 1u << o.d), eax);
+        else { e.DropGpr(o.a); a.mov(e.Gpr(o.a), eax); }
+    }
     return 1;
 }
 
@@ -370,12 +437,18 @@ uint32_t EmitIntStore(BlockEmitter& e, const Op& o, const Shape& s, bool fromFpr
     EmitEa(e, o, s.indexed, s.zeroBase);
     // after the address: the address does not read rS, an update form's rA is written last. stfiwx stores the low word of the
     // register's bits whatever its form
-    a.mov(edx, fromFpr ? e.FprWord(o.d, 0) : e.Gpr(o.d));
+    if (fromFpr) a.mov(edx, e.FprWord(o.d, 0));
+    else if (e.WantCacheGpr(o.d)) a.mov(edx, e.ReadGpr(o.d));
+    else a.mov(edx, e.Gpr(o.d));
     EmitCanonical(e);
+    const BlockEmitter::GprSnapshot snap = e.SnapshotGprs();
     const Patch slow = EmitStoreChecked(e, s.width, s.reverse);
     const uint32_t join = Here(a);
-    if (s.update) a.mov(e.Gpr(o.a), eax);
-    e.Cold(StoreCold{slow, join, e.index, o.imm, o.a, o.b, s.width, s.update, s.indexed, s.reverse});
+    if (s.update) {
+        if (e.GprReadLater(o.a)) a.mov(e.WriteGpr(o.a), eax);
+        else { e.DropGpr(o.a); a.mov(e.Gpr(o.a), eax); }
+    }
+    e.Cold(StoreCold{slow, join, e.index, o.imm, o.a, o.b, s.width, s.update, s.indexed, s.reverse, snap});
     return 1;
 }
 
@@ -385,6 +458,7 @@ uint32_t EmitLmw(BlockEmitter& e, const Op& o) {
     Xbyak::CodeGenerator& a = e.a;
     EmitEa(e, o, false);
     EmitCanonical(e);
+    e.FlushAllGprs();
     for (uint32_t k = o.d; k < 32; ++k) {
         const Xbyak::RegExp at = kLean + rcx + static_cast<int>(4 * (k - o.d));
 #if defined(__MOVBE__)
@@ -405,11 +479,13 @@ uint32_t EmitLmw(BlockEmitter& e, const Op& o) {
 struct StmwCold {
     Patches slow;
     uint32_t join, pcIndex, first;
+    BlockEmitter::GprSnapshot snap;
     void operator()(BlockEmitter& e) const {
         slow.Resolve(e.a);
         e.StorePc(pcIndex);
         e.CallHelper(&StmwFlagged, kFrame, eax, first);
         EmitPendingCheck(e);
+        e.EmitReloadSnapshotVolatile(snap);
         JmpTo(e.a, join);
     }
 };
@@ -419,6 +495,8 @@ uint32_t EmitStmw(BlockEmitter& e, const Op& o) {
     const uint32_t n = 32 - o.d;
     StmwCold cold{};
     EmitEa(e, o, false);
+    e.FlushDirtyGprs();
+    cold.snap = e.SnapshotGprs();
     EmitCanonical(e);
     a.mov(esi, ecx);
     a.shr(esi, MemoryInline::kLeanPolicyShift);
@@ -460,14 +538,16 @@ uint32_t EmitStmw(BlockEmitter& e, const Op& o) {
 
 // --- floating point loads and stores --------------------------------------------------------------------------------------
 
-// Form byte of r := form, unless the block knows it holds it already (jit_x64_forms.cpp).
+// Form bit of r := form, unless the block knows it holds it already (jit_x64_forms.cpp).
 void EmitSetForm(BlockEmitter& e, uint32_t r, Form form) {
     if (e.KnownForm(e.index, r) == form) {
         BlockEmitter::NoteForm(BlockEmitter::FormEvent::WriteSkipped);
         return;
     }
     BlockEmitter::NoteForm(BlockEmitter::FormEvent::WriteEmitted);
-    e.a.mov(e.Form(r), static_cast<uint32_t>(form));
+    const uint32_t bit = 1u << (r & 31u);
+    if (form == Form::Paired) e.a.or_(e.PairedMask(), bit);
+    else e.a.and_(e.PairedMask(), ~bit);
 }
 void EmitSetScalarForm(BlockEmitter& e, uint32_t r) { EmitSetForm(e, r, Form::Scalar); }
 
@@ -478,9 +558,12 @@ struct LfsCold {
     uint32_t join, imm;
     uint8_t d, ra, rb;
     bool update, indexed;
+    BlockEmitter::GprSnapshot snap;
     void operator()(BlockEmitter& e) const {
         Resolve(e.a, other);
+        e.EmitFlushSnapshot(snap);
         e.CallHelper(&LfsOther, kFrame, edx, static_cast<uint32_t>(d));
+        e.EmitReloadSnapshotVolatile(snap);
         if (update) EmitRebuildEa(e.a, e, ra, imm, indexed, rb);
         JmpTo(e.a, join);
     }
@@ -491,6 +574,7 @@ uint32_t EmitLfs(BlockEmitter& e, const Op& o, bool update, bool indexed, bool z
     EmitEa(e, o, indexed, zeroBase);
     EmitCanonical(e);
     EmitLoadSwapped(a, 4);
+    const BlockEmitter::GprSnapshot snap = e.SnapshotGprs();
     Patch other{};
 #if !MKW_FAST_FLOAT
     a.mov(esi, edx);
@@ -508,9 +592,11 @@ uint32_t EmitLfs(BlockEmitter& e, const Op& o, bool update, bool indexed, bool z
     a.movq(e.Fpr(o.d), xmm0);
     EmitSetScalarForm(e, o.d);
     const uint32_t join = Here(a);
-    if (update) a.mov(e.Gpr(o.a), eax);
+    if (update) a.mov(e.WriteGpr(o.a), eax);
 #if !MKW_FAST_FLOAT
-    e.Cold(LfsCold{other, join, o.imm, o.d, o.a, o.b, update, indexed});
+    e.Cold(LfsCold{other, join, o.imm, o.d, o.a, o.b, update, indexed, snap});
+#else
+    (void)snap;
 #endif
     return 1;
 }
@@ -522,7 +608,7 @@ uint32_t EmitLfd(BlockEmitter& e, const Op& o, bool update, bool indexed = false
     EmitLoadSwapped(a, 8);  // FlatReadFloat64 under lean memory is FlatLoad<uint64_t>
     a.mov(e.Fpr(o.d), rdx);
     EmitSetScalarForm(e, o.d);
-    if (update) a.mov(e.Gpr(o.a), eax);
+    if (update) a.mov(e.WriteGpr(o.a), eax);
     return 1;
 }
 
@@ -533,24 +619,31 @@ struct StfCold {
     uint32_t haveValue, haveBits, join, pcIndex, imm;
     uint8_t d, ra, rb, width;
     bool update, hasSubnormal, indexed, havePaired;
+    BlockEmitter::GprSnapshot snap;
     void operator()(BlockEmitter& e) const {
         Xbyak::CodeGenerator& a = e.a;
         if (havePaired) {
             Resolve(a, paired);
+            e.EmitFlushSnapshot(snap);
             e.CallHelper(&ScalarBits, kFrame, static_cast<uint32_t>(d));
+            e.EmitReloadSnapshotVolatile(snap);
             a.mov(rdx, rax);
             JmpTo(a, haveValue);
         }
         if (hasSubnormal) {
             Resolve(a, subnormal);
+            e.EmitFlushSnapshot(snap);
             e.CallHelper(&SubnormalSingle, rdx);
+            e.EmitReloadSnapshotVolatile(snap);
             a.mov(edx, eax);
             JmpTo(a, haveBits);
         }
         Resolve(a, slow);
+        e.EmitFlushSnapshot(snap);
         e.StorePc(pcIndex);
         e.CallHelper(ShimFor(width), kFrame, eax, rdx);
         EmitPendingCheck(e);
+        e.EmitReloadSnapshotVolatile(snap);
         if (update) EmitRebuildEa(a, e, ra, imm, indexed, rb);
         JmpTo(a, join);
     }
@@ -559,19 +652,34 @@ struct StfCold {
 uint32_t EmitStf(BlockEmitter& e, const Op& o, bool single, bool update, bool indexed, bool zeroBase = false) {
     Xbyak::CodeGenerator& a = e.a;
     StfCold cold{};
-    a.mov(rdx, e.Fpr(o.d));
+    const auto prewarmEa = [&]() {
+        if (!zeroBase) {
+            if (e.WantCacheGpr(o.a)) (void)e.ReadGpr(o.a);
+            if (indexed && e.WantCacheGpr(o.b)) (void)e.ReadGpr(o.b, 1u << o.a);
+        } else if (indexed && e.WantCacheGpr(o.b)) {
+            (void)e.ReadGpr(o.b);
+        }
+    };
     const Form known = e.KnownForm(e.index, o.d);
-    if (known == Form::Scalar) {  // no test: the register holds a double
-        BlockEmitter::NoteForm(BlockEmitter::FormEvent::TestSkipped);
-    } else if (known == Form::Paired) {  // no test: ps0 widened, in line
+    if (known == Form::Paired) {  // no test: ps0 widened, in line
         BlockEmitter::NoteForm(BlockEmitter::FormEvent::ConversionForced);
+        e.FlushVolatileGprs();
         e.CallHelper(&ScalarBits, kFrame, static_cast<uint32_t>(o.d));
         a.mov(rdx, rax);
+        prewarmEa();
+        cold.snap = e.SnapshotGprs();
     } else {
-        BlockEmitter::NoteForm(BlockEmitter::FormEvent::TestEmitted);
-        a.cmp(e.Form(o.d), static_cast<uint32_t>(Form::Paired));
-        cold.paired = EmitJcc(a, kE);
-        cold.havePaired = true;
+        prewarmEa();
+        cold.snap = e.SnapshotGprs();
+        a.mov(rdx, e.Fpr(o.d));
+        if (known == Form::Scalar) {  // no test: the register holds a double
+            BlockEmitter::NoteForm(BlockEmitter::FormEvent::TestSkipped);
+        } else {
+            BlockEmitter::NoteForm(BlockEmitter::FormEvent::TestEmitted);
+            a.test(e.PairedMask(), 1u << (o.d & 31u));
+            cold.paired = EmitJcc(a, kNe);
+            cold.havePaired = true;
+        }
     }
     cold.haveValue = Here(a);
     if (single) {
@@ -601,7 +709,7 @@ uint32_t EmitStf(BlockEmitter& e, const Op& o, bool single, bool update, bool in
     cold.width = single ? 4 : 8;
     cold.slow = EmitStoreChecked(e, cold.width);
     cold.join = Here(a);
-    if (update) a.mov(e.Gpr(o.a), eax);
+    if (update) a.mov(e.WriteGpr(o.a), eax);
     cold.pcIndex = e.index;
     cold.imm = o.imm;
     cold.d = o.d;
@@ -621,19 +729,24 @@ struct PsqLCold {
     uint32_t join, pcIndex, imm;
     uint8_t d, b, ra;
     bool update, hasQuiet;
+    BlockEmitter::GprSnapshot snap;
     void operator()(BlockEmitter& e) const {
         Xbyak::CodeGenerator& a = e.a;
         if (hasQuiet) {
             Resolve(a, quiet0);
             Resolve(a, quiet1);
+            e.EmitFlushSnapshot(snap);
             e.CallHelper(&PsqPairQuieted, kFrame, rdx, static_cast<uint32_t>(d));
+            e.EmitReloadSnapshotVolatile(snap);
             if (update) EmitRebuildEa(a, e, ra, imm);
             JmpTo(a, join);
         }
         Resolve(a, generic);
+        e.EmitFlushSnapshot(snap);
         e.StorePc(pcIndex);
         e.CallHelper(&PsqLoad, kFrame, eax, static_cast<uint32_t>(d) | (static_cast<uint32_t>(b) << 8));
         EmitPendingCheck(e);
+        e.EmitReloadSnapshotVolatile(snap);
         if (update) EmitRebuildEa(a, e, ra, imm);
         JmpTo(a, join);
     }
@@ -644,6 +757,7 @@ uint32_t EmitPsqL(BlockEmitter& e, const Op& o, bool update) {
     const uint32_t w = o.b >> 3, i = o.b & 7u;
     PsqLCold cold{};
     EmitEa(e, o, false);
+    cold.snap = e.SnapshotGprs();
     if (w == 0) a.test(e.Gqr(i), 0xFFFF0000u);  // type 0 and load scale 0
     else a.test(e.Gqr(i), 0x00070000u);         // type 0
     cold.generic = EmitJcc(a, kNe);
@@ -673,7 +787,7 @@ uint32_t EmitPsqL(BlockEmitter& e, const Op& o, bool update) {
     a.mov(e.Fpr(o.d), rdx);
     EmitSetForm(e, o.d, Form::Paired);
     cold.join = Here(a);
-    if (update) a.mov(e.Gpr(o.a), eax);
+    if (update) a.mov(e.WriteGpr(o.a), eax);
     cold.pcIndex = e.index;
     cold.imm = o.imm;
     cold.d = o.d;
@@ -692,12 +806,15 @@ struct PsqStCold {
     uint32_t join, pcIndex, imm;
     uint8_t d, b, ra;
     bool update;
+    BlockEmitter::GprSnapshot snap;
     void operator()(BlockEmitter& e) const {
         Xbyak::CodeGenerator& a = e.a;
         generic.Resolve(a);
+        e.EmitFlushSnapshot(snap);
         e.StorePc(pcIndex);
         e.CallHelper(&PsqStore, kFrame, eax, static_cast<uint32_t>(d) | (static_cast<uint32_t>(b) << 8));
         EmitPendingCheck(e);
+        e.EmitReloadSnapshotVolatile(snap);
         if (update) EmitRebuildEa(a, e, ra, imm);
         JmpTo(a, join);
     }
@@ -706,33 +823,26 @@ struct PsqStCold {
 uint32_t EmitPsqSt(BlockEmitter& e, const Op& o, bool update) {
     Xbyak::CodeGenerator& a = e.a;
     const uint32_t w = o.b >> 3, i = o.b & 7u;
-    const uint32_t packed = static_cast<uint32_t>(o.d) | (static_cast<uint32_t>(o.b) << 8);
     EmitEa(e, o, false);
-    if (w != 0) {  // a single store: PPC_PsqSt's own conversion, always in the shim
-        e.StorePc(e.index);
-        e.CallHelper(&PsqStore, kFrame, eax, packed);
-        EmitPendingCheck(e);
-        if (update) {
-            EmitRebuildEa(a, e, o.a, o.imm);
-            a.mov(e.Gpr(o.a), eax);
-        }
-        return 1;
-    }
     PsqStCold cold{};
-    a.test(e.Gqr(i), 0x0000FFFFu);
+    cold.snap = e.SnapshotGprs();
+    if (w == 0) a.test(e.Gqr(i), 0x0000FFFFu);  // paired float: store type 0 and store scale 0
+    else a.test(e.Gqr(i), 0x00000007u);         // single float: store type 0 (ignores store scale)
     cold.generic.Add(EmitJcc(a, kNe));
     if (e.KnownForm(e.index, o.d) == Form::Paired) {
         BlockEmitter::NoteForm(BlockEmitter::FormEvent::TestSkipped);
     } else {
         BlockEmitter::NoteForm(BlockEmitter::FormEvent::TestEmitted);
-        a.cmp(e.Form(o.d), static_cast<uint32_t>(Form::Scalar));
+        a.test(e.PairedMask(), 1u << (o.d & 31u));
         cold.generic.Add(EmitJcc(a, kE));
     }
-    a.mov(rdx, e.Fpr(o.d));
+    if (w == 0) a.mov(rdx, e.Fpr(o.d));
+    else a.mov(edx, e.FprWord(o.d, 1));  // ps0 sits in the high word of the paired FPR
 #if !MKW_FAST_FLOAT
     // The store keeps a lane unless it is a subnormal (flushed to a signed zero) or a NaN (quieted): those, and only
     // those, are the shim's. Per lane, m = bits & 0x7FFFFFFF: a normal, an infinity or a zero is kept as it is.
-    for (int lane = 0; lane < 2; ++lane) {
+    const int lanes = w == 0 ? 2 : 1;
+    for (int lane = 0; lane < lanes; ++lane) {
         Xbyak::Label keep;
         if (lane == 0) {
             a.mov(esi, edx);
@@ -750,30 +860,34 @@ uint32_t EmitPsqSt(BlockEmitter& e, const Op& o, bool update) {
     }
 #endif
     EmitCanonical(e);
-    // both ends of the 8 bytes: a pair can straddle two chunks (LeanStoreNeedsPolicy(addr) and (addr + 7))
-    a.mov(esi, ecx);
-    a.shr(esi, MemoryInline::kLeanPolicyShift);
-    a.cmp(a.byte[kLean + rsi + kPolicyDisp], 0);
-    cold.generic.Add(EmitJcc(a, kNe));
-    a.lea(edi, a.ptr[rax + 7]);
-    a.and_(edi, kMask);
-    a.shr(edi, MemoryInline::kLeanPolicyShift);
-    a.cmp(a.byte[kLean + rdi + kPolicyDisp], 0);
-    cold.generic.Add(EmitJcc(a, kNe));
+    if (w == 0) {
+        // both ends of the 8 bytes: a pair can straddle two chunks (LeanStoreNeedsPolicy(addr) and (addr + 7))
+        a.mov(esi, ecx);
+        a.shr(esi, MemoryInline::kLeanPolicyShift);
+        a.cmp(a.byte[kLean + rsi + kPolicyDisp], 0);
+        cold.generic.Add(EmitJcc(a, kNe));
+        a.lea(edi, a.ptr[rax + 7]);
+        a.and_(edi, kMask);
+        a.shr(edi, MemoryInline::kLeanPolicyShift);
+        a.cmp(a.byte[kLean + rdi + kPolicyDisp], 0);
+        cold.generic.Add(EmitJcc(a, kNe));
 #if MKW_LEAN_DIRTY_MARKS
-    a.mov(esi, ecx);
-    a.shr(esi, 6);
-    a.mov(a.word[kLean + rsi + kDirtyDisp], 0x0101);
+        a.mov(esi, ecx);
+        a.shr(esi, 6);
+        a.mov(a.word[kLean + rsi + kDirtyDisp], 0x0101);
 #endif
-    // the packed register byte-swapped: ps0 (the high word) lands at the lower address, big-endian
+        // the packed register byte-swapped: ps0 (the high word) lands at the lower address, big-endian
 #if defined(__MOVBE__)
-    a.movbe(a.qword[kLean + rcx], rdx);
+        a.movbe(a.qword[kLean + rcx], rdx);
 #else
-    a.bswap(rdx);
-    a.mov(a.qword[kLean + rcx], rdx);
+        a.bswap(rdx);
+        a.mov(a.qword[kLean + rcx], rdx);
 #endif
+    } else {
+        cold.generic.Add(EmitStoreChecked(e, 4));
+    }
     cold.join = Here(a);
-    if (update) a.mov(e.Gpr(o.a), eax);
+    if (update) a.mov(e.WriteGpr(o.a), eax);
     cold.pcIndex = e.index;
     cold.imm = o.imm;
     cold.d = o.d;

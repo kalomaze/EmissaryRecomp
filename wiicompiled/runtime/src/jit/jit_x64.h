@@ -56,6 +56,13 @@ inline constexpr bool kWin64 = true;
 inline constexpr bool kWin64 = false;
 #endif
 
+// Direct calls from JIT blocks into lean AOT functions (unwound via per-chunk .eh_frame FDEs on Linux x86-64).
+#if defined(__linux__) && defined(__x86_64__)
+inline constexpr bool kDirectCalls = true;
+#else
+inline constexpr bool kDirectCalls = false;
+#endif
+
 // Integer argument registers of the host's C calling convention (SysV: rdi, rsi, rdx, rcx, r8, r9; Win64: rcx, rdx, r8,
 // r9). CallHelper takes at most kMaxCallArgs arguments, the number both ABIs pass in registers.
 inline constexpr unsigned kMaxCallArgs = 4;
@@ -163,7 +170,8 @@ public:
     Xbyak::Address Gqr(uint32_t i) const;      // dword
     Xbyak::Address Fpr(uint32_t r) const;      // qword: the register's 64 raw bits (CpuContext form: ps0 as a double or paired)
     Xbyak::Address FprWord(uint32_t r, uint32_t half) const;  // dword; half 0: the low word (ps1), 1: the high word (ps0)
-    Xbyak::Address Form(uint32_t r) const;     // byte: Frame::form[r] (Form::Unknown 0, Scalar 1, Paired 2)
+    Xbyak::Address PairedMask() const;         // dword: Frame::pairedMask (bit r = 1 iff fpr[r] is Paired)
+    Xbyak::Address FrameFlags() const;         // dword: Frame::flags (kFrameFlag*)
     Xbyak::Address Executed() const;           // qword: Frame::executed
     // The same registers' addresses by host offset into CpuContext, for state this list lacks (offsetof(CpuContext, ...)).
     Xbyak::Address CtxField(size_t offset) const;
@@ -218,6 +226,8 @@ public:
     // the caller has set (xmm0 and xmm1 are the first two on both ABIs; on Win64 float arguments share positions with the
     // integer ones, so a helper that takes (double, uint32_t) has the integer in rdx there and rsi on SysV).
     void CallRaw(const void* fn);
+    // Calls the shared JIT->patched-JIT subcall trampoline (eax = target, rdx = const JitCallTarget*). Linux x86-64 only.
+    void CallSubCall();
 
     // Op `index` as a call to the interpreter's handler and the handling of its answer (go on, or leave the block); the
     // number of ops it ran (2 for a fused pair). Used by the core for every op without native code.
@@ -292,6 +302,32 @@ public:
     // after the code), the newest first; `NewCell` makes room for all of them.
     void CellProbe(Xbyak::Label& cell, const Xbyak::Label& miss);
 
+    // --- intra-block GPR cache (ebp, r8d, r9d, r10d, r11d) -------------------------------------------------------------
+    // Caches hot guest GPRs in 5 host registers within a block (ebp is callee-saved, r8d-r11d are volatile).
+    // Flushed before calls, exits, and non-cache-aware ops; preserved across conditional branches' fall-through path
+    // (dirty slots are flushed on the cold taken path).
+    static constexpr uint32_t kGprCacheSlots = 5;
+    struct GprSnapshot {
+        int8_t guest[kGprCacheSlots] = {-1, -1, -1, -1, -1};
+        uint8_t dirtyMask = 0;
+    };
+    static const Xbyak::Reg32& GprCacheReg(uint32_t slot);
+    static const Xbyak::Reg64& GprCacheReg64(uint32_t slot);
+    int FindCachedGpr(uint32_t r) const;
+    bool GprReadLater(uint32_t r) const { return !inCold_ && ((gprReadLater_[index] >> r) & 1u) != 0; }
+    bool WantCacheGpr(uint32_t r) const { return FindCachedGpr(r) >= 0 || GprReadLater(r); }
+    const Xbyak::Reg32& ReadGpr(uint32_t r, uint32_t pinMask = 0);
+    const Xbyak::Reg32& WriteGpr(uint32_t r, uint32_t pinMask = 0);
+    const Xbyak::Reg32& ModifyGpr(uint32_t r, uint32_t pinMask = 0);
+    void DropGpr(uint32_t r);
+    void FlushGpr(uint32_t r);
+    void FlushDirtyGprs();
+    void FlushVolatileGprs();
+    void FlushAllGprs();
+    GprSnapshot SnapshotGprs() const;
+    void EmitFlushSnapshot(const GprSnapshot& snap);
+    void EmitReloadSnapshotVolatile(const GprSnapshot& snap);
+
     // --- cold code ----------------------------------------------------------------------------------------------------
     // A label owned by the emitter (valid until the block is done); jump to it from the main path, define it in Cold code.
     Xbyak::Label& NewLabel();
@@ -299,7 +335,7 @@ public:
     // does not fall through its end (it ends in a jump or an Exit*, usually back to a label of the main path). fn must be
     // trivially copyable and at most kColdBytes: capture labels from NewLabel by reference, other values by copy. It runs
     // after the whole block is emitted (so what it captures must outlive the call that registered it: never a local's address).
-    static constexpr size_t kColdBytes = 56;
+    static constexpr size_t kColdBytes = 72;
     template <typename F>
     void Cold(const F& fn) {
         static_assert(sizeof(F) <= kColdBytes && std::is_trivially_copyable_v<F> && alignof(F) <= 8,
@@ -333,14 +369,29 @@ private:
     };
     struct Exit {
         uint32_t pc;
+        uint32_t patchOffset;  // offset of 5-byte `jmp rel32` in block buffer, or kNoPatch for indirect
         Xbyak::Label stub;
+        Xbyak::Label far;      // `jmp [rip + slot]` fallback when target lies outside ±2 GiB
         Xbyak::Label slot;
+        static constexpr uint32_t kNoPatch = ~0u;
     };
     ColdItem& NewCold();
     void CallHelperImpl(const void* fn, std::initializer_list<CallArg> args);
     void AnalyseCr();
     void AnalyseForms();
+    void AnalyseGprUses();
     Xbyak::Label staleCell_, plainStale_;
+    struct GprSlot {
+        int8_t guest = -1;
+        bool dirty = false;
+        uint32_t lastUse = 0;
+    };
+    uint32_t AllocGprSlot(uint32_t pinMask);
+
+    GprSlot gprSlots_[kGprCacheSlots];
+    uint32_t gprReadLater_[kMaxBlock + 1] = {};
+    uint32_t gprTick_ = 0;
+    bool inCold_ = false;
     void* owner_ = nullptr;
     bool staleStub_ = false;
     void EmitValidityTest(const Xbyak::Label& fail, bool shortJump);
@@ -379,8 +430,8 @@ namespace PpcInterpreter::detail {
 // slot's unlinked stub (exits Continue to the slot's pc, handing the dispatcher the slot's address) until link() aims it
 // at a block's checked entry.
 struct JitLink {
-    const void* target;    // read by the block's `jmp [slot]`: first member
-    const void* unlinked;  // the slot's own stub: what target is reset to
+    const void* target;    // read by `jmp [slot]` (indirect / far / inline cache): first member
+    const void* unlinked;  // the slot's own stub: what target and patchSite are reset to
     JitLink* next;         // the list of slots aimed at one block (Block::jitIncoming)
     JitLink** prev;        // the pointer that points at this slot (the block's head or the previous slot's next)
     Block* to;             // the block target aims at, or null
@@ -388,6 +439,8 @@ struct JitLink {
     // in the first entry of a cache, the number of entries of the table (0 in an ordinary slot and the other entries).
     uint32_t key;
     uint32_t group;
+    uint8_t* patchSite;    // for direct static exits: address of 5-byte `jmp rel32` (0xE9); null for indirect/cache
+    const void* farTramp;  // for direct static exits: `jmp [rip + slot]` fallback when target is outside ±2 GiB
     static constexpr uint32_t kNoKey = 1;  // no guest pc equals it (pcs are word aligned)
 };
 

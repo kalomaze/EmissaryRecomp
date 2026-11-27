@@ -204,7 +204,7 @@ const Kind kKinds[] = {
     {"stfdx", W(X(d, 30, 26, 727)), kD, DForm::N, false, true},
     {"stfiwx", W(X(d, 30, 25, 983)), 0, DForm::N, false, true},
     {"psq_st", W(Psq(60, d, 30, 0, 0, 0x70)), kD, DForm::N, true, true},
-    {"psq_st w1", W(Psq(60, d, 30, 1, 0, 0x78)), 0, DForm::N, false, true},
+    {"psq_st w1", W(Psq(60, d, 30, 1, 0, 0x78)), kD, DForm::N, true, true},
 };
 // clang-format on
 constexpr unsigned kKindCount = sizeof kKinds / sizeof *kKinds;

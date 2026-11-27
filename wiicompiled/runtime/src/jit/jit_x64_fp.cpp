@@ -202,8 +202,8 @@ void LoadScalar(BlockEmitter& e, K kind, const Xbyak::Xmm& x, uint32_t r, unsign
         return;
     }
     BlockEmitter::NoteForm(FormEvent::TestEmitted);
-    a.cmp(e.Form(r), kFormPaired);
-    a.jne(skip, Xbyak::CodeGenerator::T_SHORT);
+    a.test(e.PairedMask(), 1u << (r & 31u));
+    a.jz(skip, Xbyak::CodeGenerator::T_SHORT);
     Count(e, kind, slot);
     a.psrlq(x, 32);
     a.cvtss2sd(x, x);
@@ -228,22 +228,24 @@ void LoadPaired(BlockEmitter& e, K kind, const Xbyak::Xmm& x, uint32_t r, unsign
         return;
     }
     BlockEmitter::NoteForm(FormEvent::TestEmitted);
-    a.cmp(e.Form(r), kFormScalar);
-    a.jne(skip, Xbyak::CodeGenerator::T_SHORT);
+    a.test(e.PairedMask(), 1u << (r & 31u));
+    a.jnz(skip, Xbyak::CodeGenerator::T_SHORT);
     Count(e, kind, slot);
     a.cvtsd2ss(x, x);
     a.shufps(x, x, 0);
     a.L(skip);
 }
 
-// Form byte of d := form, unless the byte is known to hold it already.
+// Form bit of d := form, unless the bit is known to hold it already.
 void WriteForm(BlockEmitter& e, uint32_t d, uint8_t form) {
     if (static_cast<uint8_t>(Known(e, d)) == form) {
         BlockEmitter::NoteForm(FormEvent::WriteSkipped);
         return;
     }
     BlockEmitter::NoteForm(FormEvent::WriteEmitted);
-    e.a.mov(e.Form(d), form);
+    const uint32_t bit = 1u << (d & 31u);
+    if (form == kFormPaired) e.a.or_(e.PairedMask(), bit);
+    else e.a.and_(e.PairedMask(), ~bit);
 }
 
 void StoreScalar(BlockEmitter& e, uint32_t d, const Xbyak::Xmm& x) {
@@ -502,9 +504,10 @@ uint32_t EmitFp(BlockEmitter& e, uint32_t index) {
     auto& a = e.a;
     const K k = o.kind;
     switch (k) {
-    case K::Fmr: {  // the raw bits and the source's form, as RunOp copies both
+    case K::Fmr:
+    case K::PsMr: {  // copies the raw bits and the source's form (every register is Scalar or Paired at run time)
         const Form known = Known(e, o.b);
-        if (o.d == o.b) {  // copies a register onto itself
+        if (o.d == o.b) {
             Count(e, k, kSlotDone);
             return 1;
         }
@@ -513,30 +516,14 @@ uint32_t EmitFp(BlockEmitter& e, uint32_t index) {
         if (known != Form::Unknown) {
             WriteForm(e, o.d, static_cast<uint8_t>(known));
         } else {
-            a.mov(cl, e.Form(o.b));
-            a.mov(e.Form(o.d), cl);
+            a.mov(ecx, e.PairedMask());
+            a.bt(ecx, static_cast<uint8_t>(o.b & 31u));
+            a.sbb(edx, edx);
+            a.xor_(edx, ecx);
+            a.and_(edx, 1u << (o.d & 31u));
+            a.xor_(ecx, edx);
+            a.mov(e.PairedMask(), ecx);
         }
-        Count(e, k, kSlotDone);
-        return 1;
-    }
-    case K::PsMr: {  // Scalar when the source is, Paired otherwise (Unknown included)
-        const Form known = Known(e, o.b);
-        if (known != Form::Unknown) {
-            if (o.d != o.b) {
-                a.mov(rax, e.Fpr(o.b));
-                a.mov(e.Fpr(o.d), rax);
-                WriteForm(e, o.d, static_cast<uint8_t>(known));
-            }
-            Count(e, k, kSlotDone);
-            return 1;
-        }
-        a.mov(rax, e.Fpr(o.b));
-        a.movzx(ecx, e.Form(o.b));
-        a.mov(edx, kFormPaired);
-        a.cmp(ecx, kFormScalar);
-        a.cmove(edx, ecx);
-        a.mov(e.Fpr(o.d), rax);
-        a.mov(e.Form(o.d), dl);
         Count(e, k, kSlotDone);
         return 1;
     }
@@ -548,8 +535,8 @@ uint32_t EmitFp(BlockEmitter& e, uint32_t index) {
         if (known != Form::Scalar) {
             if (known == Form::Unknown) {
                 BlockEmitter::NoteForm(FormEvent::TestEmitted);
-                a.cmp(e.Form(o.b), kFormPaired);
-                a.jne(skip, Xbyak::CodeGenerator::T_SHORT);
+                a.test(e.PairedMask(), 1u << (o.b & 31u));
+                a.jz(skip, Xbyak::CodeGenerator::T_SHORT);
             } else {
                 BlockEmitter::NoteForm(FormEvent::ConversionForced);
             }

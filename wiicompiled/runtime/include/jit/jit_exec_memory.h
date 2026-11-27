@@ -61,6 +61,8 @@ public:
     size_t BytesUsed() const { return used_; }
     // Bytes mapped in all chunks.
     size_t BytesReserved() const { return reserved_; }
+    // The underlying executable chunks, in allocation order (append-only until Reset).
+    const std::vector<Region>& Chunks() const { return chunks_; }
 
     // Frees every chunk; every pointer handed out is invalid afterwards.
     void Reset();
