@@ -86,22 +86,30 @@ MKW_CRV_INLINE int64_t PpcCrvWithBit(int64_t v, uint32_t bit, bool set) noexcept
     return PpcCrvFromNibble(set ? (nibble | mask) : (nibble & ~mask));
 }
 
-// A compare's value with SO set: XER[SO] copied into the field. Out of line and cold: translated code never sets
-// XER[SO], so this keeps each compare's never-taken path to one call.
+// A field value with SO set: XER[SO] copied into the field.
 [[gnu::cold, gnu::noinline]] inline int64_t PpcCrvWithSo(int64_t v) noexcept { return PpcCrvFromNibble(PpcCrvNibble(v) | 1u); }
+
+// PpcCrvWithSo of a 32-bit compare's value v (in (-2^32, 2^32), so bits 32-63 are equal and SO is clear): flipping bit
+// 59 sets SO and keeps LT, GT and EQ, except for v == 0, whose GT would appear; EQ with SO is bit 63 (GT clear) and bit
+// 59. A few instructions and no call: the compare's never-taken arm (translated code never sets XER[SO]) then clobbers
+// no register, so it costs the function nothing outside its out-of-line block.
+MKW_CRV_INLINE int64_t PpcCrvCompareWithSo(int64_t v) noexcept {
+    return v == 0 ? static_cast<int64_t>(0x8800000000000000ull) : (v ^ (int64_t{1} << 59));
+}
+static_assert(0x8800000000000000ull == static_cast<uint64_t>(PpcCrvEncode(0x3u)), "EQ|SO encoding");
 
 // cmp/cmpi/cmpl/cmpli and the record forms (a result against 0): the field value, SO from XER[SO].
 // XER[SO] is never set by translated code (MKW_LEAN_FLAGS), so its copy is a branch that is never taken.
 MKW_CRV_INLINE int64_t PpcCrvCompare(int32_t a, int32_t b, uint32_t xer) noexcept {
     const int64_t v = static_cast<int64_t>(a) - static_cast<int64_t>(b);
     if (!MKW_LEAN_FLAGS && (xer & 0x80000000u) != 0) [[unlikely]]
-        return PpcCrvWithSo(v);
+        return PpcCrvCompareWithSo(v);
     return v;
 }
 MKW_CRV_INLINE int64_t PpcCrvCompare(uint32_t a, uint32_t b, uint32_t xer) noexcept {
     const int64_t v = static_cast<int64_t>(static_cast<uint64_t>(a) - static_cast<uint64_t>(b));
     if (!MKW_LEAN_FLAGS && (xer & 0x80000000u) != 0) [[unlikely]]
-        return PpcCrvWithSo(v);
+        return PpcCrvCompareWithSo(v);
     return v;
 }
 

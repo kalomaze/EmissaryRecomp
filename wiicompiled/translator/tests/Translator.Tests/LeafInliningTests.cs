@@ -164,7 +164,7 @@ public class LeafInliningTests
         // With inlining the compare writes the caller's resident CR directly and
         // the branch reads it with no context round trip at all.
         Assert.Contains(
-            "crv0 = PpcCrvCompare(static_cast<int32_t>(r4), static_cast<int32_t>(0), xer);",
+            "crv0 = PpcCrvCompare(static_cast<int32_t>(r4), static_cast<int32_t>(0), ctx->xer);",
             inlined.CxxCode, StringComparison.Ordinal);
         Assert.Equal(1, CountOccurrences(inlined.CxxCode, "crv0 = ctx->crv[0];"));
     }

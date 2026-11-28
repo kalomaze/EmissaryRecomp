@@ -421,7 +421,7 @@ public class FlagElisionCodeGenTests
     }
 
     [Fact]
-    public void XerBecomesAResidentLocal()
+    public void CompareReadsXerFromContextWhenTheBodyNeverWritesIt()
     {
         var function = new IrFunction("resident_xer", "entry", new[]
         {
@@ -434,10 +434,9 @@ public class FlagElisionCodeGenTests
 
         var code = Emit(function);
 
-        Assert.Contains("uint32_t xer = ctx->xer;", code, StringComparison.Ordinal);
         Assert.Contains("crv0 = PpcCrvCompare(", code, StringComparison.Ordinal);
-        Assert.Contains(", xer);", code, StringComparison.Ordinal);
-        Assert.DoesNotContain(", ctx->xer);", code, StringComparison.Ordinal);
+        Assert.Contains(", ctx->xer);", code, StringComparison.Ordinal);
+        Assert.DoesNotContain(", xer);", code, StringComparison.Ordinal);
     }
 
     [Fact]

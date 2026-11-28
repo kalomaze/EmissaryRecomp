@@ -212,6 +212,18 @@ public sealed partial class CxxLinearCodeGenerator
             return XerLocal;
         }
 
+        /// <summary>
+        /// XER as an integer compare's summary-overflow source. A body that never writes XER reads CpuContext's copy
+        /// at the compare: the copy is current there (only a callee can change it, and every call is a boundary the
+        /// compiler cannot move the load across), and the compiler is free to re-load it after calls instead of
+        /// keeping the never-set bit live in a callee-saved register for the whole body.
+        /// </summary>
+        public string XerForCompare()
+        {
+            if (_recording || _writesXer) return Xer(written: false);
+            return "ctx->xer";
+        }
+
         private void Track(SortedSet<int> referenced, SortedSet<int> written, int index, bool isWrite, string prefix)
         {
             if (_recording)

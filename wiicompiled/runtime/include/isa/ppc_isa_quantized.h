@@ -1767,7 +1767,7 @@ if constexpr (W == 0u) PpcStorePairPsqQuantizedStackInline<int16_t>(addr, value,
 // resolvedHost; the null case keeps its original PPC_PsqL behaviour in the
 // force-inlined wrapper below.
 template <uint32_t W, uint32_t I>
-MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline double PPC_PsqLResolvedGeneric(
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_COLD_OP_CC inline double PPC_PsqLResolvedGeneric(
     uint32_t gqr, uint8_t* resolvedHost, uint32_t offset, uint32_t addr)
 {
     if constexpr (W == 0u) {
@@ -1815,7 +1815,7 @@ MKW_PPC_FORCE_INLINE double PPC_PsqLResolvedInline(CpuContext* cpu, uint8_t* res
 }
 
 template <uint32_t W, uint32_t I, uint32_t GQR>
-MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline double PPC_PsqLKnownResolvedFallback(
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_COLD_OP_CC inline double PPC_PsqLKnownResolvedFallback(
     uint32_t addr)
 {
     return PPC_PsqLKnownInline<W, I, GQR>(nullptr, addr);
@@ -1865,7 +1865,7 @@ if constexpr (W == 0u) return PpcLoadPairPsqIntegerResolvedInline<int16_t>(resol
 // resolvedHost; the null case keeps its original PPC_PsqSt behaviour in the
 // force-inlined wrapper below.
 template <uint32_t W, uint32_t I>
-MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline void PPC_PsqStResolvedGeneric(
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_COLD_OP_CC inline void PPC_PsqStResolvedGeneric(
     uint32_t gqr, uint8_t* resolvedHost, uint32_t offset, uint32_t addr, double value)
 {
     if constexpr (W == 0u) {
@@ -1979,7 +1979,7 @@ MKW_PPC_FORCE_INLINE void PPC_PsqStScalarSegmentInline(CpuContext* cpu, uint8_t*
 }
 
 template <uint32_t W, uint32_t I, uint32_t GQR>
-MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline void PPC_PsqStKnownResolvedFallback(
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_COLD_OP_CC inline void PPC_PsqStKnownResolvedFallback(
     uint32_t addr, double value)
 {
     PPC_PsqStKnownInline<W, I, GQR>(nullptr, addr, value);

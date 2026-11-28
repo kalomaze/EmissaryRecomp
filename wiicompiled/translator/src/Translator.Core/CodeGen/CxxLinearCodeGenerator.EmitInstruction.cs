@@ -747,7 +747,7 @@ public sealed partial class CxxLinearCodeGenerator
                         var rightCast = setCr.IsUnsigned
                             ? $"static_cast<uint32_t>({rightExpr})"
                             : $"static_cast<int32_t>({rightExpr})";
-                        var xer = _activeResidency is null ? "ctx->xer" : _activeResidency.Xer(written: false);
+                        var xer = _activeResidency is null ? "ctx->xer" : _activeResidency.XerForCompare();
                         sb.AppendLine($"{pad}{crField} = PpcCrvCompare({leftCast}, {rightCast}, {xer});");
                     }
                 }
