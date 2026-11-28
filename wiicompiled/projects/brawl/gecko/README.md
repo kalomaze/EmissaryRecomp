@@ -9,7 +9,10 @@ The translated entry runs a native body, runtime/src/hle/gecko_handler.cpp: the 
 registers (and stack frame), with stores of a value already in memory skipped and string writes / memory copies that
 would change nothing compared once instead of looped. A mod's list is walked in full at every hooked frame and almost
 all of its writes are such stores (Project+: ~2,900 codes and ~3,900 stores per pass). Code types Project+ does not use
-continue in the interpreter from the handler's own instruction. The wrapper keeps its guest code guard, so a change
+continue in the interpreter from the handler's own instruction. Runs of codes whose effects depend only on the list itself (writes, strings, hooks,
+skipped codes) are recorded once and replayed from a compare of what they wrote, skipped on rollback-tracked memory
+whose dirty marks stayed clear (`BRAWL_GECKO_PLAN=0` walks every code; `tests/gecko_handler_tests.cpp` checks the
+port and the plan against this binary run by the interpreter). The wrapper keeps its guest code guard, so a change
 to these words below sends the handler to the interpreter instead; BRAWL_HLE_GECKO=0 runs the translated body.
 
 Changed words (everything else is byte-identical):

@@ -681,6 +681,23 @@ if(MKW_BUILD_INTERPRETER_TESTS)
         mkw_configure_interpreter_test(mkw_jit_stale_tests)
         add_test(NAME mkw_jit_stale_tests COMMAND mkw_jit_stale_tests)
     endif()
+    # The Gecko code handler's native body (src/hle/gecko_handler.cpp) against the handler binary run by the interpreter,
+    # over hand-written and random code lists, game writes and rollback events; the same with the write plan's
+    # self-check on.
+    if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/gecko_handler_tests.cpp")
+        add_executable(mkw_gecko_handler_tests tests/gecko_handler_tests.cpp src/hle/gecko_handler.cpp)
+        mkw_configure_interpreter_test(mkw_gecko_handler_tests)
+        target_include_directories(mkw_gecko_handler_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/hle")
+        target_compile_definitions(mkw_gecko_handler_tests PRIVATE
+            "GECKO_TEST_HANDLER_BIN=\"${CMAKE_CURRENT_LIST_DIR}/../projects/brawl/gecko/codehandler.bin\"")
+        target_link_libraries(mkw_gecko_handler_tests PRIVATE Threads::Threads)
+        add_test(NAME mkw_gecko_handler_tests COMMAND mkw_gecko_handler_tests)
+        add_test(NAME mkw_gecko_handler_verify_tests COMMAND mkw_gecko_handler_tests)
+        set_tests_properties(mkw_gecko_handler_verify_tests PROPERTIES ENVIRONMENT "BRAWL_GECKO_PLAN_VERIFY=1")
+        add_test(NAME mkw_gecko_handler_inject_tests COMMAND mkw_gecko_handler_tests)
+        set_tests_properties(mkw_gecko_handler_inject_tests PROPERTIES ENVIRONMENT "GECKO_TEST_INJECT=1" WILL_FAIL TRUE)
+        set_tests_properties(mkw_gecko_handler_tests mkw_gecko_handler_verify_tests PROPERTIES TIMEOUT 300)
+    endif()
     if(MKW_JIT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/jit_quality_tests.cpp")
         add_test(NAME mkw_jit_quality_bookkeeping_tests COMMAND mkw_jit_quality_tests)
         set_tests_properties(mkw_jit_quality_bookkeeping_tests PROPERTIES

@@ -38,11 +38,19 @@ inline void MarksCleared() { markEpoch.fetch_add(1, std::memory_order_acq_rel); 
 inline std::atomic<uint32_t> consumeSeq{0};
 inline void (*consumingMarks)(uint32_t seq) = nullptr;
 inline void (*restoredMarks)(uint32_t seq) = nullptr;
+// A second reader of the tracked pages' marks: the Gecko code handler's write plan (hle/gecko_handler.cpp), which
+// leaves memory it has checked unread for as long as its marks stay clear. It is told before a consume clears marks
+// (to note the set ones) and when a restore is about to rewrite memory without marking it, with or without the
+// interpreter's hooks. Whatever else clears marks or rewrites memory starts a new epoch, which the plan reads itself.
+inline void (*planConsumingMarks)() = nullptr;
+inline void (*planRestoredMarks)() = nullptr;
 inline void MarksConsuming() {
     const uint32_t seq = consumeSeq.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (planConsumingMarks) planConsumingMarks();
     if (consumingMarks) consumingMarks(seq); else MarksCleared();
 }
 inline void MarksRestored(uint32_t snapshotSeq) {
+    if (planRestoredMarks) planRestoredMarks();
     if (restoredMarks) restoredMarks(snapshotSeq); else MarksCleared();
 }
 // Lean memory: the 64 KiB pages (of the 1 GiB canonical window) whose marks rollback's WriteWatch consumes. Nothing
