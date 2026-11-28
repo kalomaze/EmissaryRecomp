@@ -20,9 +20,10 @@
 //  Blr, Bclr: native; the return of the frame's own function normalises f1 and leaves, that of a function called with a host call
 //      normalises f1 and returns with `ret` (the caller drops the return slot), anything else leaves through an inline cache. A compare and the bclr after it
 //      branch on the compare's flags (EmitCompareReturn).
-//  Bctr: the newest target of its cell, an inline cache probe (untranslated targets only ever get in it), the cell's other targets
-//      (translated targets: each with what JitFastCallFor says to call for it, as a tail call), a miss JitTailOpCached, which fills
-//      the cell; the fallback until the registry is published.
+//  Bctr: its two inline ways (direct calls of its common translated targets, JitCallWays; not at a switch's table), the newest target
+//      of its cell, an inline cache probe (untranslated targets only ever get in it), the cell's other targets (translated targets:
+//      each with what JitFastCallFor says to call for it, as a tail call), a miss JitTailOpCached, which fills the cell; the fallback
+//      until the registry is published.
 //  Bctrl: a cell of its own, the same way: a hit calls what the entry says, a miss is JitCallOpCached, which fills the cell; the
 //      interpret-here answer leaves through an inline cache.
 #include "jit_x64.h"
@@ -545,6 +546,32 @@ void EmitSubFrameBl(BlockEmitter& e, uint32_t index, const JitCallTarget& t) {
     });
 }
 
+// The FPRs an fprsOnly record's call keeps in host registers (kThinSaveMagic), in register order; 0 when its mask has none or more
+// than kThinSaveMax (JitDirectFprsCall then).
+unsigned ThinSaveFprs(const JitCallTarget& t, uint8_t* fprs) {
+    const uint32_t mask = t.fprMask & kPpcAllNonvolatileFprMask;
+    if (mask == 0 || static_cast<unsigned>(__builtin_popcount(mask)) > kThinSaveMax) return 0;
+    unsigned n = 0;
+    for (uint32_t m = mask; m != 0; m &= m - 1u) fprs[n++] = static_cast<uint8_t>(__builtin_ctz(m));
+    return n;
+}
+
+// JitDirectFprsCall's work for a record of one to three FPRs, in line (kThinSaveMagic): their raw bits in rbp, r14, r12 across the
+// direct call, stored back after it, then the pinned r14 and r12 set again. As on the fastDirect path, the execution address (a
+// fault report's diagnostic) is not stored and the ambient context is the caller's (compiled code runs under its Run's).
+void EmitThinSaveCall(BlockEmitter& e, const JitCallTarget& t, const uint8_t* fprs, unsigned n) {
+    CodeGenerator& a = e.a;
+    static const Xbyak::Reg64* const regs[kThinSaveMax] = {&rbp, &kEpochCell, &kLean};
+    for (unsigned k = 0; k < n; ++k) a.mov(*regs[k], e.Fpr(fprs[k]));
+    a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
+    e.CallRaw(reinterpret_cast<const void*>(t.entry));
+    const uint32_t d = ThinSaveDescriptor(fprs, n);  // nop dword [rax + rax + d]: what the personality routine reads
+    a.db(0x0F), a.db(0x1F), a.db(0x84), a.db(0x00), a.dd(d);
+    for (unsigned k = 0; k < n; ++k) a.mov(e.Fpr(fprs[k]), *regs[k]);
+    if (n > 1) a.mov(kEpochCell, reinterpret_cast<uint64_t>(&BrawlDirtyMemory::markEpoch));
+    if (n > 2) a.mov(kLean, AbsMem(a, &MemoryInline::g_leanBase, kLean, 64));
+}
+
 // A call to a translated function with a raw dispatch record (`t`), as thin as Call makes it. The caller has stored nothing yet.
 // In the rollback loop frame the call goes through JitCallOp.
 void EmitThinBl(BlockEmitter& e, uint32_t index, const JitCallTarget& t) {
@@ -560,10 +587,19 @@ void EmitThinBl(BlockEmitter& e, uint32_t index, const JitCallTarget& t) {
     a.mov(e.Lr(), pc + 4);
     EmitLoopFrameTest(e, loopFrame);
     EmitStaticArgTest(e, t);
-    if (kDirectCalls && (t.fastDirect || (t.fprsOnly && !t.returnsPaired && !t.special))) {
+    const bool guardedDirect = t.preserveGprs && !t.returnsPaired && !t.special && GuardedDirectOn();
+    if (kDirectCalls && (t.fastDirect || (t.fprsOnly && !t.returnsPaired && !t.special) || guardedDirect)) {
+        uint8_t fprs[kThinSaveMax];
+        const unsigned saves = t.fprsOnly && ThinSavesOn() ? ThinSaveFprs(t, fprs) : 0;
         if (t.fastDirect) {
             a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
             e.CallRaw(reinterpret_cast<const void*>(t.entry));
+        } else if (saves != 0) {
+            EmitThinSaveCall(e, t, fprs, saves);
+        } else if (guardedDirect) {
+            a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
+            a.mov(ArgReg(1), reinterpret_cast<uint64_t>(&t));
+            e.CallRaw(reinterpret_cast<const void*>(&JitDirectGuardedCall));
         } else {
             a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
             a.mov(ArgReg(1), reinterpret_cast<uint64_t>(&t));
@@ -725,6 +761,56 @@ void CellWays(BlockEmitter& e, Xbyak::Label& cell, Xbyak::Label& hit, Xbyak::Lab
     a.jmp(hit, CodeGenerator::T_NEAR);
 }
 
+// The site's inline ways get the cell entry `entry` (JitPatchCallWays; `fill`: only into an empty way 0); nothing once the site's
+// budget is spent. Clobbers every scratch register.
+void PatchWays(BlockEmitter& e, uint32_t site, const Xbyak::Reg64& entry, bool fill) {
+    CodeGenerator& a = e.a;
+    Xbyak::Label spent;
+    a.cmp(a.dword[a.rip + e.WaysRecord(site) + static_cast<int>(offsetof(JitCallWays, budget))], 0);
+    a.je(spent, CodeGenerator::T_NEAR);
+    if (entry.getIdx() != ArgReg(1).getIdx()) a.mov(ArgReg(1), entry);
+    a.lea(ArgReg(0), a.ptr[a.rip + e.WaysRecord(site)]);
+    a.mov(ArgReg(2).cvt32(), fill ? 1 : 0);
+    e.CallRaw(reinterpret_cast<const void*>(&JitPatchCallWays));
+    a.L(spent);
+}
+
+// At a call site's slow hit (rdx: the cell or table entry): every 32nd hit of the entry out of line writes it into the site's inline
+// ways (JitTargetCell::wayHits), then goes on at `call` with rdx and eax as they were. rbp is free at a bctrl or bctr (the GPR cache
+// is flushed before them, and the call sets ebp after this). Clobbers the flags.
+void CountWayHit(BlockEmitter& e, uint32_t site, Xbyak::Label& call) {
+    CodeGenerator& a = e.a;
+    Xbyak::Label& hot = e.NewLabel();
+    a.add(a.byte[rdx + static_cast<int>(offsetof(JitTargetCell, wayHits))], 8);  // carries on the 32nd
+    a.jc(hot, CodeGenerator::T_NEAR);
+    a.L(call);
+    e.Cold([&hot, &call, site](BlockEmitter& c) {
+        c.a.L(hot);
+        c.a.mov(rbp, rdx);
+        PatchWays(c, site, rdx, false);
+        c.a.mov(rdx, rbp);
+        c.a.mov(eax, c.Ctr());
+        c.a.and_(eax, ~3u);
+        c.a.jmp(call, CodeGenerator::T_NEAR);
+    });
+}
+
+// A bctrl's or bctr's probe-order switch (BlockEmitter::EmitOrderSwitch), eax the masked target: once switched, cache 1 is probed
+// out of line first, a hit leaves the block through it, a miss goes on here. Clobbers ecx, rdx and the flags only when switched (as
+// the probes after it do).
+void EmitCacheFirstSwitch(BlockEmitter& e) {
+    if (!e.OrderSwitchRoom()) return;
+    Xbyak::Label& cacheFirst = e.NewLabel();
+    Xbyak::Label& back = e.NewLabel();
+    if (!e.EmitOrderSwitch(cacheFirst)) return;
+    e.a.L(back);
+    e.Cold([&cacheFirst, &back](BlockEmitter& c) {
+        c.a.L(cacheFirst);
+        c.CacheProbe(1);
+        c.a.jmp(back, CodeGenerator::T_NEAR);
+    });
+}
+
 uint32_t EmitBctrl(BlockEmitter& e, uint32_t index) {
     // The registry is fixed once published: before that, nothing may be remembered.
     if (!TranslatedFunctionRegistry::IsLookupPublished()) {
@@ -743,40 +829,71 @@ uint32_t EmitBctrl(BlockEmitter& e, uint32_t index) {
     a.mov(eax, e.Ctr());
     a.and_(eax, ~3u);  // the empty entries' keys are 1 (JitTargetCell::kNoKey, JitLink::kNoKey): only a masked ctr never matches them
     if (kDirectCalls) {
-        // The newest target of the cell first, then the code cache's table of translated targets, the inline cache of untranslated
-        // targets (1, shared with the block's bctr: both put only pcs that are no translated function in it, and a call to one in
-        // this frame is interpreted here: lr is set, it is a jump), the cell's other targets. A miss of all of them is
-        // JitCallOpCached; its interpret-here answer (here, not in the loop frame, where Call decides otherwise: an untranslated
-        // target) links cache 1.
+        // The site's inline ways first (JitCallWays: direct calls of its common targets), then out of line the cell's newest target,
+        // the code cache's table of translated targets, the inline cache of untranslated targets (1, shared with the block's bctr:
+        // both put only pcs that are no translated function in it, and a call to one in this frame is interpreted here: lr is set,
+        // it is a jump), the cell's other targets. A miss of all of them is JitCallOpCached; its interpret-here answer (here, not
+        // in the loop frame, where Call decides otherwise: an untranslated target) links cache 1. The site's first target (a miss)
+        // and a target hit out of line 32 times (CountWayHit) are written into the ways.
         Xbyak::Label& ways = e.NewLabel();
         Xbyak::Label& hit = e.NewLabel();
         Xbyak::Label& miss = e.NewLabel();
-        a.cmp(eax, a.dword[a.rip + cell]);
-        a.jne(ways, CodeGenerator::T_NEAR);
-        a.lea(rdx, a.ptr[a.rip + cell]);
-        a.L(hit);
+        Xbyak::Label& way1 = e.NewLabel();
+        Xbyak::Label& slow = e.NewLabel();
+        Xbyak::Label& after = e.NewLabel();
+        Xbyak::Label& never = e.NewLabel();
+        Xbyak::Label& call = e.NewLabel();
+        const uint32_t site = e.NewWays();
+        EmitCacheFirstSwitch(e);
         a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
-        a.call(a.qword[rdx + static_cast<int>(offsetof(JitTargetCell, fast))]);
+        e.EmitWayCompare(site, 0);
+        a.jne(way1, CodeGenerator::T_NEAR);
+        e.EmitWayCall(site, 0, never);
+        a.L(after);
         EmitF1Scalar(e);  // NormalizeCallFloatReturn
         a.L(resume);
         e.EmitRecheck(pc + 4);
-        e.Cold([&ways, &hit, &miss, &resume, &cell, index](BlockEmitter& c) {
-            c.a.L(ways);
+        e.Cold([&way1, &slow, &after, &never, &hit, &ways, &cell, &call, site](BlockEmitter& c) {
+            CodeGenerator& g = c.a;
+            g.L(way1);
+            c.EmitWayCompare(site, 1);
+            g.jne(slow, CodeGenerator::T_NEAR);
+            c.EmitWayCall(site, 1, never);
+            g.jmp(after, CodeGenerator::T_NEAR);
+            g.L(never);
+            g.ud2();  // a way's call before its key is written: no masked ctr equals kNoKey
+            g.L(slow);
+            g.cmp(eax, g.dword[g.rip + cell]);
+            g.jne(ways, CodeGenerator::T_NEAR);
+            g.lea(rdx, g.ptr[g.rip + cell]);
+            g.L(hit);
+            CountWayHit(c, site, call);
+            g.lea(ArgReg(0), g.ptr[kCtxBase - kCtxBias]);
+            g.call(g.qword[rdx + static_cast<int>(offsetof(JitTargetCell, fast))]);
+            g.jmp(after, CodeGenerator::T_NEAR);
+        });
+        e.Cold([&ways, &hit, &miss, &resume, &cell, index, site](BlockEmitter& c) {
+            CodeGenerator& g = c.a;
+            g.L(ways);
             TableProbe(c, false, cell, hit);
             c.CacheProbe(1);
             CellWays(c, cell, hit, miss);
-            c.a.L(miss);
-            c.a.lea(r10, c.a.ptr[c.a.rip + cell]);
+            g.L(miss);
+            g.lea(r10, g.ptr[g.rip + cell]);
             c.CallHelper(&JitCallOpCached, kFrame, &c.block, index, r10);
             TableFill(c, false, cell);
-            c.a.mov(rcx, rax);
-            c.a.shr(rcx, 32);
-            c.a.jz(resume, CodeGenerator::T_NEAR);
-            Xbyak::Label pending;
-            c.a.cmp(ecx, kReturnPending);
-            c.a.je(pending);
+            g.mov(rcx, rax);
+            g.shr(rcx, 32);
+            Xbyak::Label pending, notMade;
+            g.jnz(notMade, CodeGenerator::T_NEAR);
+            g.lea(rdx, g.ptr[g.rip + cell]);  // the call was made: the target it filled the cell with (if any) to an empty way
+            PatchWays(c, site, rdx, true);
+            g.jmp(resume, CodeGenerator::T_NEAR);
+            g.L(notMade);
+            g.cmp(ecx, kReturnPending);
+            g.je(pending);
             c.ExitDynamicMiss(1);  // eax: the target
-            c.a.L(pending);
+            g.L(pending);
             c.ExitPending();
         });
         e.Cold([&generic, &resume, &cell, index](BlockEmitter& c) {  // the rollback loop frame: Call decides
@@ -897,25 +1014,63 @@ uint32_t EmitBctr(BlockEmitter& e, uint32_t index) {
     Xbyak::Label& generic = e.NewLabel();
     a.mov(eax, e.Ctr());
     a.and_(eax, ~3u);  // the empty entries' keys are 1 (JitTargetCell::kNoKey, JitLink::kNoKey): only a masked ctr never matches them
+    uint32_t site = ~0u;  // the site's inline ways (JitCallWays), if it has them
     if (kDirectCalls) {
         // The cell holds the last translated targets this site jumped to (a tail call), their records and what to call for each
         // (JitFastCallFor); the inline cache (1) the untranslated ones, plain jumps. The two hold different pcs, so their order is
-        // free: the cell's newest target first, the code cache's table, the inline cache, the cell's other targets; at a switch's
-        // table the inline cache first.
+        // free: the site's inline ways (JitCallWays: direct calls of its common translated targets), out of line the cell's newest
+        // target, the code cache's table, the inline cache, the cell's other targets; at a switch's table (its targets are code of
+        // the function) the inline cache first and no ways. The first target and one hit out of line 32 times go in the ways.
         Xbyak::Label& hit = e.NewLabel();
         Xbyak::Label& ways = e.NewLabel();
         const bool table = JumpTableSite(e.block, index);
-        if (table) e.CacheProbe(1);
-        a.cmp(eax, a.dword[a.rip + cell]);
-        a.jne(ways, CodeGenerator::T_NEAR);
-        a.lea(rdx, a.ptr[a.rip + cell]);
-        a.L(hit);
-        EmitLoopFrameTest(e, generic);
-        a.mov(ebp, e.Lr());
-        a.and_(ebp, ~3u);
-        a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
-        a.call(a.qword[rdx + static_cast<int>(offsetof(JitTargetCell, fast))]);  // keeps rbp (JitFastCallFor: never jit_subcall)
-        EmitDirectTailFinish(e);
+        // the call (rdx: the cell entry, or `way` >= 0: that inline way's direct call); keeps rbp (JitFastCallFor: never jit_subcall)
+        const auto call = [&e, &generic](int way, uint32_t at, Xbyak::Label* never) {
+            CodeGenerator& g = e.a;
+            EmitLoopFrameTest(e, generic);
+            g.mov(ebp, e.Lr());
+            g.and_(ebp, ~3u);
+            g.lea(ArgReg(0), g.ptr[kCtxBase - kCtxBias]);
+            if (way < 0) g.call(g.qword[rdx + static_cast<int>(offsetof(JitTargetCell, fast))]);
+            else e.EmitWayCall(at, static_cast<uint32_t>(way), *never);
+        };
+        if (table) {
+            e.CacheProbe(1);
+            a.cmp(eax, a.dword[a.rip + cell]);
+            a.jne(ways, CodeGenerator::T_NEAR);
+            a.lea(rdx, a.ptr[a.rip + cell]);
+            a.L(hit);
+            call(-1, 0, nullptr);
+            EmitDirectTailFinish(e);
+        } else {
+            Xbyak::Label& way1 = e.NewLabel();
+            Xbyak::Label& slow = e.NewLabel();
+            Xbyak::Label& after = e.NewLabel();
+            Xbyak::Label& never = e.NewLabel();
+            site = e.NewWays();
+            EmitCacheFirstSwitch(e);
+            e.EmitWayCompare(site, 0);
+            a.jne(way1, CodeGenerator::T_NEAR);
+            call(0, site, &never);
+            a.L(after);
+            EmitDirectTailFinish(e);
+            // after the exits (as the probes below): way 1, the cell's first entry
+            a.L(way1);
+            e.EmitWayCompare(site, 1);
+            a.jne(slow, CodeGenerator::T_NEAR);
+            call(1, site, &never);
+            a.jmp(after, CodeGenerator::T_NEAR);
+            a.L(never);
+            a.ud2();  // a way's call before its key is written: no masked ctr equals kNoKey
+            a.L(slow);
+            a.cmp(eax, a.dword[a.rip + cell]);
+            a.jne(ways, CodeGenerator::T_NEAR);
+            a.lea(rdx, a.ptr[a.rip + cell]);
+            a.L(hit);
+            CountWayHit(e, site, e.NewLabel());
+            call(-1, 0, nullptr);
+            a.jmp(after, CodeGenerator::T_NEAR);
+        }
         a.L(ways);
         TableProbe(e, true, cell, hit);
         if (!table) e.CacheProbe(1);
@@ -928,13 +1083,19 @@ uint32_t EmitBctr(BlockEmitter& e, uint32_t index) {
         e.CallHelper(&JitThinTail, kFrame, rdx);
         EmitTailResult(e);
     }
-    e.Cold([&generic, &cell, index](BlockEmitter& c) {
+    e.Cold([&generic, &cell, index, site](BlockEmitter& c) {
         CodeGenerator& g = c.a;
         Xbyak::Label pending, returned, plain;
         g.L(generic);
         g.lea(r10, g.ptr[g.rip + cell]);
         c.CallHelper(&JitTailOpCached, kFrame, &c.block, index, r10);
         if (kDirectCalls) TableFill(c, true, cell);
+        if (site != ~0u) {  // the target the shim filled the cell with (if any) to an empty way; rbp (free here) keeps the answer
+            g.mov(rbp, rax);
+            g.lea(rdx, g.ptr[g.rip + cell]);
+            PatchWays(c, site, rdx, true);
+            g.mov(rax, rbp);
+        }
         EmitShimResult(c);
         g.cmp(ecx, kJumpHere);
         g.je(plain);

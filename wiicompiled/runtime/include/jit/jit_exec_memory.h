@@ -30,9 +30,9 @@ void Free(Region region);
 // Hands out code space from chunks, one after another. Nothing is returned piecemeal: Reset and the destructor free
 // every chunk. Used by one thread.
 //
-// On Linux a chunk of a huge page or more (the default) starts on a 2 MiB boundary and is advised MADV_HUGEPAGE, so that a
-// cache of generated code is mapped by a few huge pages and the instruction TLB is not the limit; other hosts and smaller
-// chunks (tests) get plain page mappings.
+// On Linux a chunk of a huge page or more (the default) starts on a 2 MiB boundary; it is advised MADV_HUGEPAGE only with
+// BRAWL_JIT_HUGEPAGES=1 (measured slower; jit_exec_memory.cpp MapRegionHuge). Other
+// hosts and smaller chunks (tests) get plain page mappings.
 class Arena {
 public:
 #if defined(__linux__)

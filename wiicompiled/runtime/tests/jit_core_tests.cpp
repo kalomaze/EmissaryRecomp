@@ -10,6 +10,7 @@
 #include "jit_test_env.h"
 #include "abi_bridge.h"
 #include "brawl_dirty_memory.h"
+#include "brawl_write_watch.h"
 #include "memory.h"
 #include "ppc_interpreter.h"
 #include "../src/jit/jit_x64.h"
@@ -45,6 +46,13 @@ constexpr uint32_t kBlr = 0x4E800020u;
 void Place(uint32_t base, uint32_t ops) {
     for (uint32_t i = 0; i < ops; ++i) Memory::Write32(base + 4u * i, Addi(3, 3, 1));
     Memory::Write32(base + 4u * ops, kBlr);
+}
+
+// A word into guest memory without a dirty mark, as rollback's restore writes (through a scratch word for the host's form).
+void RawWrite(uint32_t address, uint32_t word) {
+    constexpr uint32_t scratch = kCodeBase + 0x30000u;
+    Memory::Write32(scratch, word);
+    std::memcpy(Memory::GetPointer(address, 4), Memory::GetPointer(scratch, 4), 4);
 }
 
 uint32_t Run(uint32_t entry) {
@@ -95,6 +103,39 @@ void TestLinkRetireRelink() {
     for (int i = 0; i < 3; ++i) CHECK(Run(base) == 104);
     const JitX64Stats s6 = JitX64GetStats();
     CHECK(s6.compiled == s5.compiled && s6.links == s5.links);
+    // A restore announced with MarksRestoring and finished with MarksRestoreWritten (rollback's order: the notification, the
+    // writes, then that): the blocks whose words it left as they were are not dropped at all, so one dispatcher entry runs the
+    // four blocks through their links, and nothing is compiled or linked.
+    BrawlDirtyMemory::MarksRestoring(0);
+    BrawlDirtyMemory::MarksRestoreWritten();
+    const JitX64Stats s7 = JitX64GetStats();
+    CHECK(Run(base) == 104);
+    const JitX64Stats s8 = JitX64GetStats();
+    const char* const pendingEnv = std::getenv("BRAWL_JIT_RESTORE_PENDING");  // 0: every block dropped first, refreshed one by one
+    CHECK(s8.enters - s7.enters == (pendingEnv != nullptr && *pendingEnv == '0' ? 4u : 1u));
+    CHECK(s8.compiled == s7.compiled && s8.links == s7.links);
+    // The notification alone: each dropped block is refreshed at its first entry, one dispatcher entry each.
+    BrawlDirtyMemory::MarksRestored(0);
+    CHECK(Run(base) == 104);
+    const JitX64Stats s9 = JitX64GetStats();
+    CHECK(s9.enters - s8.enters == 4);
+    // A restore that changes a block's words (no mark, as rollback writes): that block stays dropped and is built again before
+    // it runs, in the middle of a chain that is linked to it; then the same back.
+    for (int round = 0; round < 2; ++round) {
+        BrawlDirtyMemory::MarksRestoring(0);
+        RawWrite(base + 4u * 40, Addi(3, 3, round == 0 ? 3 : 1));
+        BrawlDirtyMemory::MarksRestoreWritten();
+        const JitX64Stats a = JitX64GetStats();
+        CHECK(Run(base) == (round == 0 ? 106u : 104u));
+        const JitX64Stats b = JitX64GetStats();
+        CHECK(b.compiled - a.compiled == 1);
+        for (int i = 0; i < 2; ++i) CHECK(Run(base) == (round == 0 ? 106u : 104u));
+    }
+    // The first block's words changed by the restore, the blocks after it not.
+    BrawlDirtyMemory::MarksRestoring(0);
+    RawWrite(base, Addi(3, 3, 1));
+    BrawlDirtyMemory::MarksRestoreWritten();
+    for (int i = 0; i < 3; ++i) CHECK(Run(base) == 100);
 }
 
 // A loop back to a block's own start: straight to its entry when nothing in the block before the jump can have changed its code

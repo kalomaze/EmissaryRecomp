@@ -64,6 +64,22 @@ inline constexpr bool kDirectCalls = true;
 inline constexpr bool kDirectCalls = false;
 #endif
 
+// A direct call of a translated function whose record says it may leave one to three non-volatile FPRs written (fprsOnly,
+// JitCallTarget::fprMask; most such calls from compiled code): the caller keeps those FPRs' raw bits in rbp, r14 and r12
+// (callee-saved, and free across the call: the GPR cache is empty then and the pinned r14 and r12 are set again after it), calls
+// the entry and stores them back, which is what ThinFprGuard does around JitDirectFprsCall's call. The call's return address is
+// followed by an 8-byte nop (0F 1F 84 00 and a displacement) whose displacement is ThinSaveDescriptor's: when the callee throws,
+// the blocks' personality routine (the code chunks' FDE) finds it there and puts the FPRs back from the unwound registers, as
+// ThinFprGuard's destructor does when an exception passes it. Linux x86-64 (kDirectCalls) only.
+inline constexpr uint32_t kThinSaveMagic = 0x2B2Bu << 17;  // bits 17-31 of the descriptor
+inline constexpr unsigned kThinSaveMax = 3;
+// bits 0-1: the count; bits 2 + 5k .. 6 + 5k: FPR k's number - 14 (k < count), saved in rbp, r14, r12 in that order
+inline uint32_t ThinSaveDescriptor(const uint8_t* fprs, unsigned n) {
+    uint32_t d = kThinSaveMagic | n;
+    for (unsigned k = 0; k < n; ++k) d |= static_cast<uint32_t>(fprs[k] - 14u) << (2 + 5 * k);
+    return d;
+}
+
 // Integer argument registers of the host's C calling convention (SysV: rdi, rsi, rdx, rcx, r8, r9; Win64: rcx, rdx, r8,
 // r9). CallHelper takes at most kMaxCallArgs arguments, the number both ABIs pass in registers.
 inline constexpr unsigned kMaxCallArgs = 4;
@@ -119,9 +135,36 @@ void Jcc(Xbyak::CodeGenerator& a, Cc cc, const Xbyak::Label& target, Xbyak::Code
 // JitCallTarget its patchedByte): a call site may then call a patched function's block with a host call (jit_x64_branch.cpp,
 // jit_subcall).
 bool SubFramesPossible();
+// BRAWL_JIT_THIN_SAVES=0: direct calls of fprsOnly records always go through JitDirectFprsCall (no FPR saves in line: kThinSaveMagic).
+bool ThinSavesOn();
+// BRAWL_JIT_GUARDED_DIRECT=0: a bl to a target with a GPR guard goes through JitThinCallPrepared (a noexcept shim) instead of
+// JitDirectGuardedCall (a direct call the callee's exceptions unwind through).
+bool GuardedDirectOn();
 // The shared routine that moves a call cell's entry to the front (Linux x86-64): called with rcx = the cell, rdx = the entry;
 // answers rdx = the cell's first entry, which is now that one. Clobbers xmm0-xmm3.
 const void* CellPromoteRoutine();
+
+// A bctrl or bctr site's inline ways (Linux x86-64, jit_x64_branch.cpp): two `cmp eax, imm32` (the guest target) and `call rel32`
+// (what the site's cell calls for it, JitTargetCell::fast: the entry, or the target's own routine) pairs in the block's code, way 0
+// first, way 1 out of line. Their keys start as JitTargetCell::kNoKey, which no masked ctr equals. The site's slow path writes them:
+// its first target (the miss that fills an empty way 0), and a target hit out of line 32 times (JitTargetCell::wayHits, counted at the
+// slow path's call) goes into way 0 and way 0's into way 1; at most kWayPatches times per site. So a site's common targets are direct
+// calls, which the predictor handles as any direct call: the indirect call through the cell mispredicted at sites that run rarely
+// though they have one target (the predictor's entries were gone). A polymorphic site (the task scheduler's virtual calls: one or two
+// targets take 60-90% of a site's calls, a dozen others the rest) spends its writes early and keeps its ways then: writes without a
+// bound kept changing the ways there, and their compares mispredicted more (~0.5k per update) than the cell's call saved.
+// A way calls exactly what a hit of the cell's entry calls, so a way is as valid as the entry: nothing resets it.
+struct JitCallWays {
+    uint8_t* key[2];  // the imm32 of each way's cmp
+    uint8_t* rel[2];  // the rel32 of each way's call
+    uint32_t budget;  // writes left
+    uint32_t reserved;
+};
+inline constexpr uint32_t kWayPatches = 64;
+// Writes cell entry e into w's way 0 (way 0's old target into way 1), unless e is in a way already, `fill` and way 0 holds a target,
+// w's budget is spent, e's callee reads the cell entry (a shared routine: e's own routine could not be made) or is out of a call's
+// reach. noexcept: a slow path's.
+void JitPatchCallWays(JitCallWays* w, const JitTargetCell* e, bool fill) noexcept;
 
 // Fault-based stores (jit_x64_mem.cpp): guest stores go through the store view (LeanWindow::g_storeView) and its faults are
 // handled, when the memory made the store view and the handler is installed. FaultStoresInit decides it once, at the first code
@@ -419,6 +462,23 @@ public:
     // record of the entry whose key is eax, or jumps to `miss` (near). A cell holds kCellWays entries (a JitTargetCell each,
     // after the code), the newest first; `NewCell` makes room for all of them.
     void CellProbe(Xbyak::Label& cell, const Xbyak::Label& miss);
+    // A call site's inline ways (JitCallWays): NewWays makes the site's record (data after the block's code, WaysRecord labels it);
+    // EmitWayCompare emits way `way`'s `cmp eax, imm32` (the key kNoKey), EmitWayCall its `call rel32` to `initial` (never reached
+    // while the key is kNoKey). Each way of a site is emitted once.
+    static constexpr uint32_t kMaxWaySites = kMaxCells;
+    uint32_t NewWays();
+    void EmitWayCompare(uint32_t site, uint32_t way);
+    void EmitWayCall(uint32_t site, uint32_t way, const Xbyak::Label& initial);
+    Xbyak::Label& WaysRecord(uint32_t site);
+    // A bctrl's or bctr's probe-order switch (Linux x86-64): a 5-byte nop where the site starts probing for its target, emitted
+    // after the target is in eax. A site probes its inline ways, the cell and the code cache's table of translated targets before
+    // the block's inline cache 1, which holds the targets that are no translated function (code the JIT compiled: a mod's virtual
+    // calls). Once cache 1 links a target (x64::FlipProbeOrder, from LinkCached), each switch of the block becomes a `jmp` to
+    // `cacheFirst`, where the site probes cache 1 first and goes on after the switch on a miss: an order, not a decision (every
+    // target is found either way). False (nothing emitted) when the block has kMaxOrderSwitches already.
+    static constexpr uint32_t kMaxOrderSwitches = 8;
+    bool OrderSwitchRoom() const { return kDirectCalls && orderSwitchCount_ < kMaxOrderSwitches && labelCount_ + 24 < kMaxLabels; }
+    bool EmitOrderSwitch(const Xbyak::Label& cacheFirst);
 
     // --- intra-block GPR cache (ebp, r8d, r9d, r10d, r11d) -------------------------------------------------------------
     // Caches hot guest GPRs in 5 host registers within a block (ebp is callee-saved, r8d-r11d are volatile).
@@ -592,7 +652,7 @@ public:
     const BlockLayout& Layout() const { return layout_; }
 
     static constexpr uint32_t kMaxExits = 64;
-    static constexpr uint32_t kMaxLabels = 96;
+    static constexpr uint32_t kMaxLabels = 160;
     static constexpr uint32_t kMaxCold = 64;
 
     // --- code dump side table (BRAWL_JIT_DUMP_DIR, a diagnostic: records offsets only, emits nothing) -------------------
@@ -712,6 +772,16 @@ private:
     uint32_t coldCount_ = 0;
     uint32_t cellCount_ = 0;
     Xbyak::Label cells_[kMaxCells];
+    struct WaySite {
+        Xbyak::Label record;
+        uint32_t key[2] = {}, rel[2] = {};  // offsets from the buffer's start
+    };
+    WaySite waySites_[kMaxWaySites];
+    uint32_t waySiteCount_ = 0;
+    uint32_t orderSwitch_[kMaxOrderSwitches] = {};  // offsets of the switches' nops
+    const Xbyak::Label* orderTarget_[kMaxOrderSwitches] = {};
+    uint32_t orderSwitchCount_ = 0;
+    Xbyak::Label orderRecord_;  // count, then (switch, target) address pairs: cache 1's first entry's farTramp names it
     uint8_t crDead_[kMaxBlock + 2] = {};  // per op: the CR fields dead after it (CrDead)
     uint32_t formScalar_[kMaxBlock + 2] = {}, formPaired_[kMaxBlock + 2] = {};  // per op: the FPRs known Scalar / Paired on entry (KnownForm)
     uint32_t formSingle_[kMaxBlock + 2] = {};  // per op: the FPRs known Scalar and single-precision on entry (KnownSingle)
@@ -750,6 +820,9 @@ struct JitX64Stats {
     uint64_t staleStubs = 0, staleStubFailures = 0;  // stale stubs made (StaleCell) / that could not be made
     uint64_t selfLoops = 0;  // jumps back to a block's own start emitted straight to its entry (BlockEmitter::SelfLoopPrefix)
     uint64_t guarded = 0;    // blocks compiled as guarded code (no mark test on their linked entry: BlockEmitter::Guarded)
+    uint64_t wayPatches = 0; // call sites' inline ways written by a target hit out of line (x64::JitCallWays)
+    uint64_t wayFills = 0;   // by a site's first target
+    uint64_t orderFlips = 0; // blocks whose bctrl/bctr sites were switched to probe inline cache 1 first (BlockEmitter::EmitOrderSwitch)
 };
 JitX64Stats JitX64GetStats();
 // What the condition register analysis did (jit_x64_cr.cpp): blocks analysed, compare and record-form CR writes not emitted,

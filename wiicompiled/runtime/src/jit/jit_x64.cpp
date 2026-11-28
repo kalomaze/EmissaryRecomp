@@ -27,6 +27,7 @@
 #endif
 
 #if defined(__linux__) && defined(__x86_64__)
+#include <unwind.h>
 extern "C" {
 void __register_frame(const void* fde);
 void __deregister_frame(const void* fde);
@@ -50,6 +51,26 @@ bool EnvOn(const char* name) {
     const char* v = std::getenv(name);
     return v != nullptr && *v != '\0' && *v != '0';
 }
+
+}  // namespace
+
+bool GuardedDirectOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("BRAWL_JIT_GUARDED_DIRECT");
+        return v == nullptr || *v != '0';
+    }();
+    return on;
+}
+
+bool ThinSavesOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("BRAWL_JIT_THIN_SAVES");
+        return v == nullptr || *v != '0';
+    }();
+    return on;
+}
+
+namespace {
 
 struct Options {
     bool perfMap = false;
@@ -140,7 +161,7 @@ namespace {
 struct Counters {
     std::atomic<uint64_t> compiled{0}, compileFailed{0}, codeBytes{0}, links{0}, retires{0}, enters{0}, cachesCreated{0},
         cachesDestroyed{0}, compiledOps{0}, compileNanos{0}, cacheHits{0}, cacheMisses{0}, staleStubs{0}, staleStubFailures{0},
-        selfLoops{0}, guarded{0};
+        selfLoops{0}, guarded{0}, wayPatches{0}, wayFills{0}, orderFlips{0};
 };
 Counters g_counters;
 // Ops compiled, per kind: [0] with native code, [1] as a call to the interpreter's handler (a fused pair counts once, at
@@ -326,17 +347,31 @@ struct EhFrameRecord {
     alignas(8) uint8_t bytes[96];
     bool registered = false;
 
-    void Register(const void* base, size_t size, Shape shape = kBlock) {
+    // `personality`: a personality routine for the frames (augmentation "zP", an absolute pointer; FDEs then carry an empty
+    // augmentation, which their padding byte already is).
+    void Register(const void* base, size_t size, Shape shape = kBlock, const void* personality = nullptr) {
         if (registered || base == nullptr || size == 0) return;
         std::memset(bytes, 0, sizeof(bytes));
-        // CIE: length, id 0, version 1, augmentation "", code alignment 1, data alignment -8, return address register 16 (rip)
+        // CIE: length, id 0, version 1, augmentation "" (or "zP"), code alignment 1, data alignment -8, return address register
+        // 16 (rip)
         uint8_t* p = bytes + 4;
         *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0;
         *p++ = 1;
+        if (personality != nullptr) {
+            *p++ = 'z';
+            *p++ = 'P';
+        }
         *p++ = 0;
         *p++ = 1;
         *p++ = 0x78;
         *p++ = 16;
+        if (personality != nullptr) {
+            *p++ = 9;     // augmentation data: the encoding byte and the pointer
+            *p++ = 0x00;  // DW_EH_PE_absptr
+            const uint64_t at = reinterpret_cast<uintptr_t>(personality);
+            std::memcpy(p, &at, 8);
+            p += 8;
+        }
         *p++ = 0x0c; *p++ = 7;                            // DW_CFA_def_cfa rsp, cfa (ULEB128)
         if (shape.cfa < 128) {
             *p++ = shape.cfa;
@@ -354,7 +389,7 @@ struct EhFrameRecord {
         std::memcpy(bytes, &cieLen, 4);
         // FDE: length, CIE pointer (back to the CIE), pc_begin, pc_range (absolute 8-byte pointers), padding
         uint8_t* const fde = p;
-        const uint32_t fdeLen = 4 + 8 + 8 + 4;
+        const uint32_t fdeLen = 4 + 8 + 8 + 4;  // with "zP", fde + 24 is the empty augmentation's length byte (0)
         std::memcpy(fde, &fdeLen, 4);
         const uint32_t ciePtr = static_cast<uint32_t>(fde + 4 - bytes);
         std::memcpy(fde + 4, &ciePtr, 4);
@@ -371,6 +406,27 @@ struct EhFrameRecord {
         if (registered) __deregister_frame(bytes);
     }
 };
+
+// The personality routine of the code chunks' frames (blocks at block level): an exception passing a block that made a direct call
+// with FPR saves (kThinSaveMagic: the 8-byte nop at the call's return address) puts the saved FPRs back into the context, which
+// rbx (CpuContext* + kCtxBias) gives, from the registers that held them as the unwinder has restored them for this frame (rbp,
+// r14, r12: callee-saved, so their values at the call). Nothing else; never a handler or a landing pad, so unwinding goes on.
+_Unwind_Reason_Code JitBlockPersonality(int version, _Unwind_Action actions, _Unwind_Exception_Class, _Unwind_Exception*,
+                                        _Unwind_Context* context) {
+    if (version != 1) return _URC_FATAL_PHASE1_ERROR;
+    if ((actions & _UA_CLEANUP_PHASE) == 0) return _URC_CONTINUE_UNWIND;
+    const uint8_t* const ip = reinterpret_cast<const uint8_t*>(_Unwind_GetIP(context));
+    if (ip == nullptr || ip[0] != 0x0F || ip[1] != 0x1F || ip[2] != 0x84 || ip[3] != 0x00) return _URC_CONTINUE_UNWIND;
+    uint32_t d;
+    std::memcpy(&d, ip + 4, 4);
+    if ((d & ~((uint32_t{1} << 17) - 1u)) != kThinSaveMagic) return _URC_CONTINUE_UNWIND;
+    auto* const ctx = reinterpret_cast<CpuContext*>(_Unwind_GetGR(context, 3) - static_cast<uintptr_t>(kCtxBias));
+    static const int kDwarf[kThinSaveMax] = {6, 14, 12};  // rbp, r14, r12
+    const unsigned n = d & 3u;
+    for (unsigned k = 0; k < n && k < kThinSaveMax; ++k)
+        ctx->fpr[14u + ((d >> (2 + 5 * k)) & 31u)].raw = static_cast<uint64_t>(_Unwind_GetGR(context, kDwarf[k]));
+    return _URC_CONTINUE_UNWIND;
+}
 #endif
 
 // The trampoline's raw signature, the same on both ABIs: a packed result (status << 32 | next pc), the link slot through
@@ -384,6 +440,7 @@ struct Shared {
     EnterFn enter = nullptr;
     EnterDirectFn enterDirect = nullptr;
     const void* subCall = nullptr;      // Linux x86-64: eax = target, rdx = the cell entry (a bctrl to a patched function)
+    const void* subCallRecord = nullptr;  // the same with rdx = the target's JitCallTarget (a target's own routine, MakeThunk)
     const void* subCallReturn = nullptr;  // where the callee of subCall returns (JitLiftContinue finds the callee's entry there)
     const void* exitDynamic = nullptr;  // eax = the next pc
     const void* exitSlot = nullptr;     // eax = the next pc, rdx = the link slot
@@ -560,6 +617,7 @@ bool BuildShared() {
             mark("jit_subcall");
             s.subCall = a.getCurr();
             a.mov(rdx, a.qword[rdx + static_cast<int>(offsetof(JitTargetCell, record))]);
+            s.subCallRecord = a.getCurr();
             a.mov(rcx, a.qword[rdx + static_cast<int>(offsetof(JitCallTarget, patchedByte))]);
             a.test(rcx, rcx);
             a.jz(fallbackEntry, Xbyak::CodeGenerator::T_NEAR);
@@ -1140,6 +1198,33 @@ Xbyak::Label& BlockEmitter::NewCell() {
 }
 
 static_assert(sizeof(JitTargetCell) == 32 && offsetof(JitTargetCell, target) == 0);
+
+uint32_t BlockEmitter::NewWays() {
+    if (waySiteCount_ == kMaxWaySites) throw EmitError{"call ways"};
+    return waySiteCount_++;
+}
+
+void BlockEmitter::EmitWayCompare(uint32_t site, uint32_t way) {
+    a.db(0x3D);  // cmp eax, imm32 (never the imm8 form: the key is written at run time)
+    waySites_[site].key[way] = static_cast<uint32_t>(a.getSize());
+    a.dd(JitTargetCell::kNoKey);
+}
+
+void BlockEmitter::EmitWayCall(uint32_t site, uint32_t way, const Xbyak::Label& initial) {
+    waySites_[site].rel[way] = static_cast<uint32_t>(a.getSize()) + 1;
+    a.call(initial);  // E8 rel32 (a call to a label is always the rel32 form)
+}
+
+Xbyak::Label& BlockEmitter::WaysRecord(uint32_t site) { return waySites_[site].record; }
+
+bool BlockEmitter::EmitOrderSwitch(const Xbyak::Label& cacheFirst) {
+    if (!OrderSwitchRoom()) return false;
+    orderSwitch_[orderSwitchCount_] = static_cast<uint32_t>(a.getSize());
+    orderTarget_[orderSwitchCount_] = &cacheFirst;
+    ++orderSwitchCount_;
+    a.db(0x0F), a.db(0x1F), a.db(0x44), a.db(0x00), a.db(0x00);  // nop dword [rax + rax]: becomes `jmp rel32` (FlipProbeOrder)
+    return true;
+}
 
 void BlockEmitter::CellProbe(Xbyak::Label& cell, const Xbyak::Label& miss) {
     const int key = static_cast<int>(offsetof(JitTargetCell, target)), record = static_cast<int>(offsetof(JitTargetCell, record));
@@ -1788,6 +1873,17 @@ void BlockEmitter::Finish() {
             a.dq(0);
         }
     }
+    static_assert(sizeof(JitCallWays) == 40);
+    for (uint32_t i = 0; i < waySiteCount_; ++i) {  // the call sites' inline ways (JitCallWays): filled in below
+        a.L(waySites_[i].record);
+        for (unsigned w = 0; w < sizeof(JitCallWays) / 8; ++w) a.dq(0);
+    }
+    const bool orderSwitches = orderSwitchCount_ != 0 && caches_[1].probed;
+    if (orderSwitches) {  // the probe-order switches (EmitOrderSwitch): filled in below
+        a.L(orderRecord_);
+        a.dq(orderSwitchCount_);
+        for (uint32_t i = 0; i < 2 * orderSwitchCount_; ++i) a.dq(0);
+    }
     a.L(epochRecord_);  // the epoch tests' immediates (Block::jitEpoch): their count, then their addresses, filled in below
     a.dq(epochSiteCount_);
     for (uint32_t i = 0; i < epochSiteCount_; ++i) a.dq(0);
@@ -1812,6 +1908,22 @@ void BlockEmitter::Finish() {
     uint8_t* const codeBase = const_cast<uint8_t*>(a.getCode());
     uint64_t* const record = reinterpret_cast<uint64_t*>(const_cast<uint8_t*>(epochRecord_.getAddress()));
     for (uint32_t i = 0; i < epochSiteCount_; ++i) record[1 + i] = reinterpret_cast<uintptr_t>(codeBase + epochSites_[i]);
+    for (uint32_t i = 0; i < waySiteCount_; ++i) {
+        JitCallWays* const w = reinterpret_cast<JitCallWays*>(const_cast<uint8_t*>(waySites_[i].record.getAddress()));
+        const WaySite& site = waySites_[i];
+        for (uint32_t k = 0; k < 2; ++k) {
+            if (site.key[k] == 0 || site.rel[k] == 0) throw EmitError{"a call way"};
+            w->key[k] = codeBase + site.key[k];
+            w->rel[k] = codeBase + site.rel[k];
+        }
+        w->budget = kWayPatches;
+        w->reserved = 0;
+    }
+    uint64_t* const orders = orderSwitches ? reinterpret_cast<uint64_t*>(const_cast<uint8_t*>(orderRecord_.getAddress())) : nullptr;
+    for (uint32_t i = 0; orders != nullptr && i < orderSwitchCount_; ++i) {
+        orders[1 + 2 * i] = reinterpret_cast<uintptr_t>(codeBase + orderSwitch_[i]);
+        orders[2 + 2 * i] = reinterpret_cast<uintptr_t>(orderTarget_[i]->getAddress());
+    }
     for (uint32_t i = 0; i < exitCount_; ++i) {
         JitLink* const slot = reinterpret_cast<JitLink*>(const_cast<uint8_t*>(exits_[i].slot.getAddress()));
         slot->target = slot->unlinked = exits_[i].stub.getAddress();
@@ -1844,7 +1956,8 @@ void BlockEmitter::Finish() {
             entries[i].key = JitLink::kNoKey;
             entries[i].group = i == 0 ? kCacheEntries[&c - caches_] : 0;
             entries[i].patchSite = nullptr;
-            entries[i].farTramp = nullptr;
+            // cache 1's first entry: the block's probe-order switches (a cache entry has no patch site, so no far trampoline)
+            entries[i].farTramp = i == 0 && &c == &caches_[1] ? orders : nullptr;
         }
     }
 }
@@ -1903,7 +2016,7 @@ struct JitCodeCache {
         while (ehFrames.size() < chunks.size()) {
             const JitExecMemory::Region& c = chunks[ehFrames.size()];
             auto rec = std::make_unique<x64::EhFrameRecord>();
-            rec->Register(c.base, c.size);
+            rec->Register(c.base, c.size, x64::EhFrameRecord::kBlock, reinterpret_cast<const void*>(&x64::JitBlockPersonality));
             ehFrames.push_back(std::move(rec));
         }
     }
@@ -2033,7 +2146,8 @@ bool CompileBlock(JitCodeCache& cache, Block& b) {
     // is then emitted again in a new chunk, where every part has all its room.
     const size_t code = 256 + static_cast<size_t>(b.count) * kMaxBytesPerOp;
     const size_t data = 64 + 8 * (1 + BlockEmitter::kMaxEpochSites) + BlockEmitter::kMaxExits * sizeof(JitLink) + sizeof(StaleCell) +
-                        BlockEmitter::kMaxCells * kCellWays * sizeof(JitTargetCell) +
+                        BlockEmitter::kMaxCells * kCellWays * sizeof(JitTargetCell) + BlockEmitter::kMaxWaySites * sizeof(JitCallWays) +
+                        8 * (1 + 2 * BlockEmitter::kMaxOrderSwitches) +
                         (BlockEmitter::kCacheEntries[0] + BlockEmitter::kCacheEntries[1]) * sizeof(JitLink) + 64 * BlockEmitter::kCaches +
                         16 * (BlockEmitter::kMaxConsts + 1);  // the float constants (Const128), 16-byte aligned
     for (int attempt = 0; attempt < 2; ++attempt) {
@@ -2196,9 +2310,33 @@ void Aim(JitLink& slot, Block& to) {
     to.jitIncoming = &slot;
 }
 
+// The block of cache 1's first entry `head` links a target that is no translated function: its bctrl/bctr sites probe cache 1 first
+// from now on (BlockEmitter::EmitOrderSwitch: each switch's nop becomes `jmp` to the site's cache-first probe). Once per block;
+// BRAWL_JIT_CACHE_FIRST=0 leaves the switches as they are. The block's code is not running on another thread (a code cache is a
+// thread's), and on this one it runs again only after the dispatcher returns.
+void FlipProbeOrder(JitLink& head) {
+    static const bool on = [] {
+        const char* v = std::getenv("BRAWL_JIT_CACHE_FIRST");
+        return v == nullptr || *v != '0';
+    }();
+    const uint64_t* const record = static_cast<const uint64_t*>(head.farTramp);
+    head.farTramp = nullptr;
+    if (!on) return;
+    for (uint64_t i = 0; i < record[0]; ++i) {
+        uint8_t* const site = reinterpret_cast<uint8_t*>(record[1 + 2 * i]);
+        const uint8_t* const to = reinterpret_cast<const uint8_t*>(record[2 + 2 * i]);
+        const int32_t rel = static_cast<int32_t>(to - (site + 5));  // the same block's code: always in reach
+        uint8_t jump[5] = {0xE9};
+        std::memcpy(jump + 1, &rel, 4);
+        std::memcpy(site, jump, 5);
+    }
+    Bump(g_counters.orderFlips);
+}
+
 // The inline cache whose first entry is `head`: `to` goes in the entry its start selects (the emitted probe computes the same
 // index from the pc), replacing what was there.
 void LinkCached(JitLink& head, Block& to) {
+    if (head.farTramp != nullptr) FlipProbeOrder(head);
     JitLink& e = (&head)[(to.start >> 2) & (head.group - 1)];
     if (e.to == &to && e.target == to.jitLinked && e.key == to.start) return;
     if (diag::ChurnOn()) diag::AddKey(diag::kTCacheLink, (uint64_t{e.key} << 32) | to.start);
@@ -2298,15 +2436,272 @@ bool x64::SubFramesPossible() {
     return h.lowestRedirect != nullptr && h.pendingFast != nullptr && h.anyDirty != nullptr && h.sync != nullptr;
 }
 
+namespace {
+
+// A call target's own routine for the call sites' cells (JitFastCallFor), with direct branches only. The shared routines (jit_exits'
+// callArgs and callGuarded, jit_subcall's entry) end in one indirect jump through the cell entry that every site and target goes
+// through, which the predictor could not learn (~0.6k mispredicts per update). Process-wide, like the JitCallTarget it is made for
+// (never freed: code may be on a stack at exit). Inputs as the shared routines': rdi = the context, lr and ctx->pc set, the
+// rollback loop frame ruled out, called from a block (a bctrl's or bctr's call) whose [rsp] returns there; rdx is not read.
+//   Args:    the float arguments t->argMask names that are held paired made scalar (JitNormalizeArgs), then t's entry
+//   Guarded: JitThinCall(frame, t); an exception it stored leaves the block (jit_exit_pending, the return address dropped)
+//   Sub:     jit_subcall for t (eax = t->target, rdx = t)
+enum class ThunkKind : uintptr_t { Args = 1, Guarded = 2, Sub = 3 };
+
+struct ThunkPool {
+    std::mutex mutex;
+    std::unordered_map<uintptr_t, const void*> made;  // the record's address | kind -> its routine
+    uint8_t* at = nullptr;
+    size_t left = 0;
+};
+
+ThunkPool& Thunks() {
+    static ThunkPool* const pool = new ThunkPool;  // never freed (see above)
+    return *pool;
+}
+
+// A jump or call from a routine made at run time to a fixed address: rel32 in reach (but BRAWL_JIT_FAR_JUMPS), else through `scratch`.
+void ThunkBranch(Xbyak::CodeGenerator& g, const void* target, const Xbyak::Reg64& scratch, bool call) {
+    static const bool alwaysLong = x64::EnvOn("BRAWL_JIT_FAR_JUMPS");
+    const int64_t distance = reinterpret_cast<const uint8_t*>(target) - (g.getCurr() + 5);
+    if (!alwaysLong && distance >= INT32_MIN && distance <= INT32_MAX) {
+        if (call) g.call(target);
+        else g.jmp(target, Xbyak::CodeGenerator::T_NEAR);
+        return;
+    }
+    g.mov(scratch, reinterpret_cast<uint64_t>(target));
+    if (call) g.call(scratch);
+    else g.jmp(scratch);
+}
+
+const void* MakeThunk(const JitCallTarget* t, ThunkKind kind) noexcept {
+    using namespace Xbyak::util;
+    const x64::Shared& s = x64::g_shared;
+    ThunkPool& p = Thunks();
+    const uintptr_t key = reinterpret_cast<uintptr_t>(t) | static_cast<uintptr_t>(kind);
+    static_assert(alignof(JitCallTarget) >= 4, "the kind goes in the record address's low bits");
+    try {
+        std::lock_guard<std::mutex> lock(p.mutex);
+        const auto found = p.made.find(key);
+        if (found != p.made.end()) return found->second;
+        constexpr size_t kMaxThunk = 128;
+        if (p.left < kMaxThunk) {
+            const JitExecMemory::Region region = JitExecMemory::Allocate(64 * 1024);  // near the text, as the code caches
+            if (!region) return nullptr;
+            p.at = static_cast<uint8_t*>(region.base);
+            p.left = region.size;
+        }
+        Xbyak::CodeGenerator g(kMaxThunk, p.at);
+        const void* const entry = reinterpret_cast<const void*>(t->entry);
+        switch (kind) {
+        case ThunkKind::Args: {
+            Xbyak::Label normalize;
+            g.test(g.dword[x64::kFrame + static_cast<int>(offsetof(Frame, pairedMask))], t->argMask);
+            g.jnz(normalize, Xbyak::CodeGenerator::T_SHORT);
+            ThunkBranch(g, entry, rax, false);
+            g.L(normalize);
+            g.sub(rsp, 8);  // the stack aligned for the call (the site's call pushed 8)
+            g.mov(x64::ArgReg(0), x64::kFrame);
+            g.mov(x64::ArgReg(1), reinterpret_cast<uint64_t>(t));
+            ThunkBranch(g, reinterpret_cast<const void*>(&JitNormalizeArgs), rax, true);
+            g.add(rsp, 8);
+            g.lea(x64::ArgReg(0), g.ptr[x64::kCtxBase - x64::kCtxBias]);
+            ThunkBranch(g, entry, rax, false);
+            break;
+        }
+        case ThunkKind::Guarded: {
+            Xbyak::Label pending;
+            g.sub(rsp, 8);
+            g.mov(x64::ArgReg(0), x64::kFrame);
+            g.mov(x64::ArgReg(1), reinterpret_cast<uint64_t>(t));
+            ThunkBranch(g, reinterpret_cast<const void*>(&JitThinCall), rax, true);
+            g.add(rsp, 8);
+            g.test(rax, rax);
+            g.jnz(pending, Xbyak::CodeGenerator::T_SHORT);
+            g.ret();
+            g.L(pending);
+            g.add(rsp, 8);
+            ThunkBranch(g, s.exitPending, rax, false);
+            break;
+        }
+        case ThunkKind::Sub:
+            g.mov(eax, t->target);
+            g.mov(rdx, reinterpret_cast<uint64_t>(t));
+            ThunkBranch(g, s.subCallRecord, rcx, false);  // jit_subcall reads eax and rdx, sets rcx first
+            break;
+        }
+        g.ready();
+        const size_t size = (g.getSize() + 15) & ~size_t{15};
+        const void* const at = p.at;
+        p.made.emplace(key, at);
+        p.at += size;
+        p.left -= size;
+        x64::PerfMapAdd(at, g.getSize(), "jit_exits", 0);  // the profile tools count it with the shared routines (cqlib.TRAMPOLINES)
+        x64::DumpCode("jit_exits", at, g.getSize(), t->target);
+        return at;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+#if defined(__linux__) && defined(__x86_64__)
+// A bctrl's call of the patched function t with a host call (Linux x86-64): jit_subcall for t alone, its constants in the code, so that
+// its call of the callee's block (`call r8`, the block from the thread's fast-entry table) serves one target, not every patched
+// callee of every bctrl (~0.15k mispredicts per update at jit_subcall's), and its other branches are direct. The same stack and
+// frame steps as jit_subcall: the routines live in regions of their own whose one FDE (EhFrameRecord::kRoutine) describes the
+// frame at each routine's return from the callee, as jit_subcall's does; JitLiftContinue finds the callee's entry by that return
+// address (NoteLiftEntry). Null when it cannot be made (jit_subcall serves t then).
+struct SubPool {
+    std::mutex mutex;
+    std::unordered_map<const JitCallTarget*, const void*> made;
+    uint8_t* at = nullptr;
+    size_t left = 0;
+    std::vector<x64::EhFrameRecord*> frames;  // never freed (see ThunkPool)
+};
+
+const void* MakeSubThunk(const JitCallTarget* t) noexcept {
+    using namespace Xbyak::util;
+    using Xbyak::CodeGenerator;
+    static SubPool* const pool = new SubPool;
+    SubPool& p = *pool;
+    try {
+        std::lock_guard<std::mutex> lock(p.mutex);
+        const auto found = p.made.find(t);
+        if (found != p.made.end()) return found->second;
+        constexpr size_t kMaxThunk = 256;
+        if (p.left < kMaxThunk) {
+            const JitExecMemory::Region region = JitExecMemory::Allocate(64 * 1024);
+            if (!region) return nullptr;
+            x64::EhFrameRecord* const frame = new x64::EhFrameRecord;
+            frame->Register(region.base, region.size, x64::EhFrameRecord::kRoutine);
+            p.frames.push_back(frame);
+            p.at = static_cast<uint8_t*>(region.base);
+            p.left = region.size;
+        }
+        const PatchedHooks& hooks = GetPatchedHooks();
+        const int frameWord = static_cast<int>(offsetof(Frame, pairedMask));
+        const uint32_t target = t->target;
+        const int slot = static_cast<int>(FastEntryIdx(target) * sizeof(FastEntrySlot));
+        CodeGenerator g(kMaxThunk, p.at);
+        Xbyak::Label fallback, sync, synced;
+        g.mov(rcx, reinterpret_cast<uint64_t>(t->patchedByte));
+        g.cmp(g.byte[rcx], 0);
+        g.je(fallback, CodeGenerator::T_NEAR);
+        g.mov(rcx, x64::AbsMem(g, &hooks.lowestRedirect, rcx, 64));
+        g.cmp(g.dword[rcx], target);
+        g.jbe(fallback, CodeGenerator::T_NEAR);  // the redirect bound at or below t
+        g.sub(rsp, 8);  // with the site's call's 8, the stack aligned for this call
+        ThunkBranch(g, reinterpret_cast<const void*>(&JitThreadFastEntries), rax, true);
+        g.add(rsp, 8);
+        g.test(rax, rax);
+        g.jz(fallback, CodeGenerator::T_NEAR);
+        g.cmp(g.dword[rax + slot], target);
+        g.jne(fallback, CodeGenerator::T_NEAR);
+        g.mov(r8, g.qword[rax + slot + static_cast<int>(offsetof(FastEntrySlot, jitChecked))]);
+        g.test(r8, r8);
+        g.jz(fallback, CodeGenerator::T_NEAR);
+        // as jit_subcall: the target's slot, the return slot (the caller's Frame word), the callee's word (0, lr tagged), the call
+        g.mov(eax, target);
+        g.push(rax);
+        g.push(g.qword[x64::kFrame + frameWord]);
+        g.mov(ecx, g.dword[x64::kCtxBase + x64::CtxDisp(offsetof(CpuContext, lr))]);
+        g.and_(ecx, ~3u);
+        g.or_(ecx, 1u);
+        g.shl(rcx, 32);
+        g.mov(g.qword[x64::kFrame + frameWord], rcx);
+        g.mov(g.dword[x64::kCtxBase + x64::CtxDisp(offsetof(CpuContext, pc))], target);
+        g.call(r8);
+        const size_t returnAt = g.getSize();
+        g.lea(rsp, g.ptr[rsp + 8]);  // the return slot (the callee's return leaves it)
+        g.mov(rcx, x64::AbsMem(g, &hooks.pendingFast, rcx, 64));
+        g.cmp(g.qword[rcx], 0);
+        g.jne(sync, CodeGenerator::T_NEAR);
+        g.mov(rcx, x64::AbsMem(g, &hooks.anyDirty, rcx, 64));
+        g.cmp(g.byte[rcx], 0);
+        g.jne(sync, CodeGenerator::T_NEAR);
+        g.L(synced);
+        g.add(rsp, 8);
+        g.ret();
+        g.L(sync);
+        g.call(x64::AbsMem(g, &hooks.sync, rcx, 64));
+        g.jmp(synced, CodeGenerator::T_NEAR);
+        g.L(fallback);  // the target's wrapper
+        g.lea(x64::ArgReg(0), g.ptr[x64::kCtxBase - x64::kCtxBias]);
+        ThunkBranch(g, reinterpret_cast<const void*>(t->entry), rax, false);
+        g.ready();
+        const size_t size = (g.getSize() + 15) & ~size_t{15};
+        const uint8_t* const at = p.at;
+        x64::NoteLiftEntry(at + returnAt, target);
+        p.made.emplace(t, at);
+        p.at += size;
+        p.left -= size;
+        x64::PerfMapAdd(at, g.getSize(), "jit_subcall", 0);  // counted with jit_subcall (cqlib.TRAMPOLINES)
+        x64::DumpCode("jit_subcall", at, g.getSize(), target);
+        return at;
+    } catch (...) {
+        return nullptr;
+    }
+}
+#else
+const void* MakeSubThunk(const JitCallTarget*) noexcept { return nullptr; }
+#endif
+
+}  // namespace
+
 const void* JitFastCallFor(const JitCallTarget* t, bool tail) noexcept {
     const x64::Shared& s = x64::g_shared;
     if (!x64::kDirectCalls || t == nullptr || !s.ok) return nullptr;
-    if (!t->fastDirect) return s.callGuarded;
-    if (t->argMask != 0) return s.callArgs;
+    if (!t->fastDirect) {
+        const void* const own = MakeThunk(t, ThunkKind::Guarded);
+        return own != nullptr ? own : s.callGuarded;
+    }
+    if (t->argMask != 0) {
+        const void* const own = MakeThunk(t, ThunkKind::Args);
+        return own != nullptr ? own : s.callArgs;
+    }
     // a patched callee of a bctrl with a host call (jit_subcall tests the guard byte again at every call); a bctr's tail call keeps
     // lr in rbp across the call, which the callee's blocks do not keep: the wrapper
-    if (!tail && t->patchedByte != nullptr && *t->patchedByte != 0 && x64::SubFramesPossible()) return s.subCall;
+    if (!tail && t->patchedByte != nullptr && *t->patchedByte != 0 && x64::SubFramesPossible()) {
+        const void* own = MakeSubThunk(t);
+        if (own == nullptr) own = MakeThunk(t, ThunkKind::Sub);
+        return own != nullptr ? own : s.subCall;
+    }
     return reinterpret_cast<const void*>(t->entry);
+}
+
+void x64::JitPatchCallWays(JitCallWays* w, const JitTargetCell* e, bool fill) noexcept {
+    const Shared& s = g_shared;
+    const uint32_t key = e->target;
+    const uint8_t* const fast = static_cast<const uint8_t*>(e->fast);
+    if (key == JitTargetCell::kNoKey || fast == nullptr) return;
+    // the shared routines read the cell entry in rdx, which a way's call does not set
+    if (fast == s.subCall || fast == s.callArgs || fast == s.callGuarded) return;
+    uint32_t key0, key1;
+    std::memcpy(&key0, w->key[0], 4);
+    std::memcpy(&key1, w->key[1], 4);
+    if (key == key0 || key == key1 || w->budget == 0 || (fill && key0 != JitTargetCell::kNoKey)) return;
+    const auto rel = [](const uint8_t* site, const uint8_t* to, int32_t& out) {
+        const int64_t d = to - (site + 4);
+        out = static_cast<int32_t>(d);
+        return d >= INT32_MIN && d <= INT32_MAX;
+    };
+    int32_t rel0;
+    if (!rel(w->rel[0], fast, rel0)) return;
+    --w->budget;
+    // The older way 0 moves to way 1 (its callee first, then its key), then way 0 gets the new one. The code is not running on
+    // another thread; on this one it is reached again only after this returns.
+    if (key0 != JitTargetCell::kNoKey) {
+        int32_t old0, rel1;
+        std::memcpy(&old0, w->rel[0], 4);
+        const uint8_t* const callee0 = w->rel[0] + 4 + old0;
+        if (rel(w->rel[1], callee0, rel1)) {
+            std::memcpy(w->rel[1], &rel1, 4);
+            std::memcpy(w->key[1], &key0, 4);
+        }
+    }
+    std::memcpy(w->rel[0], &rel0, 4);
+    std::memcpy(w->key[0], &key, 4);
+    Bump(fill ? g_counters.wayFills : g_counters.wayPatches);
 }
 
 uint64_t JitX64KindOps(K kind, bool native) {
@@ -2319,7 +2714,8 @@ JitX64Stats JitX64GetStats() {
                        get(g_counters.retires), get(g_counters.enters), get(g_counters.cachesCreated),
                        get(g_counters.cachesDestroyed), get(g_counters.compiledOps), get(g_counters.compileNanos),
                        get(g_counters.cacheHits), get(g_counters.cacheMisses), get(g_counters.staleStubs),
-                       get(g_counters.staleStubFailures), get(g_counters.selfLoops), get(g_counters.guarded)};
+                       get(g_counters.staleStubFailures), get(g_counters.selfLoops), get(g_counters.guarded),
+                       get(g_counters.wayPatches), get(g_counters.wayFills), get(g_counters.orderFlips)};
 }
 
 // The x86-64 backend, or null when the host does not run generated code, or guest memory is not the lean window with

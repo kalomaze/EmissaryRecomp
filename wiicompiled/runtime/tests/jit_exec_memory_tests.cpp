@@ -328,7 +328,8 @@ bool ThpDisabledBySystem() {
     return !read || std::strstr(text, "[never]") != nullptr;
 }
 
-// Linux: the default chunk starts on a 2 MiB boundary, is a whole number of huge pages, and is advised for huge pages.
+// Linux: the default chunk starts on a 2 MiB boundary and is a whole number of huge pages; it is advised for huge pages only with
+// BRAWL_JIT_HUGEPAGES=1 (THPeligible then).
 void TestArenaHugePages() {
     using JitExecMemory::Arena;
     Arena arena;
@@ -337,7 +338,8 @@ void TestArenaHugePages() {
     assert(reinterpret_cast<uintptr_t>(first) % Arena::kHugePageBytes == 0);
     assert(arena.BytesReserved() % Arena::kHugePageBytes == 0);
     first[0] = 1;
-    if (!ThpDisabledBySystem()) {
+    const char* advise = std::getenv("BRAWL_JIT_HUGEPAGES");
+    if (!ThpDisabledBySystem() && advise != nullptr && *advise == '1') {
         const int eligible = ThpEligible(first);
         assert(eligible == 1 || eligible == -1);
         (void)eligible;

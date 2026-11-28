@@ -628,6 +628,9 @@ if(MKW_BUILD_INTERPRETER_TESTS)
         # guarded code (and everything else) with the stores' policy test in line, not the store view's faults
         add_test(NAME mkw_jit_differential_policy_tests COMMAND mkw_jit_differential_tests)
         set_tests_properties(mkw_jit_differential_policy_tests PROPERTIES ENVIRONMENT "BRAWL_LEAN_STORE_VIEW=0")
+        # every line tested (BRAWL_JIT_GUARD=0: no guarded code; the guarded stages expect none)
+        add_test(NAME mkw_jit_differential_noguard_tests COMMAND mkw_jit_differential_tests)
+        set_tests_properties(mkw_jit_differential_noguard_tests PROPERTIES ENVIRONMENT "BRAWL_JIT_GUARD=0")
     endif()
 
     # The floating point group of the run-time compiler against the classic interpreter, over edge values, forms, aliases and
@@ -665,6 +668,11 @@ if(MKW_BUILD_INTERPRETER_TESTS)
         add_test(NAME mkw_jit_branch_direct_far_tests COMMAND mkw_jit_branch_tests)
         set_tests_properties(mkw_jit_branch_direct_far_tests PROPERTIES
             ENVIRONMENT "JIT_BRANCH_DIRECT=1;BRAWL_JIT_FAR_JUMPS=1;BRAWL_JIT_FAR_MEMORY=1;BRAWL_JIT_EXEC_MEM=1;BRAWL_JIT_BLOCK_PC=1")
+        # without guarded code (BRAWL_JIT_GUARD=0): the guarded host-call stages expect none, plain and entered directly
+        add_test(NAME mkw_jit_branch_noguard_tests COMMAND mkw_jit_branch_tests)
+        set_tests_properties(mkw_jit_branch_noguard_tests PROPERTIES ENVIRONMENT "BRAWL_JIT_GUARD=0")
+        add_test(NAME mkw_jit_branch_direct_noguard_tests COMMAND mkw_jit_branch_tests)
+        set_tests_properties(mkw_jit_branch_direct_noguard_tests PROPERTIES ENVIRONMENT "JIT_BRANCH_DIRECT=1;BRAWL_JIT_GUARD=0")
     endif()
     if(MKW_JIT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/jit_quality_tests.cpp")
         add_executable(mkw_jit_quality_tests tests/jit_quality_tests.cpp)
@@ -726,6 +734,9 @@ if(MKW_JIT)
     target_link_libraries(mkw_jit_exec_memory_tests PRIVATE Threads::Threads)
     set_target_properties(mkw_jit_exec_memory_tests PROPERTIES UNITY_BUILD OFF)
     add_test(NAME mkw_jit_exec_memory_tests COMMAND mkw_jit_exec_memory_tests)
+    # the code chunks advised for huge pages (off by default)
+    add_test(NAME mkw_jit_exec_memory_huge_tests COMMAND mkw_jit_exec_memory_tests)
+    set_tests_properties(mkw_jit_exec_memory_huge_tests PROPERTIES ENVIRONMENT "BRAWL_JIT_HUGEPAGES=1")
 endif()
 
 add_executable(mkw_platform_paths_tests "${CMAKE_CURRENT_LIST_DIR}/tests/platform_paths_tests.cpp")

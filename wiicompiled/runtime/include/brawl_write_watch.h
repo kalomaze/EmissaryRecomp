@@ -11,6 +11,21 @@
 #include <stdexcept>
 #include <vector>
 
+namespace BrawlDirtyMemory {
+// A restore to a snapshot taken at consume `snapshotSeq` that calls MarksRestoreWritten once it has written guest memory (the
+// rollback and core restores), with nothing run on this thread in between: what MarksRestored does, except that the interpreter's
+// code cache of this thread drops only the code the restore changed, after it has written (BlockCache::RestoreWritten), and keeps
+// the rest as it is.
+inline void (*restoringMarks)(uint32_t seq) = nullptr;
+inline void (*restoredWritten)() = nullptr;
+inline void MarksRestoring(uint32_t snapshotSeq) {
+    if (restoringMarks) restoringMarks(snapshotSeq); else MarksRestored(snapshotSeq);
+}
+inline void MarksRestoreWritten() {
+    if (restoredWritten) restoredWritten();
+}
+}  // namespace BrawlDirtyMemory
+
 namespace BrawlRollback {
 // Explicit portable instrumentation, not OS page protection. The simulation
 // boundary must quiesce writers before Capture/Reset or destroying the tracker.

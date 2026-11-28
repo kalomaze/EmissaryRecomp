@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "abi_bridge.h"
+#include "brawl_write_watch.h"
 #include "guest_code_patch.h"
 #include "hz_perf.h"
 #include "guest_float_abi.h"
@@ -729,6 +730,7 @@ inline void RememberTarget(JitTargetCell* cell, uint32_t target, const JitCallTa
     cell[0].record = t;
     cell[0].argMask = static_cast<uint16_t>(t->argMask);  // bits 1-13
     cell[0].hits = 0;
+    cell[0].wayHits = 0;
     cell[0].entry = t->entry;
     cell[0].fast = JitFastCallFor(t, tail);
     cell[0].target = target;
@@ -738,6 +740,8 @@ inline void RememberTarget(JitTargetCell* cell, uint32_t target, const JitCallTa
 #if !MKW_JIT
 const void* JitFastCallFor(const JitCallTarget*, bool) noexcept { return nullptr; }
 #endif
+
+void JitDirectGuardedCall(CpuContext* cpu, const JitCallTarget* t) { ThinGuarded(cpu, *t); }
 
 void JitDirectFprsCall(CpuContext* cpu, const JitCallTarget* t) {
     if (t->address != 0) RecompMod::g_currentTranslatedExecutionAddress = t->address;
@@ -1517,6 +1521,26 @@ struct BlockCache {
     static uint32_t SlotOf(uint32_t pc) { return ((pc >> 2) ^ (pc >> 16)) & (kSlots - 1u); }
     Slot slots[kSlots] = {};
     FastEntrySlot fastEntries[kFastEntrySlots] = {};  // L1 cache of compiled, logged, non-hook entries -> jitChecked
+    // The entry each slot of fastEntries last held before another took it (a second way, which only the C++ entries probe:
+    // jit_subcall reads fastEntries alone). Hot patched functions whose starts share a slot took turns in it, each call of
+    // one sending the other to the slow entry (two such pairs ran ~17 times an update each).
+    FastEntrySlot fastVictims[kFastEntrySlots] = {};
+    // The compiled entry of `pc` in either way, or null.
+    MKW_PPC_FORCE_INLINE const void* FastEntryFor(uint32_t pc) const {
+        const uint32_t i = FastEntryIdx(pc);
+        if (__builtin_expect(fastEntries[i].pc == pc, 1)) return fastEntries[i].jitChecked;
+        return fastVictims[i].pc == pc ? fastVictims[i].jitChecked : nullptr;
+    }
+    void FastEntryPut(uint32_t pc, const void* jitChecked) {
+        static const bool victims = [] {  // BRAWL_JIT_FAST_VICTIMS=0: one way, as before
+            const char* v = std::getenv("BRAWL_JIT_FAST_VICTIMS");
+            return v == nullptr || *v != '0';
+        }();
+        const uint32_t i = FastEntryIdx(pc);
+        if (victims && fastEntries[i].pc != pc && fastEntries[i].jitChecked != nullptr) fastVictims[i] = fastEntries[i];
+        if (fastVictims[i].pc == pc) fastVictims[i] = FastEntrySlot{};
+        fastEntries[i] = FastEntrySlot{pc, 0, jitChecked};
+    }
     std::unordered_map<uint32_t, Block*> blocks;
     // Blocks are packed into chunks in the order they are built, so code that runs together sits together.
     static constexpr size_t kChunkBytes = 256 * 1024;
@@ -1614,6 +1638,9 @@ struct BlockCache {
         Caches().push_back(this);
         BrawlDirtyMemory::consumingMarks = &ConsumingMarks;
         BrawlDirtyMemory::restoredMarks = &RestoredMarks;
+        BrawlDirtyMemory::restoringMarks = &RestoringMarks;
+        BrawlDirtyMemory::restoredWritten = &RestoreWritten;
+        t_own = this;
         BrawlDirtyMemory::guardedWritten = &GuardedWritten;
     }
     ~BlockCache() {
@@ -1621,6 +1648,7 @@ struct BlockCache {
             std::lock_guard<std::mutex> lock(CachesMutex());
             Caches().erase(std::find(Caches().begin(), Caches().end(), this));
         }
+        if (t_own == this) t_own = nullptr;
         DestroyJit();
     }
     BlockCache(const BlockCache&) = delete;
@@ -1630,11 +1658,22 @@ struct BlockCache {
         if (v.empty()) newMarks.push_back(mark);
         v.push_back(b);
     }
-    void RetireAll(uint32_t mark) {  // with CachesMutex held
+    // The calling thread's cache (made by its ThreadState, on that thread).
+    static inline thread_local BlockCache* t_own = nullptr;
+    // The blocks of this cache a restore announced with MarksRestoring would drop, kept as they are until the restore has written
+    // (RestoreWritten: with CachesMutex held).
+    std::vector<Block*> restorePending;
+    // A block the restore may change: dropped now, or (`pending`: a restore that RestoreWritten follows, this thread's cache) once
+    // the restore has written and only if its words changed.
+    void DropRestored(Block& b, bool pending) {  // with CachesMutex held
+        if (pending) restorePending.push_back(&b);
+        else DropCounted(b);
+    }
+    void RetireAll(uint32_t mark, bool pending) {  // with CachesMutex held
         const auto it = owners.find(mark);
         if (it == owners.end()) return;
         for (Block* o : it->second)
-            if (o->epoch != 0) DropCounted(*o);
+            if (o->epoch != 0) DropRestored(*o, pending);
     }
     // A block no longer known to match guest memory (epoch 0): the link slots aimed at it are suspended first, as compiled code
     // follows a slot without testing the target's epoch (Block::jitLinked). A refresh that finds its words unchanged aims them
@@ -1719,7 +1758,18 @@ struct BlockCache {
     // BrawlDirtyMemory::restoredMarks: rollback restored its pages to a snapshot taken at consume `snapshotSeq`, so
     // guest memory changed where it was written since, all of which a later consume found (or code built since then
     // was decoded from). Retire that code; the restore counts as a write for any older snapshot.
-    static void RestoredMarks(uint32_t snapshotSeq) {
+    // BrawlDirtyMemory::restoringMarks: the same for a restore that calls MarksRestoreWritten once it has written: the blocks of
+    // this thread's cache wait for RestoreWritten (nothing runs on this thread in between: the caller restores and returns),
+    // those of other threads' caches are dropped now.
+    static void RestoredMarks(uint32_t snapshotSeq) { RestoredMarksImpl(snapshotSeq, false); }
+    static void RestoringMarks(uint32_t snapshotSeq) {
+        static const bool pending = [] {  // BRAWL_JIT_RESTORE_PENDING=0: every block dropped before the restore writes, as before
+            const char* v = std::getenv("BRAWL_JIT_RESTORE_PENDING");
+            return v == nullptr || *v != '0';
+        }();
+        RestoredMarksImpl(snapshotSeq, pending);
+    }
+    static void RestoredMarksImpl(uint32_t snapshotSeq, bool written) {
         diag::Add(diag::kRestores);
         const uint64_t retiredBefore = diag::ChurnOn() ? RetiredTotal() : 0;
         struct Tally {
@@ -1729,6 +1779,7 @@ struct BlockCache {
         const uint32_t now = BrawlDirtyMemory::consumeSeq.fetch_add(1, std::memory_order_acq_rel) + 1;
         std::lock_guard<std::mutex> lock(CachesMutex());
         for (BlockCache* c : Caches()) {
+            const bool pending = written && c == t_own;
             // the marks last found set after the snapshot; the restore writes them again, now
             size_t first = c->writtenAt.size();
             while (first > 0 && c->writtenAt[first - 1].first > snapshotSeq) --first;
@@ -1741,13 +1792,27 @@ struct BlockCache {
                                         [](const auto& a, const auto& b) { return a.second == b.second; }),
                             again.end());
                 for (auto& [at, m] : again) {
-                    c->RetireAll(m);
+                    c->RetireAll(m, pending);
                     at = now;
                 }
                 c->writtenAt.insert(c->writtenAt.end(), again.begin(), again.end());
             }
             for (auto it = c->builtAt.rbegin(); it != c->builtAt.rend() && it->first >= snapshotSeq; ++it)
-                if (it->second->epoch != 0) c->DropCounted(*it->second);
+                if (it->second->epoch != 0) c->DropRestored(*it->second, pending);
+        }
+    }
+    // BrawlDirtyMemory::restoredWritten: the restore MarksRestoring announced has written guest memory. Of the blocks of this
+    // thread's cache it would have dropped (restorePending), those whose words it changed are dropped now, before any of them can
+    // run; the others (a mod's variable next to them is what the restore rewrote, or code built since the snapshot from words the
+    // snapshot holds too) stay as they were: no epoch or link slot in their code is written, and no refresh follows.
+    static void RestoreWritten() {
+        std::lock_guard<std::mutex> lock(CachesMutex());
+        for (BlockCache* c : Caches()) {
+            for (Block* b : c->restorePending) {
+                if (b->epoch == 0 || g_jitEpochFault == 6) continue;  // dropped since (a consume); 6: a test aid
+                if (!Holds(*b)) c->DropCounted(*b);
+            }
+            c->restorePending.clear();
         }
     }
     // Guarded code (BrawlDirtyMemory::guardedWritten, Block::jitGuarded): the start pcs whose blocks must keep their tests (they
@@ -1955,6 +2020,7 @@ struct BlockCache {
         Report();
         for (Slot& s : slots) s = Slot{};
         std::memset(fastEntries, 0, sizeof(fastEntries));
+        std::memset(fastVictims, 0, sizeof(fastVictims));
         for (const auto& [pc, b] : blocks) Retire(*b);
         blocks.clear();
 #if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
@@ -1966,6 +2032,7 @@ struct BlockCache {
             newMarks.clear();
             writtenAt.clear();
             builtAt.clear();
+            restorePending.clear();
         }
 #endif
         DestroyJit();  // after the blocks are dropped: all their code goes
@@ -1981,6 +2048,8 @@ struct BlockCache {
     void Retire(Block& b) {
         FastEntrySlot& fe = fastEntries[FastEntryIdx(b.start)];
         if (fe.pc == b.start) fe = FastEntrySlot{};
+        FastEntrySlot& victim = fastVictims[FastEntryIdx(b.start)];
+        if (victim.pc == b.start) victim = FastEntrySlot{};
         if (b.jitEntry == nullptr && b.jitIncoming == nullptr) return;
         if (const JitBackend* const backend = Backend()) backend->retire(b);
     }
@@ -3371,7 +3440,7 @@ MKW_PPC_NO_INLINE bool RunCompiledEntrySlow(CpuContext* ctx, uint32_t entry) {
     diag::Add(diag::kSlowEntriesRan);
     NoteEntry(state, ctx, entry);
     if (b->jitChecked != nullptr) {
-        cache.fastEntries[FastEntryIdx(entry)] = FastEntrySlot{entry, 0, b->jitChecked};
+        cache.FastEntryPut(entry, b->jitChecked);
     }
     std::optional<CpuContextScope> cpuContextScope;
     if (__builtin_expect(TryGetCpuContext() != ctx, 0)) cpuContextScope.emplace(ctx);
@@ -3414,15 +3483,15 @@ bool detail::RunCompiledEntry(CpuContext* ctx, uint32_t entry) {
     if (__builtin_expect(state != nullptr && g_fastJitReady.load(std::memory_order_acquire) &&
                              TryGetCpuContext() == ctx &&
                              (!state->cache.overLimit || state->cache.depth != 0), 1)) {
-        const FastEntrySlot& fe = state->cache.fastEntries[FastEntryIdx(entry)];
-        if (__builtin_expect(fe.pc == entry && fe.jitChecked != nullptr && JitBlocksMayRun(ctx), 1)) {
+        const void* const checked = state->cache.FastEntryFor(entry);
+        if (__builtin_expect(checked != nullptr && JitBlocksMayRun(ctx), 1)) {
             diag::Add(diag::kFastEntries);
             ++state->cache.depth;
             struct DepthScope {
                 BlockCache* cache;
                 ~DepthScope() { --cache->depth; }
             } depthScope{&state->cache};
-            g_enterDirect(ctx, entry, fe.jitChecked, &state->directState);
+            g_enterDirect(ctx, entry, checked, &state->directState);
             return true;
         }
     }
@@ -3443,8 +3512,8 @@ void detail::RunPatchedJit(CpuContext* ctx, uint32_t address) {
     if (__builtin_expect(state != nullptr && address < h.lowestRedirect->load(std::memory_order_acquire) &&
                              g_fastJitReady.load(std::memory_order_acquire) && TryGetCpuContext() == ctx &&
                              (!state->cache.overLimit || state->cache.depth != 0), 1)) {
-        const FastEntrySlot& fe = state->cache.fastEntries[FastEntryIdx(address)];
-        if (__builtin_expect(fe.pc == address && fe.jitChecked != nullptr && JitBlocksMayRun(ctx), 1)) {
+        const void* const checked = state->cache.FastEntryFor(address);
+        if (__builtin_expect(checked != nullptr && JitBlocksMayRun(ctx), 1)) {
             diag::Add(diag::kFastEntries);
             {
                 ++state->cache.depth;
@@ -3452,7 +3521,7 @@ void detail::RunPatchedJit(CpuContext* ctx, uint32_t address) {
                     BlockCache* cache;
                     ~DepthScope() { --cache->depth; }
                 } depthScope{&state->cache};
-                g_enterDirect(ctx, address, fe.jitChecked, &state->directState);
+                g_enterDirect(ctx, address, checked, &state->directState);
             }
             // RunPatched's Sync test: what the function called may have patched more code (GuestCodePatch::RunPatched)
             if (__builtin_expect(h.pendingFast->load(std::memory_order_acquire) != 0 ||

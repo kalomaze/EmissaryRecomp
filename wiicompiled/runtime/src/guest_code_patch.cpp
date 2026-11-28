@@ -362,6 +362,9 @@ inline void MarkPendingPage(uint32_t address) {
     const uint32_t page = address / kPage;
     const uint32_t word = page / 32;
     const uint32_t bit = 1u << (page % 32);
+    // a page already pending (written since the Sync that last took it) has its group and root bits set too, or they were taken
+    // by a Sync that has yet to take its page word: three locked or-s fewer for every further write to a pending page
+    if ((g_pendingPages[word].load(std::memory_order_relaxed) & bit) != 0) return;
     g_pendingPages[word].fetch_or(bit, std::memory_order_relaxed);
     g_pendingGroups[word / 32].fetch_or(1u << (word % 32), std::memory_order_release);
     g_pendingRoots[word / 32 / 32].fetch_or(1u << ((word / 32) % 32), std::memory_order_release);
@@ -592,9 +595,8 @@ bool NoteWrite(uint32_t address) {
     // variable embedded inside a code page), record its address directly and skip the 3-level bitmap and 4 KiB scan.
     if (!GuestFlat::IsActive() && ((address & (kPage - 1)) <= kPage - 8)) {
         const uint64_t tag = static_cast<uint64_t>(address & ~3u) | (uint64_t{1} << 32);
-        uint64_t cur = g_pendingFast.load(std::memory_order_relaxed);
-        if (cur == tag &&
-            g_pendingFast.compare_exchange_strong(cur, tag, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        uint64_t cur = g_pendingFast.load(std::memory_order_acquire);
+        if (cur == tag) {  // the word is pending already (a locked compare-exchange of the same value would be all it did)
             HZ_PERF_ADD(kHzNoteWrite, 1);
             Bump(g_stats.noteWrites);
             return true;

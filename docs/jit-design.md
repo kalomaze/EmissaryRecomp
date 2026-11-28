@@ -117,6 +117,12 @@ data (a third part): link slots, the stale cell, inline caches, call cells (writ
   a new chunk.
 - Exit status: `Continue` (next pc), `Return` (the frame's function returned), `Pending` (an exception is stored in
   the frame).
+- Rollback's restore writes guest memory without marks. Its notification (`MarksRestoring`) names the blocks under the marks
+  written since the snapshot and those built since; other threads' caches drop theirs at once, the calling thread's keep them until
+  the restore has written (`MarksRestoreWritten`, `RestoreWritten`: nothing runs on that thread in between), and then drop only those
+  whose words it changed. The others stay as they were: no epoch or link slot in their code is written and no refresh follows
+  (`MarksRestored`, the notification alone, drops them all, as before). The restores call `MarksRestoreWritten` from a destructor,
+  so that a restore that throws half way still has its writes compared.
 - A block whose dirty marks stay set though its words do not change (a mod's variable inside a function's code) gets,
   after repeated failures of its check, a stub that compares its words in place and enters it when they are equal.
 
@@ -187,8 +193,14 @@ code; what is left (rare instruction forms, overflow-enable forms) takes this pa
   goes through `JitThinCall` / `JitThinTail` with a per-target `JitCallTarget` (the record's entry and guards, the float ABI),
   settled when the block is compiled. A call site that knows its callee tests the callee's float argument registers in line.
   `bctrl` and `bctr` keep their last eight targets in a cell of the block's data (`kCellWays`), each with what the site calls
-  for it (`JitFastCallFor`: the entry, or a shared routine); an entry hit often moves to the front. Untranslated targets of
-  either go through the block's inline cache 1. The rollback loop frame always takes the general path (`Call`).
+  for it (`JitFastCallFor`: the entry, or the target's own routine, made once per target with direct branches only: the float
+  arguments, the guards, a patched callee's host call); an entry hit often moves to the front. Before the cell, a site (Linux,
+  not a switch's table) tests two inline ways, `cmp eax, imm32` and `call rel32` that its slow path writes (`x64::JitCallWays`):
+  its first target, then any target hit out of line 32 times, so that a site's common targets are direct calls. Untranslated targets of
+  either go through the block's inline cache 1. Each site starts with a 5-byte nop (`BlockEmitter::EmitOrderSwitch`); once the
+  block's cache 1 links a target (`FlipProbeOrder`, from `LinkCached`) every such nop becomes a `jmp` to the site's own probe of
+  cache 1, which goes on after the nop on a miss: a mod's virtual calls (code the JIT compiled) then skip the ways, the cell and the
+  table (`BRAWL_JIT_CACHE_FIRST=0` keeps the order). The rollback loop frame always takes the general path (`Call`).
 - A call to a patched function (a translated function whose guard byte is set, which `GuestCodePatch::RunPatched` runs in
   a `Run` of its own) from a `bl`, while the guard byte stays set and no redirect applies (Linux), is a host `call` of the
   callee's block in the caller's `Frame`. The nested `Run`'s per-call state is only `pairedMask` (0) and `returnAddress`
@@ -202,13 +214,22 @@ code; what is left (rare instruction forms, overflow-enable forms) takes this pa
   unlinked call link, a cache miss, an exception) goes through `lift` (`JitLiftContinue`): the callee gets a `Frame` of its
   own from the shared state and the dispatcher runs it (`JitDirectContinue`) until it returns; then the tagged return. A
   `bctrl` does the same through `jit_subcall` (fast-entry table). Otherwise the wrapper runs `RunPatched`.
+- A direct call of a translated function whose record lets it leave one to three non-volatile FPRs written (an FPR guard and no GPR
+  guard) keeps their raw bits in `rbp`, `r14` and `r12` across the call (callee-saved; the GPR cache is empty at a call and the
+  pinned `r14` and `r12` are set again after it) and stores them back, where `JitDirectFprsCall` copies them in C++. The call's
+  return address is followed by an 8-byte nop whose displacement says which FPRs went where: the code chunks' FDE names a
+  personality routine (`JitBlockPersonality`), which, when an exception passes such a call, puts the FPRs back from the unwound
+  registers as the C++ guard's destructor does, and lets the unwinding go on (no landing pad).
+- A `bl` to a target with a GPR guard (a native) calls `JitDirectGuardedCall` directly (its guards restore the registers when the
+  callee throws, and the exception unwinds through the block), not the `noexcept` shim that catches and stores it.
 - `bctrl` and `bctr` sites whose cells miss look in the code cache's table of translated targets (`TargetTable`, one for
   calls and one for tail calls, filled from the cells) before their shims. A `bctr` after `lwzx; mtctr` (a switch's table)
   probes the inline cache first. `ctx->pc` (a diagnostic) is not stored before direct calls of translated code.
 - `GuestCodePatch::RunPatched` enters compiled code through `RunCompiledEntry`, which does what `Run` does for a first
   block that has code, is current and is no hook pc, and hands anything else to the general entry. With code variants off
   it tail-calls `RunPatchedJit`, which makes the redirect test, `RunCompiledEntry`'s fast path and the `Sync` test in one
-  function. `Run` itself tries `RunCompiledEntry` first, so translated code's calls of untranslated code (a mod's module,
+  function. The thread's fast-entry table has a second way that only these C++ entries probe (`jit_subcall` reads the first): two
+  hot patched functions whose starts share a slot no longer send each other to the slow entry. `Run` itself tries `RunCompiledEntry` first, so translated code's calls of untranslated code (a mod's module,
   through `RunUntranslatedOrFail`) enter through `jit_enter_direct` too.
 - Linux x86-64: code space is mapped within a rel32 displacement of the executable's text (a reservation at the top of the
   reachable window), so calls of translated functions and runtime helpers are `call rel32`.
@@ -244,6 +265,10 @@ Read once, at first use.
 | `BRAWL_JIT_FAR_JUMPS=1` | jumps to the shared routines always take the long form (`mkw_jit_quality_far_tests`) |
 | `BRAWL_JIT_FAR_MEMORY=1` | code space mapped anywhere, not near the executable (`mkw_jit_branch_direct_far_tests`) |
 | `BRAWL_JIT_GUARD=0` | every line of a block tested, guarded ones too (see "Guarded lines") |
+| `BRAWL_JIT_RESTORE_PENDING=0` | a restore drops every block it may change before it writes, as `MarksRestored` does (none waits for the compare) |
+| `BRAWL_JIT_FAST_VICTIMS=0` | the fast-entry table keeps one way (no second way for the entries a slot held before) |
+| `BRAWL_JIT_GUARDED_DIRECT=0` | a `bl` to a native goes through `JitThinCallPrepared` (the `noexcept` shim), not `JitDirectGuardedCall` |
+| `BRAWL_JIT_THIN_SAVES=0` | direct calls of records with an FPR guard always go through `JitDirectFprsCall` (no FPR saves in line) |
 | `BRAWL_JIT_EXEC_MEM=1`, `BRAWL_JIT_BLOCK_PC=1` | blocks add their count to `frame.executed` in memory; blocks store `ctx->pc` at entry |
 
 ## Files

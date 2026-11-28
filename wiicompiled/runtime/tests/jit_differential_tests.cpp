@@ -16,6 +16,7 @@
 // only after many programs), so a block's first runs really are its first.
 #include "abi_bridge.h"
 #include "brawl_dirty_memory.h"
+#include "brawl_write_watch.h"
 #include "isa/ppc_isa_fpenv.h"
 #include "jit_test_cr.h"
 #include "lean_window.h"
@@ -748,7 +749,7 @@ void FnThrow(CpuContext* c) {
 
 constexpr uint32_t kFnModify = kFuncBase + 0x00, kFnFloat = kFuncBase + 0x10, kFnWrite = kFuncBase + 0x20,
                    kFnReenter = kFuncBase + 0x30, kFnThrow = kFuncBase + 0x40, kFnRewrite = kFuncBase + 0x50,
-                   kFnRestore = kFuncBase + 0x60, kFnSetSo = kFuncBase + 0x70;
+                   kFnRestore = kFuncBase + 0x60, kFnSetSo = kFuncBase + 0x70, kFnRestoreWritten = kFuncBase + 0x80;
 
 void RegisterFunction(uint32_t address, const char* name, void (*fn)(CpuContext*)) {
     TranslatedFunctionInfo info{};
@@ -2348,6 +2349,15 @@ void FnRestore(CpuContext* c) {
     BrawlDirtyMemory::MarksRestored(0);
     c->gpr[7] = c->gpr[3] + 12u;
 }
+// A restore in the order rollback makes it: the notification (MarksRestoring), the write without marks, then MarksRestoreWritten,
+// which drops the blocks of this thread's cache whose words the write changed and keeps the others. The caller's block holds the
+// rewritten word unless it is the one already there.
+void FnRestoreWritten(CpuContext* c) {
+    BrawlDirtyMemory::MarksRestoring(0);
+    RawWrite(c->gpr[3], c->gpr[4]);
+    BrawlDirtyMemory::MarksRestoreWritten();
+    c->gpr[7] = c->gpr[3] + 16u;
+}
 
 // A word rewritten without marks by a call the running chain of compiled blocks makes (FnRewrite), reached after the call
 // through a link slot or an inline cache, which do not test the target's epoch (Block::jitLinked). The call is made three
@@ -2423,6 +2433,64 @@ void AddLinkEpochPrograms() {
     }
 }
 
+// The restore-notification program of AddLinkEpochPrograms with the restore written (FnRestoreWritten), in a stage of its own after
+// the others (the slots the stages before use stay as they were: the store view lag stage notices its fault in one program only);
+// `twice`: a second such call writes the word back.
+void AddRestoreWrittenPrograms() {
+    Rng rng(63);
+    using namespace ppc;
+    for (int twice = 0; twice < 2; ++twice) {
+        Asm a;
+        Label patched = a.NewLabel();
+        a.Save();
+        a.LiLabel(3, patched);
+        a << mr(4, 8);
+        a.BAbs(kFnRestoreWritten, true);
+        a.Bind(patched);
+        a << addi(10, 4, 0) << xori(11, 11, 2);
+        if (twice) {
+            a.LiLabel(3, patched);
+            a.Li32(4, addi(10, 4, 0));
+            a.BAbs(kFnRestoreWritten, true);
+            a << addi(10, 10, 3);
+        }
+        a.Done();
+        States st;
+        for (int round = 0; round < 2; ++round)
+            for (uint32_t w : kPatchWords)
+                for (int repeat = 0; repeat < 3; ++repeat) {
+                    CpuContext c = BaseState(rng);
+                    c.gpr[8] = w;
+                    st.push_back(c);
+                }
+        AddProgram("stale", twice ? "a call rewrites the next instruction and puts it back, restore written"
+                                  : "a call rewrites the next instruction without marks, restore written",
+                   a, st);
+    }
+}
+
+// The restore-written programs with the restore's compare left out on purpose (g_jitEpochFault 6: every block the restore would
+// drop kept, its words changed or not): they must notice. With BRAWL_JIT_RESTORE_PENDING=0 every such block is dropped before the
+// restore writes and nothing waits for the compare: there is no fault to notice.
+void RestoreWrittenFault() {
+    if (!PpcInterpreter::JitAvailable()) return;
+    const char* const pendingEnv = std::getenv("BRAWL_JIT_RESTORE_PENDING");
+    if (pendingEnv != nullptr && *pendingEnv == '0') return;
+    const unsigned failures = g_failures, reported = g_reported;
+    PpcInterpreter::detail::g_jitEpochFault = 6;
+    g_reported = kMaxReports;
+    AddRestoreWrittenPrograms();
+    const unsigned noticed = g_failures - failures;
+    PpcInterpreter::detail::g_jitEpochFault = 0;
+    g_failures = failures;
+    g_reported = reported;
+    std::printf("  restore written fault: %u failed\n", noticed);
+    if (noticed == 0) {
+        std::fprintf(stderr, "FAIL: the deliberate restore fault (the blocks a restore changed kept) was not noticed\n");
+        ++g_failures;
+    }
+}
+
 // The same programs with the link epoch made wrong on purpose four ways (g_jitEpochFault): each must make a program fail.
 void LinkEpochFaults() {
     if (!PpcInterpreter::JitAvailable()) return;
@@ -2486,6 +2554,20 @@ void AddStaleCode() {
                 run();
                 BrawlDirtyMemory::MarksRestored(0);
                 run();
+                BrawlDirtyMemory::MarksRestoring(0);
+                BrawlDirtyMemory::MarksRestoreWritten();
+                run();
+                for (unsigned i = 0; i < pieces; ++i) {  // restores that change a piece's first word, and put it back
+                    BrawlDirtyMemory::MarksRestoring(0);
+                    RawWrite(at[i], addi(3, 3, 0x33));
+                    BrawlDirtyMemory::MarksRestoreWritten();
+                    run();
+                    run();
+                    BrawlDirtyMemory::MarksRestoring(0);
+                    RawWrite(at[i], addi(3, 3, 1));
+                    BrawlDirtyMemory::MarksRestoreWritten();
+                    run();
+                }
                 for (unsigned i = 0; i < pieces; ++i) {  // writes that set no mark: only the new epoch tells
                     RawWrite(at[i], addi(3, 3, 0x21));
                     BrawlDirtyMemory::MarksCleared();
@@ -3415,6 +3497,7 @@ int main() {
     RegisterFunction(kFnThrow, "DiffThrow", FnThrow);
     RegisterFunction(kFnRewrite, "DiffRewrite", FnRewrite);
     RegisterFunction(kFnRestore, "DiffRestore", FnRestore);
+    RegisterFunction(kFnRestoreWritten, "DiffRestoreWritten", FnRestoreWritten);
     RegisterFunction(kFnSetSo, "DiffSetSo", FnSetSo);
     TranslatedFunctionRegistry::Finalize();
     WriteSupportCode();
@@ -3463,6 +3546,8 @@ int main() {
         std::printf("  %-34s %6.2f s%s\n", "random programs", Since(t), g_failures != before ? "  FAILED" : "");
     }
     GuardedStages(randomCount, firstSeed);
+    Stage("restore written", AddRestoreWrittenPrograms);
+    Stage("restore written fault", RestoreWrittenFault);
     MkwRestoreHostMxcsr(savedControl);
     PpcInterpreter::ClearEngineOverride();
 

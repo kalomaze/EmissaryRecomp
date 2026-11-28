@@ -289,6 +289,8 @@ void RunPatchedJit(CpuContext* ctx, uint32_t address);
 
 // Direct call to a non-throwing-guard fprsOnly target (no try/catch: unwinds directly through chunk .eh_frame).
 void JitDirectFprsCall(CpuContext* cpu, const JitCallTarget* t);
+// The same for a target with a GPR guard (a native): ThinGuarded's work, its guards restoring when the callee throws.
+void JitDirectGuardedCall(CpuContext* cpu, const JitCallTarget* t);
 
 using EnterDirectFn = void (*)(CpuContext* ctx, uint32_t entry, const void* jitChecked, DirectEnterState* state);
 
@@ -350,7 +352,8 @@ inline const uint32_t* JitLinkEpochCell() noexcept { return &g_jitLinkEpoch; }
 // A test aid (jit_differential_tests): the link epoch made wrong on purpose so that the tests can show they notice. 1: a new
 // epoch suspends no slot; 2: JitNoteEpoch does nothing; 3: ExitDynamicAfterCall takes the inline cache unguarded (read when a
 // block is compiled); 4: a block's epoch is not copied into its code (JitBackend::setEpoch); 5: a write under guarded code drops
-// nothing (BlockCache::GuardedWritten). 0 in a real run.
+// nothing (BlockCache::GuardedWritten); 6: a restore's writes are not compared, every block it would drop is kept
+// (BlockCache::RestoreWritten). 0 in a real run.
 inline int g_jitEpochFault = 0;
 // JitNoteEpoch's work when the epochs differ: every slot suspended (JitBackend::suspend), the cell set to markEpoch.
 void JitSweepLinks() noexcept;
@@ -388,7 +391,7 @@ const JitCallTarget* JitCallTargetFor(uint32_t target) noexcept;
 struct JitTargetCell {
     uint32_t target;
     uint16_t argMask;                // record->argMask and record->entry, beside the key: what the call routines read on every call
-    uint8_t reserved;
+    uint8_t wayHits;                 // the site's: hits of this entry out of line, past its inline ways (it goes in them every 32)
     uint8_t hits;                    // the site's: hits of this entry while it is not the first (it moves to the first every 8)
     const JitCallTarget* record;
     const void* fast;

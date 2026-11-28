@@ -1443,6 +1443,81 @@ void SubFrameCalls() {
     SubState(0, false);
 }
 
+// --- exceptions through the call sites' routines into blocks that keep FPRs in host registers -------------------------------------
+// A bl to an fprsOnly function of at most three FPRs keeps them in rbp, r14, r12 across the call (EmitThinSaveCall); when the callee
+// throws, the blocks' personality routine puts them back. Here the exception comes through the code a bctrl or bctr site calls: the
+// subcall routine of a patched callee (MakeSubThunk: a host call of the callee's block, a frame of its own), a fprsOnly callee's own
+// routine, a native called directly. `top` 0: the program's own thin-save bl calls kReenterFprs (f30, f31 kept), which runs G in a
+// Run of its own (a trampoline between the two thin-save frames); 1: the program is G. `inner`: how G reaches the thrower (f15, f17,
+// f31 kept around its call): 0 bctrl of patched function 0, which calls it by bl; 1 bctrl of it; 2 bctr of it; 3 bctrl of function 0,
+// which calls it by bctrl; 4 bctrl of function 0, which calls the throwing native by bl. The thrower throws on odd r12.
+constexpr uint32_t kReenterFprs = 0x80042090u, kThrowFprs = 0x800420A0u;
+void FnThrowFprs(CpuContext* c) {
+    const bool fail = (c->gpr[12] & 1u) != 0;
+    ClobberAll(c, 6);
+    c->gpr[12] = fail ? 1u : 0u;
+    if (fail) throw std::runtime_error("fprs callee threw");
+}
+void RegisterThinSaveFunctions() {
+    RegisterFunctionEx(kReenterFprs, "ReenterFprs", FnReenter, FunctionKind::BaseTranslated, kMasks[4]);  // f30, f31
+    RegisterFunctionEx(kThrowFprs, "ThrowFprs", FnThrowFprs, FunctionKind::BaseTranslated, kMasks[5]);    // f15, f17, f31
+}
+
+void ThinSavesThroughRoutines(int top, int inner) {
+    Asm a;
+    Label g = a.NewLabel();
+    if (top == 0) {
+        a << mflr(0) << stw(0, 0, 1);
+        PairedSetup(a, 11);
+        a.LiLabel(5, g);
+        a.BAbs(kReenterFprs, true);
+        a << addi(10, 10, 1);
+        ObserveFprs(a, 0x40);
+        a << lwz(0, 0, 1) << mtlr(0) << blr();
+    }
+    a.Bind(g);
+    Label back = a.NewLabel();
+    a << stwu(1, -32, 1) << mflr(0) << stw(0, 36, 1) << lfd(30, 0x48, 1) << lfd(31, 0x50, 1) << addi(16, 3, 3);
+    switch (inner) {
+    case 1: a.Li32(8, kThrowFprs), a << mtctr(8) << bctrl(); break;
+    case 2: a.LiLabel(7, back) << mtlr(7), a.Li32(8, kThrowFprs), a << mtctr(8) << bctr(); break;
+    default: a.Li32(8, SubAddress(0)), a << mtctr(8) << bctrl(); break;
+    }
+    a.Bind(back);
+    a << addi(11, 11, 1) << lfd(30, 0x58, 1) << lwz(0, 36, 1) << mtlr(0) << addi(1, 1, 32) << blr();
+    Asm f;  // patched function 0
+    f << stwu(1, -32, 1) << mflr(0) << stw(0, 36, 1) << lfd(15, 0x40, 1) << lfd(17, 0x48, 1) << lfd(31, 0x58, 1);
+    if (inner == 3) f.Li32(8, kThrowFprs), f << mtctr(8) << bctrl();
+    else if (inner == 4) f.BAbs(kSubThrowGuarded, true);
+    else f.BAbs(kThrowFprs, true);
+    f << addi(11, 11, 2) << lfd(17, 0x50, 1) << lwz(0, 36, 1) << mtlr(0) << addi(1, 1, 32) << blr();
+    Scenario s;
+    s.image = a.Finish();
+    const Image f0 = f.Finish();
+    s.runs = [=](uint32_t, std::vector<RunSpec>& runs) {
+        WriteImage(f0, SubAddress(0));
+        Rng local(500 + static_cast<uint32_t>(top * 8 + inner));
+        static const uint32_t kUnpatched[] = {0, 0, 0, 0, 1, 0, 0, 0};
+        for (int round = 0; round < 3; ++round)
+            for (size_t i = 0; i < sizeof kUnpatched / sizeof *kUnpatched; ++i) {
+                RunSpec spec;
+                spec.ctx = BaseState(local);
+                spec.ctx.gpr[12] = (i + static_cast<size_t>(round)) % 3 == 1 ? 1u : 0u;
+                const uint32_t unpatched = kUnpatched[i];
+                spec.before = [unpatched] { SubState(unpatched, false); };
+                runs.push_back(std::move(spec));
+            }
+    };
+    SubState(0, false);
+    RunCase(Fmt("thin saves through routines, top %d inner %d", top, inner), s);
+}
+
+void ThinSavesThroughRoutinesAll() {
+    for (int top = 0; top < 2; ++top)
+        for (int inner = 0; inner < 5; ++inner) ThinSavesThroughRoutines(top, inner);
+    SubState(0, false);
+}
+
 
 // --- host calls between patched functions that do not return the usual way, and exits from inside one ---------------------------
 // A patched callee runs in a Run of its own under RunPatched; the JIT calls its block with a host call in the caller's Frame instead
@@ -1875,10 +1950,98 @@ void LeanEntryHooks() {
     }
 }
 
+// One bctrl or bctr site whose common target changes over a long run, so that its inline ways (x64::JitCallWays) are written by the
+// first miss and then by targets hit out of line 32 times, moving older targets out of the ways: A once, B 40 times, C 40 times, A 20
+// times, then B and a fourth target alternating (translated functions of several kinds, a patched one, or leaf code). Answers
+// whether the ways were written at least three times over all runs of all engines.
+bool IndirectHotWays() {
+    const uint64_t before = JitX64GetStats().wayPatches;
+    for (int style = 0; style < 2; ++style)
+        for (int kinds = 0; kinds < 3; ++kinds) {
+            constexpr int kCalls = 140;
+            Asm a;
+            Label table = a.NewLabel(), loop = a.NewLabel(), done = a.NewLabel(), leaf = a.NewLabel();
+            a << mflr(0) << stw(0, 0, 1);
+            a.LiLabel(4, table) << stw(4, 4, 1) << li(5, kCalls) << stw(5, 8, 1);
+            a.Bind(loop);
+            a << lwz(5, 8, 1) << cmpwi(0, 5, 0);
+            a.Bc(12, 2, done);
+            a << addi(5, 5, -1) << stw(5, 8, 1) << lwz(4, 4, 1) << lwz(6, 0, 4) << addi(4, 4, 4) << stw(4, 4, 1);
+            PairedSetup(a, 5);
+            if (style == 0) {
+                a << mtctr(6) << bctrl() << addi(10, 10, 1);
+                a.B(loop);
+            } else {
+                Label back = a.NewLabel();
+                a.LiLabel(7, back) << mtlr(7) << mtctr(6) << bctr();
+                a.Bind(back);
+                a.B(loop);
+            }
+            a.Bind(done);
+            ObserveFprs(a, 0x40);
+            a << lwz(0, 0, 1) << mtlr(0) << blr();
+            a.Bind(leaf);
+            a << addi(3, 3, 13) << ori(12, 3, 0x50) << blr();
+            a.Bind(table);
+            const size_t tableIndex = a.Here();
+            for (int e = 0; e < kCalls + 2; ++e) a << 0u;
+            Scenario s;
+            s.image = a.Finish();
+            const size_t leafAt = static_cast<size_t>(std::find(s.image.words.begin(), s.image.words.end(), addi(3, 3, 13)) - s.image.words.begin());
+            s.runs = [=](uint32_t base, std::vector<RunSpec>& runs) {
+                Rng local(90 + kinds * 3 + style);
+                for (int round = 0; round < 2; ++round) {
+                    RunSpec spec;
+                    spec.ctx = BaseState(local);
+                    spec.ctx.gpr[3] = local.Next();
+                    const uint32_t leafAddress = base + 4u * static_cast<uint32_t>(leafAt);
+                    uint32_t t[4];
+                    for (uint32_t& x : t) x = kThinBase + kThinStride * local.Below(kThinCount);
+                    if (kinds == 1) t[2] = PatchedAddress(3);
+                    if (kinds == 2) t[3] = leafAddress;
+                    for (int e = 0; e < kCalls; ++e) {
+                        const int w = e < 1 ? 0 : e < 41 ? 1 : e < 81 ? 2 : e < 101 ? 0 : (e & 1) != 0 ? 1 : 3;
+                        spec.writes.push_back({static_cast<uint32_t>(4 * (tableIndex + e)), t[w]});
+                    }
+                    spec.before = [] { ResetPatched(); };
+                    runs.push_back(std::move(spec));
+                }
+            };
+            RunCase(Fmt("indirect hot ways %s kinds %d", style == 0 ? "bctrl" : "bctr", kinds), s);
+        }
+    return JitX64GetStats().wayPatches - before >= 3;
+}
+
 void CallTests() {
     ThinCalls();
+    const uint64_t waysBefore = JitX64GetStats().wayFills, flipsBefore = JitX64GetStats().orderFlips;
     IndirectSites(false);
     IndirectSites(true);
+#if defined(__linux__) && defined(__x86_64__)
+    // the bctrl and bctr sites' inline ways (x64::JitCallWays) were written, so the runs above went through them as well (not with
+    // the code space far from the executable: a way's call does not reach the callees then)
+    const char* far = std::getenv("BRAWL_JIT_FAR_MEMORY");
+    const bool near = far == nullptr || *far == '\0' || *far == '0';
+    if (near && JitX64GetStats().wayFills == waysBefore) {
+        ++g_failures;
+        std::fprintf(stderr, "FAIL indirect sites: no call site's inline ways were written\n");
+    }
+    // their leaf targets (untranslated) switched blocks to probe inline cache 1 first, so the runs went through that order as well
+    const char* cacheFirst = std::getenv("BRAWL_JIT_CACHE_FIRST");
+    if ((JitX64GetStats().orderFlips == flipsBefore) != (cacheFirst != nullptr && *cacheFirst == '0')) {
+        ++g_failures;
+        std::fprintf(stderr, "FAIL indirect sites: probe-order switches %s\n",
+                     JitX64GetStats().orderFlips == flipsBefore ? "never flipped" : "flipped with BRAWL_JIT_CACHE_FIRST=0");
+    }
+    if (!IndirectHotWays() && near) {
+        ++g_failures;
+        std::fprintf(stderr, "FAIL indirect hot ways: the ways were not written by targets hit out of line\n");
+    }
+#else
+    (void)waysBefore;
+    (void)flipsBefore;
+    (void)IndirectHotWays();
+#endif
     for (int depth : {1, 2, 3, 7, 8, 9, 12})
         for (int ret = 0; ret < 4; ++ret) PatchedChain(depth, ret, false);
     for (int ret = 0; ret < 4; ++ret) PatchedChain(3, ret, true);
@@ -1890,6 +2053,7 @@ void CallTests() {
     PatchedReenter();
     PatchedSelfModifying();
     SubFrameCalls();
+    ThinSavesThroughRoutinesAll();
     SharedCalls();
 }
 
@@ -2265,6 +2429,7 @@ int main() {
     RegisterSubFrameHooks();
     RegisterCallTestFunctions();
     RegisterSubFrameFunctions();
+    RegisterThinSaveFunctions();
     TranslatedFunctionRegistry::Finalize();
     if (!PpcInterpreter::JitAvailable()) {
         std::printf("jit branch: no JIT backend on this host, nothing to test\n");

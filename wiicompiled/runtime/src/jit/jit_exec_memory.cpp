@@ -159,8 +159,11 @@ Region MapRegion(size_t bytes) {
 }
 
 #if defined(__linux__)
-// A region of whole 2 MiB pages starting on a 2 MiB boundary, advised for transparent huge pages (the advice is a hint: a
-// host that refuses it still has the mapping).
+// A region of whole 2 MiB pages starting on a 2 MiB boundary, advised for transparent huge pages only with BRAWL_JIT_HUGEPAGES=1
+// (the advice is a hint: a host that refuses it still has the mapping). Without it (the default) the code cache's chunks are on 4 KiB
+// pages, measured faster: block cycles -2.5%, engine cycles -2.0% (11 paired rounds, same binary; game thread -0.6%, within its
+// noise). Suspected, not measured: on huge pages every chunk's hot part starts at the same offset of a physically contiguous 2 MiB
+// page, so the hottest code of every chunk falls into the same L2 sets.
 Region MapRegionHuge(size_t bytes) {
     Region region;
     constexpr size_t kHuge = Arena::kHugePageBytes;
@@ -168,8 +171,13 @@ Region MapRegionHuge(size_t bytes) {
         return region;
     }
     const size_t size = (bytes + kHuge - 1) / kHuge * kHuge;
-    // BRAWL_JIT_NO_HUGEPAGES=1 (a diagnostic for measuring): the same aligned chunks without the advice
-    static const bool noAdvice = [] { const char* v = std::getenv("BRAWL_JIT_NO_HUGEPAGES"); return v != nullptr && *v != '\0' && *v != '0'; }();
+    // BRAWL_JIT_HUGEPAGES=1: the same aligned chunks with the advice (BRAWL_JIT_NO_HUGEPAGES=1, the older switch, still means none)
+    static const bool noAdvice = [] {
+        const char* on = std::getenv("BRAWL_JIT_HUGEPAGES");
+        const char* off = std::getenv("BRAWL_JIT_NO_HUGEPAGES");
+        if (off != nullptr && *off != '\0' && *off != '0') return true;
+        return !(on != nullptr && *on != '\0' && *on != '0');
+    }();
 #if defined(__x86_64__)
     static_assert(NearSpace::kSlot == kHuge, "near slots are huge pages");
     if (void* const near = NearSpace::Get().Map(size, !noAdvice)) {
