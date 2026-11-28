@@ -269,7 +269,12 @@ def build_game(args, game, build):
         run(dotnet, translator, 'emit-build-shards', '--project', project,
             '--base-metadata', 'generated/base_translation_output.json', '--base-functions-dir', 'generated/functions',
             '--native-source-dir', 'runtime/src', '--out', 'generated/build_shards', '--base-shards', '600',
-            *(['--code-variants', 'generated/code_variants'] if variants else []), cwd=wc)
+            *(['--code-variants', 'generated/code_variants'] if variants else []),
+            # Hot direct call edges to inline at C++ level (TranslatedBuildShardEmitter.Inline.cs), when present.
+            # MKW_INLINE_PROFILE_FILE (absolute path) replaces it, for experiments.
+            *(['--inline-profile', os.environ['MKW_INLINE_PROFILE_FILE']] if os.environ.get('MKW_INLINE_PROFILE_FILE')
+              else ['--inline-profile', 'projects/brawl/inline_profile.txt']
+              if (wc / 'projects/brawl/inline_profile.txt').is_file() else []), cwd=wc)
         translated_stamp.write_text(translation_key)
     compilers = f'{shutil.which("clang")}\n{shutil.which("clang++")}'
     compilers_stamp = build / 'native-compilers.txt'

@@ -111,6 +111,163 @@ public sealed class TranslatedBuildShardEmitterTests
     }
 
     [Fact]
+    public void InlineProfileInlinesPromotedIndirectArms()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"translator-inline-{Guid.NewGuid():N}");
+        var functions = Path.Combine(root, "functions");
+        var output = Path.Combine(root, "out");
+        Directory.CreateDirectory(functions);
+        Directory.CreateDirectory(Path.Combine(root, "native"));
+        try
+        {
+            const string caller = """
+                #include "abi_bridge.h"
+                extern "C" void func_80001000(CpuContext* MKW_RESTRICT ctx) {
+                    uint32_t r3 = ctx->gpr[3];
+                    uint32_t ctr = ctx->ctr;
+                    ctx->lr = 0x80001008u;
+                    ctx->gpr[3] = r3;
+                    ctx->ctr = ctr;
+                    if ((ctr) == 0x80005000u) [[likely]] { InvokeDirectCpu<0x80005000u>(ctx); } else if ((ctr) == 0x80006000u) { InvokeDirectCpu<0x80006000u>(ctx); } else { MKW_INDIRECT_CALL(ctr, ctx); }
+                    r3 = ctx->gpr[3];
+                    ctx->gpr[3] = r3;
+                }
+                // RECOMP_REGISTRATION base 0x80001000 func_80001000 preserves=true fpr_mask=0x00000000
+                """;
+            const string target = """
+                #include "abi_bridge.h"
+                extern "C" void func_80005000(CpuContext* MKW_RESTRICT ctx) {
+                    ctx->gpr[3] = ctx->gpr[3] + 5;
+                }
+                // RECOMP_REGISTRATION base 0x80005000 func_80005000 preserves=true fpr_mask=0x00000000
+                """;
+            const string other = """
+                #include "abi_bridge.h"
+                extern "C" void func_80006000(CpuContext* MKW_RESTRICT ctx) {
+                    ctx->gpr[3] = ctx->gpr[3] + 6;
+                }
+                // RECOMP_REGISTRATION base 0x80006000 func_80006000 preserves=true fpr_mask=0x00000000
+                """;
+            Write(Path.Combine(functions, "func_80001000.cpp"), caller);
+            Write(Path.Combine(functions, "func_80005000.cpp"), target);
+            Write(Path.Combine(functions, "func_80006000.cpp"), other);
+            var profile = Path.Combine(root, "inline_profile.txt");
+            Write(profile, "# test\n80001000 80005000 100\n");
+            var metadataPath = Path.Combine(root, "base_output.json");
+            BaseTranslationOutputMetadataFile.WriteIfChangedAtomic(metadataPath,
+                BaseTranslationOutputMetadata.Create([
+                    Metadata("func_80001000.cpp", 0x80001000u, caller),
+                    Metadata("func_80005000.cpp", 0x80005000u, target),
+                    Metadata("func_80006000.cpp", 0x80006000u, other)
+                ], TranslationQualityMetadata.Clean, "inline"));
+            var previous = Environment.GetEnvironmentVariable("MKW_INLINE_STATIC");
+            Environment.SetEnvironmentVariable("MKW_INLINE_STATIC", "0");
+            try
+            {
+                TranslatedBuildShardEmitter.Emit(new TranslatedBuildShardOptions(
+                    metadataPath, functions, output, Path.Combine(root, "native"), BaseShardCount: 1, RegistrationShardCount: 1,
+                    InlineProfilePath: profile));
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("MKW_INLINE_STATIC", previous);
+            }
+            var shard = File.ReadAllText(Assert.Single(Directory.GetFiles(
+                Path.Combine(output, "base_common"), "shard_*.cpp")));
+            // The promoted line becomes an if/else chain; the selected arm is the guarded inline form, the others keep
+            // their call, and every arm repeats the flush and the reload.
+            Assert.Contains("    if ((ctr) == 0x80005000u) [[likely]] {\n        if (__builtin_expect(g_mkwGuestCodePatched[1u], 0)) {", shard);
+            Assert.Contains("            func_80005000_inl(ctx);", shard);
+            Assert.Contains("    } else if ((ctr) == 0x80006000u) {\n        ctx->lr = 0x80001008u;", shard);
+            Assert.Contains("        MKW_STATIC_TRANSLATED_CALL(0x80006000u, func_80006000, ctx);\n        r3 = ctx->gpr[3];", shard);
+            Assert.Contains("    } else {\n        ctx->lr = 0x80001008u;\n        ctx->gpr[3] = r3;\n        ctx->ctr = ctr;\n        MKW_INDIRECT_CALL(ctr, ctx);\n        r3 = ctx->gpr[3];\n    }", shard);
+            Assert.Equal(4, shard.Split("ctx->lr = 0x80001008u;").Length - 1);
+            Assert.DoesNotContain("func_80006000_inl", shard);
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public void InlineProfileGuardsInlinedCopiesAndSkipsNativeBodies()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"translator-inline-{Guid.NewGuid():N}");
+        var functions = Path.Combine(root, "functions");
+        var native = Path.Combine(root, "runtime", "src");
+        var output = Path.Combine(root, "out");
+        Directory.CreateDirectory(functions);
+        Directory.CreateDirectory(native);
+        try
+        {
+            const string caller = """
+                #include "abi_bridge.h"
+                extern "C" void func_80001000(CpuContext* MKW_RESTRICT ctx) {
+                    uint32_t r3 = ctx->gpr[3];
+                    ctx->lr = 0x80001008u;
+                    ctx->gpr[3] = r3;
+                    InvokeDirectCpu<0x80005000u>(ctx);
+                    r3 = ctx->gpr[3];
+                    InvokeDirectCpu<0x80006000u>(ctx);
+                    ctx->gpr[3] = r3;
+                }
+                // RECOMP_REGISTRATION base 0x80001000 func_80001000 preserves=true fpr_mask=0x00000000
+                """;
+            const string target = """
+                #include "abi_bridge.h"
+                extern "C" void func_80005000(CpuContext* MKW_RESTRICT ctx) {
+                    ctx->gpr[3] = ctx->gpr[3] + 5;
+                }
+                // RECOMP_REGISTRATION base 0x80005000 func_80005000 preserves=true fpr_mask=0x00000000
+                """;
+            const string nativeTarget = """
+                #include "abi_bridge.h"
+                extern "C" void func_80006000(CpuContext* MKW_RESTRICT ctx) {
+                    ctx->gpr[3] = 6;
+                }
+                // RECOMP_REGISTRATION base 0x80006000 func_80006000 preserves=true fpr_mask=0x00000000
+                """;
+            Write(Path.Combine(functions, "func_80001000.cpp"), caller);
+            Write(Path.Combine(functions, "func_80005000.cpp"), target);
+            Write(Path.Combine(functions, "func_80006000.cpp"), nativeTarget);
+            Write(Path.Combine(native, "native.cpp"), "MKW_NATIVE_BODY(0x80006000u, Native_80006000);\n");
+            var profile = Path.Combine(root, "inline_profile.txt");
+            Write(profile, "# test\n80001000 80005000 100\n80001000 80006000 90\n80001000 80001000 5\n");
+            var metadataPath = Path.Combine(root, "base_output.json");
+            BaseTranslationOutputMetadataFile.WriteIfChangedAtomic(metadataPath,
+                BaseTranslationOutputMetadata.Create([
+                    Metadata("func_80001000.cpp", 0x80001000u, caller),
+                    Metadata("func_80005000.cpp", 0x80005000u, target),
+                    Metadata("func_80006000.cpp", 0x80006000u, nativeTarget)
+                ], TranslationQualityMetadata.Clean, "inline"));
+            TranslatedBuildShardEmitter.Emit(new TranslatedBuildShardOptions(
+                metadataPath, functions, output, native, BaseShardCount: 1, RegistrationShardCount: 1,
+                InlineProfilePath: profile));
+            var shard = File.ReadAllText(Assert.Single(Directory.GetFiles(
+                Path.Combine(output, "base_common"), "shard_*.cpp")));
+            // The copy is the callee's body; the site tests the callee's guard byte (index 1: sorted addresses).
+            Assert.Contains("static inline __attribute__((always_inline)) void func_80005000_inl(CpuContext* MKW_RESTRICT ctx)\n{", shard);
+            Assert.Contains("if (__builtin_expect(g_mkwGuestCodePatched[1u], 0)) {", shard);
+            Assert.Contains("        func_80005000(ctx);", shard);
+            Assert.Contains("        func_80005000_inl(ctx);", shard);
+            // Flush and reload are repeated in both arms.
+            Assert.Equal(2, shard.Split("        ctx->lr = 0x80001008u;").Length - 1);
+            Assert.Equal(2, shard.Split("        r3 = ctx->gpr[3];").Length - 1);
+            // The callee keeps its own guarded wrapper and body.
+            Assert.Contains("[[clang::musttail]] return func_80005000_body(ctx);", shard);
+            // A native body is never inlined, nor is a function into itself.
+            Assert.Contains("MKW_STATIC_TRANSLATED_CALL(0x80006000u, func_80006000, ctx);", shard);
+            Assert.DoesNotContain("func_80006000_inl", shard);
+            Assert.DoesNotContain("func_80001000_inl", shard);
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
     public void RemainingWeightPartitionDoesNotCreateOversizedTailBin()
     {
         var weights = Enumerable.Repeat(300L, 10).ToArray();

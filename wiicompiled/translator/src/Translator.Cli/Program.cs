@@ -171,7 +171,8 @@ int RunEmitBuildShards(string[] argsTail)
             // Brawl translates main.dol with all 126 .rel modules (~100k functions): far more shards than 72.
             BaseShardCount: int.Parse(OptionValue(argsTail, "--base-shards") ?? "72", CultureInfo.InvariantCulture),
             NativeIndex: nativeIndex,
-            CodeVariantsDirectory: OptionValue(argsTail, "--code-variants") is { } variants ? Path.GetFullPath(variants) : null));
+            CodeVariantsDirectory: OptionValue(argsTail, "--code-variants") is { } variants ? Path.GetFullPath(variants) : null,
+            InlineProfilePath: OptionValue(argsTail, "--inline-profile") is { } inlineProfile ? Path.GetFullPath(inlineProfile) : null));
         Console.WriteLine("[translator] emitted stable translated build graph");
         Console.WriteLine($"  base functions: {result.BaseFunctionCount:N0}");
         Console.WriteLine($"  shared base functions: {result.SharedBaseFunctionCount:N0}");
@@ -2336,7 +2337,8 @@ static (string? Positional, CommandOption[] Options)? CommandSpec(string command
         new("--native-source-dir", "path"),
         new("--out", "generated/build_shards"),
         new("--base-shards", "72"),
-        new("--code-variants", "path")
+        new("--code-variants", "path"),
+        new("--inline-profile", "path")
     }),
     _ => null
 };
