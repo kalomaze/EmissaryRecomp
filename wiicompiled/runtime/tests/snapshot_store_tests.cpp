@@ -31,9 +31,10 @@ static void TestOnlyLaterWritesNeedRestoring() {
     assert(live == frame1 && store.lastRestoreReadBytes == 7);
 }
 
-static void TestHistoryAgainstFullImages() {
+// One block in `density` is written per step; sparse writes leave most blocks' newest copy in the base image.
+static void TestHistoryAgainstFullImages(unsigned density, uint32_t seed) {
     SnapshotStore store;
-    std::mt19937 random(0x70a11bac);
+    std::mt19937 random(seed);
     std::vector<uint8_t> live(257 * SnapshotStore::BlockSize - 13);
     std::vector<std::pair<int, std::vector<uint8_t>>> history{{0, live}};
     const auto read = [&](size_t at, uint8_t* out, size_t size) { std::memcpy(out, live.data() + at, size); };
@@ -44,20 +45,25 @@ static void TestHistoryAgainstFullImages() {
     for (unsigned step = 0; step < 3000; ++step) {
         std::vector<uint32_t> dirty;
         for (uint32_t block = 0; block < 257; ++block) {
-            if (random() % 9 != 0) continue;
+            if (random() % density != 0) continue;
             dirty.push_back(block);
             const size_t at = block * SnapshotStore::BlockSize;
             const size_t size = std::min(SnapshotStore::BlockSize, live.size() - at);
             for (size_t i = 0; i < size; ++i) live[at + i] = static_cast<uint8_t>(random());
         }
+        // Sometimes prepared ahead (PrepareRestore), sometimes prepared for a save that drops it.
+        const unsigned prepare = random() % 3;
         if (history.size() > 1 && random() % 7 == 0) {
             const size_t target = random() % history.size();
+            if (prepare == 0) store.PrepareRestore(history[target].first, history.back().first);
+            if (prepare == 1) store.PrepareRestore(history[random() % history.size()].first, history.back().first);
             store.Restore(history[target].first, history.back().first, dirty, read, write);
             assert(live == history[target].second);
             history.resize(target + 1);
             ++restores;
         } else {
             const int frame = nextFrame++;
+            if (prepare == 0 && history.size() > 1) store.PrepareRestore(history[random() % history.size()].first, history.back().first);
             store.Save(frame, live.size(), read, &dirty, history.back().first);
             history.emplace_back(frame, live);
             if (history.size() > SnapshotStore::Capacity) { history.erase(history.begin()); ++evictions; }
@@ -76,7 +82,7 @@ static void TestHistoryAgainstFullImages() {
             assert(live == history.back().second);
         }
     }
-    std::cout << "snapshot history: 3000 transitions, " << restores << " restores, " << evictions << " evictions\n";
+    std::cout << "snapshot history (1 in " << density << "): 3000 transitions, " << restores << " restores, " << evictions << " evictions\n";
 }
 
 // Model the production incremental boundaries: Enable once for the base,
@@ -221,7 +227,8 @@ int main() {
     TestBatchCallbacksAndFailures();
     TestEvictedSourcesAndSlotReuse();
     TestOnlyLaterWritesNeedRestoring();
-    TestHistoryAgainstFullImages();
+    TestHistoryAgainstFullImages(9, 0x70a11bac);
+    TestHistoryAgainstFullImages(61, 0x5ca77e2);
     TestConsumedMarksAcrossSnapshotBoundaries();
     std::cout << "snapshot store: ok\n";
 }

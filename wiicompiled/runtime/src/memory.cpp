@@ -274,6 +274,8 @@ struct LeanBankCopies {
 };
 std::vector<LeanBankCopies> g_leanBankCopies;  // Memory::Init's; RefreshLeanStorePolicy reads it
 
+void StoreViewSync(const uint8_t* policy);
+
 // The lean store policy (memory_access.h): one byte per 64 KiB of the window, set where a guest store must take
 // the checked Memory::Write* path. Every chunk not wholly inside a guest region, so a store no region maps raises
 // the checked path's AccessViolation, as without the window (most of those chunks have no backing at all:
@@ -327,6 +329,7 @@ void RefreshLeanStorePolicy() {
     // past the window), so its one test reads both.
     for (uint64_t chunk = 0; chunk + 1 < kChunks; ++chunk)
         rangePolicy[chunk] = static_cast<uint8_t>(policy[chunk] | policy[chunk + 1]);
+    StoreViewSync(policy);
 }
 
 // The window is reserved address space on every OS (Memory::Init), which backs only what is in use, the same ranges
@@ -346,6 +349,79 @@ uint64_t g_leanBackedBytes = 0;
 // The window's 64 KiB chunks already backed (aliased views share their backing): BackLeanWindow's, and MEM1's and its
 // mirrors' shared views (MapLeanBanks).
 uint8_t g_leanChunkBacked[MemoryInline::kLeanWindowSize >> MemoryInline::kLeanPolicyShift];
+constexpr int kLeanMaxViews = static_cast<int>(LeanWindow::kAliasViews) + 1;
+
+// The store view (lean_window.h, g_storeView): which chunks of its cached copy (+3 GiB of the aliased view, one GiB up
+// from the store view's base) are read-write now (StoreViewSync keeps them so: backed, and the store policy byte clear).
+uint8_t g_storeViewWritable[MemoryInline::kLeanWindowSize >> MemoryInline::kLeanPolicyShift];
+constexpr uint64_t kStoreViewCachedCopy = 3;  // the alias copy that guest addresses 0x80000000-0xBFFFFFFF store to
+
+void StoreViewFail(const char* what, uint64_t offset, uint64_t size, uint32_t rc) {
+    std::ostringstream message;
+    message << "lean memory: could not " << what << " store view bytes 0x" << std::hex << offset << "+0x" << size
+            << " (error 0x" << rc << ")";
+    throw std::runtime_error(message.str());
+}
+
+// Newly backed window bytes [offset, offset + size) (whole chunks): read-only in every copy of the store view; the cached
+// copy's chunks become read-write at the next StoreViewSync, where the store policy allows it.
+void StoreViewProtectNew(uint64_t offset, uint64_t size) {
+    if (!LeanWindow::g_storeView) return;
+    uint8_t* const window = MemoryInline::LeanBaseAtInit();
+    for (uint64_t k = 1; k < LeanWindow::kAliasViews; ++k)
+        if (const uint32_t rc = LeanWindow::Protect(window + k * MemoryInline::kLeanWindowSize + offset, size, false))
+            StoreViewFail("protect", offset, size, rc);
+    if (offset < LeanWindow::kAliasTail) {
+        const uint64_t tail = std::min<uint64_t>(size, LeanWindow::kAliasTail - offset);
+        if (const uint32_t rc = LeanWindow::Protect(window + LeanWindow::kAliasViews * MemoryInline::kLeanWindowSize + offset,
+                                                    tail, false))
+            StoreViewFail("protect", offset, tail, rc);
+    }
+    constexpr uint32_t kShift = MemoryInline::kLeanPolicyShift;
+    std::memset(g_storeViewWritable + (offset >> kShift), 0, size >> kShift);
+}
+
+// The cached copy of the store view in step with the store policy: a chunk is read-write exactly when it is backed and its
+// policy byte is clear (a store there takes LeanTryStore's fast path), read-only otherwise. Changes only what differs.
+void StoreViewSync(const uint8_t* policy) {
+    if (!LeanWindow::g_storeView) return;
+    constexpr uint32_t kShift = MemoryInline::kLeanPolicyShift;
+    constexpr uint64_t kChunks = MemoryInline::kLeanWindowSize >> kShift;
+    uint8_t* const copy = MemoryInline::LeanBaseAtInit() + kStoreViewCachedCopy * MemoryInline::kLeanWindowSize;
+    const auto want = [&](uint64_t c) { return static_cast<uint8_t>(g_leanChunkBacked[c] != 0 && policy[c] == 0); };
+    for (uint64_t first = 0; first < kChunks;) {
+        if (!g_leanChunkBacked[first] || want(first) == g_storeViewWritable[first]) {
+            ++first;
+            continue;
+        }
+        const uint8_t writable = want(first);
+        uint64_t last = first + 1;
+        while (last < kChunks && g_leanChunkBacked[last] && want(last) == writable && g_storeViewWritable[last] != writable) ++last;
+        const uint64_t offset = first << kShift, size = (last - first) << kShift;
+        if (const uint32_t rc = LeanWindow::Protect(copy + offset, size, writable != 0)) StoreViewFail("protect", offset, size, rc);
+        std::memset(g_storeViewWritable + first, writable, last - first);
+        first = last;
+    }
+}
+
+// The aliased view (lean_window.h): the views of `length` bytes of one shared object at window offset `offset` (64 KiB
+// aligned), the object's bytes from `objectOffset`: the window's own and its aliases (+1 ... +4 GiB, and the tail at
+// +5 GiB for what lies in the window's first 64 KiB). Answers how many it wrote to `views` (at most kLeanMaxViews).
+int LeanAliasViews(uint64_t offset, uint64_t objectOffset, uint64_t length, LeanWindow::View* views) {
+    uint8_t* const window = MemoryInline::LeanBaseAtInit();
+    int n = 0;
+    views[n++] = LeanWindow::View{window + offset, objectOffset, length};
+    if (!LeanWindow::g_aliased) return n;
+    for (uint64_t k = 1; k < LeanWindow::kAliasViews; ++k)
+        views[n++] = LeanWindow::View{window + offset + k * MemoryInline::kLeanWindowSize, objectOffset, length};
+    if (offset < LeanWindow::kAliasTail) {
+        const uint64_t tail = std::min<uint64_t>(length, LeanWindow::kAliasTail - offset);
+        views[n++] = LeanWindow::View{window + LeanWindow::kAliasViews * MemoryInline::kLeanWindowSize + offset,
+                                      objectOffset, tail};
+    }
+    return n;
+}
+
 void BackLeanWindow(uint64_t offset, uint64_t size) {
     constexpr uint32_t kShift = MemoryInline::kLeanPolicyShift;  // backing granularity: one policy chunk, 64 KiB
     uint8_t* const backed = g_leanChunkBacked;
@@ -359,15 +435,24 @@ void BackLeanWindow(uint64_t offset, uint64_t size) {
         }
         uint8_t* const at = MemoryInline::LeanBaseAtInit() + (first << kShift);
         const uint64_t bytes = (last - first) << kShift;
-        const uint32_t rc = LeanWindow::Commit(at, bytes);
+        uint32_t rc = 0;
+        std::string error;
+        if (LeanWindow::g_aliased) {  // one shared object, at its window offset and its aliases
+            LeanWindow::View views[kLeanMaxViews];
+            const int n = LeanAliasViews(first << kShift, 0, bytes, views);
+            if (!LeanWindow::MapSharedViews(bytes, views, n, &error)) rc = 1;
+        } else {
+            rc = LeanWindow::Commit(at, bytes);
+        }
         if (rc != 0) {
             std::ostringstream message;
             message << "lean memory: could not back window bytes 0x" << std::hex << (first << kShift) << "+0x" << bytes
-                    << " (error 0x" << rc << ")";
+                    << " (error 0x" << rc << (error.empty() ? "" : ": ") << error << ")";
             throw std::runtime_error(message.str());
         }
         std::memset(backed + first, 1, last - first);
         g_leanBackedBytes += bytes;
+        StoreViewProtectNew(first << kShift, bytes);
         first = last;
     }
 }
@@ -598,13 +683,24 @@ void MapLeanBanks(const std::vector<LeanBankCopies>& banks, uint8_t* window) {
             marks.push_back(window + marksOffset);
         }
         std::string error = "a copy not 64 KiB aligned, or already backed";
-        if (shareable && LeanWindow::MapShared(bank.size, data.data(), static_cast<int>(data.size()), &error) &&
-            LeanWindow::MapShared(marksSize, marks.data(), static_cast<int>(marks.size()), &error)) {
+        // each copy's views: its window offset and, in the aliased view, its aliases (LeanAliasViews)
+        const auto mapCopies = [&](uint64_t size, const std::vector<uint8_t*>& targets) {
+            std::vector<LeanWindow::View> views;
+            for (uint8_t* const target : targets) {
+                LeanWindow::View v[kLeanMaxViews];
+                const int n = LeanAliasViews(static_cast<uint64_t>(target - window), 0, size, v);
+                views.insert(views.end(), v, v + n);
+            }
+            return LeanWindow::MapSharedViews(size, views.data(), static_cast<int>(views.size()), &error);
+        };
+        if (shareable && mapCopies(bank.size, data) && mapCopies(marksSize, marks)) {
             for (size_t i = 0; i < data.size(); ++i) {
                 const uint64_t dataChunk = static_cast<uint64_t>(data[i] - window) >> kShift;
                 const uint64_t marksChunk = static_cast<uint64_t>(marks[i] - window) >> kShift;
                 std::memset(g_leanChunkBacked + dataChunk, 1, bank.size >> kShift);
                 std::memset(g_leanChunkBacked + marksChunk, 1, marksSize >> kShift);
+                StoreViewProtectNew(dataChunk << kShift, bank.size);
+                StoreViewProtectNew(marksChunk << kShift, marksSize);
             }
             g_leanBackedBytes += bank.size + marksSize;
             for (size_t i = 0; i < marks.size(); ++i)  // each slice's spill byte (often the next copy's first, shared)
@@ -759,16 +855,30 @@ void Memory::Init(const Config& config) {
     // masked address, so the physical, cached and uncached views of MEM1/MEM2 alias by construction.
     // Address space only: BackLeanWindow backs the parts in use. The 64 KiB after it (kLeanGuardSize) stay reserved and
     // unbacked, so a resolved read range's access past the window's end faults (memory_access.h, kLeanRangePolicyOffset).
+    // Linux reserves the aliased view around it (lean_window.h, g_aliased): 64 KiB below, the window and its four
+    // aliases, the tail, 64 KiB after (BRAWL_LEAN_ALIAS=0: the window alone), and makes the store view of it
+    // (g_storeView; BRAWL_LEAN_STORE_VIEW=0: none, every alias read-write).
     static uint8_t* const window = [] {
-        constexpr uint64_t kReserved = MemoryInline::kLeanWindowSize + MemoryInline::kLeanGuardSize;
-        uint8_t* const reserved = LeanWindow::Reserve(kReserved);
+#if defined(__linux__)
+        const char* const env = std::getenv("BRAWL_LEAN_ALIAS");
+        const bool alias = env == nullptr || env[0] != '0';
+        const char* const storeEnv = std::getenv("BRAWL_LEAN_STORE_VIEW");
+        LeanWindow::g_storeView = alias && (storeEnv == nullptr || storeEnv[0] != '0');
+#else
+        const bool alias = false;
+#endif
+        const uint64_t below = alias ? MemoryInline::kLeanGuardSize : 0;
+        const uint64_t views = alias ? LeanWindow::kAliasViews * MemoryInline::kLeanWindowSize + LeanWindow::kAliasTail
+                                     : MemoryInline::kLeanWindowSize;
+        uint8_t* const reserved = LeanWindow::Reserve(below + views + MemoryInline::kLeanGuardSize);
 #if defined(_WIN32)
         if (reserved == nullptr)
             throw std::runtime_error("lean memory: could not reserve the 1 GiB guest window (it needs Windows 10 1803 "
                                      "or newer: VirtualAlloc2, MapViewOfFile3)");
 #endif
         if (reserved == nullptr) throw std::runtime_error("lean memory: could not reserve the 1 GiB guest window");
-        return reserved;
+        LeanWindow::g_aliased = alias;
+        return reserved + below;
     }();
     MemoryInline::SetLeanBase(window);
     BackLeanWindow(MemoryInline::kLeanPolicyOffset, MemoryInline::kLeanWindowSize >> MemoryInline::kLeanPolicyShift);
@@ -785,6 +895,16 @@ void Memory::Init(const Config& config) {
     BrawlDirtyMemory::flatBase = reinterpret_cast<uintptr_t>(window);
     g_leanBankCopies = LeanBankLayout(config.regions);
     MapLeanBanks(g_leanBankCopies, window);
+    // With the store view the JIT marks a store group's bytes once its leader's own store went through (jit_x64_mem.cpp):
+    // the marks of a group's other bytes may lie past a region's slice (where that store then faults), and it finds the marks
+    // from the unmasked address of a cached-view store, so a group starting below 0x80000000 marks up to 3 bytes below the
+    // map. The whole map and the 64 KiB under it are backed so that they land somewhere; nothing reads the marks outside the
+    // regions, and untouched pages cost nothing.
+    if (LeanWindow::g_storeView) {
+        BackLeanWindow(MemoryInline::kLeanDirtyOffset - (uint64_t{1} << MemoryInline::kLeanPolicyShift),
+                       uint64_t{1} << MemoryInline::kLeanPolicyShift);
+        BackLeanWindow(MemoryInline::kLeanDirtyOffset, BrawlDirtyMemory::kLeanDirtyBlocks + 1);
+    }
 #else
     // Cached, uncached and physical guest aliases share one allocation per RAM
     // bank. Other configured regions own their storage independently.

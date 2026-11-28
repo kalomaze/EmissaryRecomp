@@ -338,6 +338,46 @@ static void TestSnapshotCodeRestoration() {
     run(1); run(1);
 }
 
+// Rollback's consume over code spread across tracked pages (two 64 KiB pages a WriteWatch covers, several lines of the mark map
+// each) and an untracked page: every block whose code a store changed runs the new code after the consume cleared its marks,
+// also when the block was compiled long before and its neighbours under the same line were not written.
+static void TestConsumeAcrossPages() {
+    constexpr uint32_t tracked = 0x80020000, bytes = 0x20000, untracked = 0x80040000;
+    BrawlRollback::WriteWatch watch;
+    auto* host = Memory::GetPointer(tracked, bytes);
+    watch.Add(host, bytes, 0, tracked);
+    BrawlRollback::SnapshotStore store;
+    const auto read = [&](size_t at, uint8_t* out, size_t n) { std::memcpy(out, host + at, n); };
+    std::vector<uint32_t> sites;
+    for (uint32_t off = 0; off < bytes; off += 0x1340) sites.push_back(tracked + off);  // lines and pages apart, some shared
+    for (uint32_t off = 0; off < 0x4000; off += 0x1100) sites.push_back(untracked + off);
+    for (uint32_t i = 0; i < sites.size(); ++i) {
+        Memory::Write32(sites[i], 0x38600000u | (i + 1));  // li r3,i+1
+        Memory::Write32(sites[i] + 4, 0x4e800020);
+    }
+    const auto run = [&](uint32_t at, uint32_t expected) {
+        for (int k = 0; k < 3; ++k) {  // past the compile threshold
+            CpuContext ctx{}; ctx.lr = 0x80006000;
+            PpcInterpreter::Run(&ctx, at);
+            assert(ctx.gpr[3] == expected);
+        }
+    };
+    store.Save(0, bytes, read);
+    watch.Enable();
+    for (uint32_t i = 0; i < sites.size(); ++i) run(sites[i], i + 1);
+    for (uint32_t round = 1; round <= 3; ++round)
+        for (uint32_t i = round % 2; i < sites.size(); i += 2) {
+            const uint32_t value = 0x100u * round + i;
+            Memory::Write32(sites[i], 0x38600000u | value);
+            watch.Capture(bytes, store.Jobs());  // consumes: the marks of the tracked pages are clear afterwards
+            run(sites[i], value);
+            if (i + 1 < sites.size()) {  // a neighbour that was not written keeps running its code
+                const uint32_t w = Memory::Read32(sites[i + 1]);
+                run(sites[i + 1], w & 0xFFFFu);
+            }
+        }
+}
+
 namespace InterpreterTest { extern unsigned frameEnds, loopEnds, soundHooks; }
 
 static void TestOnlineHooksAndContinuation() {
@@ -379,8 +419,63 @@ static void TestOnlineHooksAndContinuation() {
 
 }
 
+// Translated code's indirect calls of guarded records (abi_bridge.cpp's site slow path): callees that may write every
+// non-volatile FPR (the fixed copy), f20-f31, f31 alone, a sparse set (the register loop), and a native (GPR guard too, the
+// general dispatch). Each writes f1-f31 and r14-r31 (and throws when r3 is odd): what its guard covers comes back, the rest keeps
+// what the callee wrote, also when the callee throws.
+static void ClobberGuardTest(CpuContext* ctx) {
+    for (int i = 1; i < 32; ++i) ctx->fpr[i].d = -1000.0 - i;
+    for (int i = 14; i < 32; ++i) ctx->gpr[i] = 0xDEAD0000u + static_cast<uint32_t>(i);
+    if (ctx->gpr[3] & 1u) throw std::runtime_error("guarded callee threw");
+}
+static void RegisterGuardTestCallee(uint32_t address, uint32_t fprMask, FunctionKind kind) {
+    TranslatedFunctionInfo info{};
+    info.address = address;
+    info.name = "ClobberGuardTest";
+    info.rawCpuInvoker = ClobberGuardTest;
+    info.entryPoint = reinterpret_cast<void*>(ClobberGuardTest);
+    info.nonvolatileFprWriteMask = fprMask;
+    info.kind = kind;
+    TranslatedFunctionRegistry::Register(std::move(info));
+}
+constexpr uint32_t kGuardAll = 0x80002100, kGuardRun = 0x80002200, kGuardNative = 0x80002300, kGuardF31 = 0x80002400,
+                   kGuardSparse = 0x80002500;
+static void TestIndirectSiteGuards() {
+#if MKW_INDIRECT_IC
+    struct Case { uint32_t target; uint32_t fprKept; bool gprsKept; };
+    const Case cases[] = {{kGuardAll, 0xFFFFC000u, false}, {kGuardRun, 0xFFF00000u, false}, {kGuardNative, 0xFFFFC000u, true},
+                          {kGuardF31, 0x80000000u, false}, {kGuardSparse, 0x50024000u, false}};
+    for (const Case& c : cases)
+        for (uint32_t r3 : {2u, 3u}) {
+            for (int round = 0; round < 3; ++round) {  // the site's slots empty, then holding the record
+                CpuContext ctx{};
+                for (int i = 0; i < 32; ++i) ctx.fpr[i].d = 1.0 + i;
+                for (int i = 0; i < 32; ++i) ctx.gpr[i] = 0x1000u + static_cast<uint32_t>(i);
+                ctx.gpr[3] = r3;
+                CpuContextScope scope(&ctx);
+                bool threw = false;
+                try {
+                    MKW_INDIRECT_CALL(c.target, &ctx);
+                } catch (const std::runtime_error&) {
+                    threw = true;
+                }
+                assert(threw == ((r3 & 1u) != 0));
+                for (int i = 1; i < 32; ++i)
+                    assert(ctx.fpr[i].d == (((c.fprKept >> i) & 1u) ? 1.0 + i : -1000.0 - i));
+                for (int i = 14; i < 32; ++i)
+                    assert(ctx.gpr[i] == (c.gprsKept ? 0x1000u + static_cast<uint32_t>(i) : 0xDEAD0000u + static_cast<uint32_t>(i)));
+            }
+        }
+#endif
+}
+
 int main() {
     Memory::Init(0x200000);
+    RegisterGuardTestCallee(kGuardAll, 0xFFFFC000u, FunctionKind::BaseTranslated);
+    RegisterGuardTestCallee(kGuardRun, 0xFFF00000u, FunctionKind::BaseTranslated);
+    RegisterGuardTestCallee(kGuardNative, 0xFFFFC000u, FunctionKind::Native);
+    RegisterGuardTestCallee(kGuardF31, 0x80000000u, FunctionKind::BaseTranslated);
+    RegisterGuardTestCallee(kGuardSparse, 0x50024000u, FunctionKind::BaseTranslated);
     TestSingleLoads();
     TranslatedFunctionInfo callee{};
     callee.address = 0x80002000;
@@ -413,8 +508,10 @@ int main() {
     assert(ctx.fpr[5].paired.ps1 == 1.2275004386901855f);
     assert(ctx.fpr[7].paired.ps1 == 4.910001754760742f);
     TranslatedFunctionRegistry::Finalize();
+    TestIndirectSiteGuards();
     TestOnlineHooksAndContinuation();
     TestSnapshotCodeRestoration();
+    TestConsumeAcrossPages();
     TestDiscontiguousCodeChecks();
     TestCompactedJumpSources();
     TestSequencePairs();

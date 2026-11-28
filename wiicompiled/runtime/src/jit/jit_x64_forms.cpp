@@ -7,9 +7,10 @@
 // test, and the write of a byte that already holds the value, can go. AnalyseForms walks the block once, when it is compiled,
 // and keeps for every op the registers whose form is known on entry to the op's code.
 //
-// Knowledge is about the byte in memory, which the code always keeps up to date (every write is kept unless the byte is known to
-// hold the value already), so an exit or a call never needs a flush. It starts empty at the block's entry (the dispatcher and
-// the links enter with whatever forms the frame holds) and an op changes it only as listed here:
+// Knowledge is about the form the register holds. The byte in memory follows it lazily (the writes are pending in the emitter until
+// the next flush before a call, an exit or a cold path's call: BlockEmitter::SetFprForm); a register the block does not know has no
+// pending write, so its byte in memory is right whenever code tests it. Knowledge starts empty at the block's entry (the
+// dispatcher and the links enter with whatever forms the frame holds) and an op changes it only as listed here:
 //
 //  * a kind that writes an FPR sets its destination: Scalar (loads lfs, lfd and their forms, the double and single arithmetic,
 //    fneg, fabs, frsp, and the Generic float ops: DescribeGeneric), Paired (psq_l, the paired arithmetic and moves);
@@ -24,10 +25,21 @@
 // destination byte and no other, so it does not change what is known after the op. An op's own sources are read before its
 // destination is written, so aliasing is no problem: the knowledge on entry describes the sources.
 //
+// Alongside the forms: the registers known Scalar whose double is a single-precision value widened (BlockEmitter::KnownSingle;
+// its fraction's low 29 bits are clear and it is no double subnormal, so PpcForce25BitInline leaves it as it is, and a sum or
+// difference of two of them below 2^-126 is exact). A Paired register's scalar view (ps0 widened by cvtss2sd) is always one. The
+// writers that make one: lfs and its forms (the manual's conversion of any word, or cvtss2sd), the single-precision arithmetic
+// and frsp (a float widened, whatever the operands), and fmr, fneg, fabs, ps_mr of a register whose scalar view is one (they
+// move bits or change the sign only). Every other writer makes the register not known single.
+//
+// The forms are kept in memory lazily (BlockEmitter::SetFprForm, jit_x64_fpr.cpp): what this analysis knows is the form the
+// register holds, and the emitter writes the byte before anything reads it in memory.
+//
 // BRAWL_JIT_NO_FORMS=1 turns the analysis off (every form unknown, every byte written).
 // BRAWL_JIT_FORMS_FAULT=<n> (a test aid: it makes the analysis wrong on purpose so that the tests can show they notice) is read
 // at every compile: 1 keeps the knowledge across calls and unlisted ops, 2 gives fmr and ps_mr a Scalar result whatever their
-// source, 3 makes the loads set Paired, 4 treats a paired op's destination as already Paired.
+// source, 3 makes the loads set Paired, 4 treats a paired op's destination as already Paired, 5 takes every Scalar result for a
+// single-precision value (lfd's and the double arithmetic's too).
 #include "jit_x64.h"
 #include "jit_x64_generic.h"
 
@@ -110,23 +122,40 @@ void BlockEmitter::AnalyseForms() {
     const uint32_t n = block.count;
     g_forms.analysed.fetch_add(1, std::memory_order_relaxed);
     if (EnvOn("BRAWL_JIT_NO_FORMS")) {
-        for (uint32_t i = 0; i <= n; ++i) formScalar_[i] = formPaired_[i] = 0;
+        for (uint32_t i = 0; i <= n; ++i) formScalar_[i] = formPaired_[i] = formSingle_[i] = 0;
         return;
     }
     const int fault = Fault();
     uint32_t scalar = 0, paired = 0;  // the registers known Scalar / Paired before the op looked at
+    uint32_t single = 0;              // of `scalar`, those known to hold a single-precision value
     const auto set = [&](uint32_t r, uint32_t form) {  // form: 0 not known, 1 scalar, 2 paired
         const uint32_t bit = 1u << (r & 31u);
         scalar &= ~bit;
         paired &= ~bit;
+        single &= ~bit;
         if (form == 1) scalar |= bit;
         else if (form == 2) paired |= bit;
     };
+    const auto scalarViewSingle = [&](uint32_t r) { return (((paired | single) >> (r & 31u)) & 1u) != 0; };
     for (uint32_t i = 0; i < n; ++i) {
         formScalar_[i] = scalar;
         formPaired_[i] = paired;
+        formSingle_[i] = single;
         const Op& o = block.ops[i];
         const Effect fx = EffectOf(o);
+        // a Scalar result that is a single (before `set` forgets the sources)
+        bool makesSingle = false;
+        switch (o.kind) {
+        case K::Lfs: case K::Lfsu: case K::Lfsx:
+        case K::Fadds: case K::Fsubs: case K::Fmuls: case K::Fdivs: case K::Fmadds: case K::Fmsubs: case K::Fnmsubs: case K::Fnmadds:
+        case K::Frsp:
+            makesSingle = true;
+            break;
+        case K::Fneg: case K::Fabs: case K::Fmr: case K::PsMr:
+            makesSingle = scalarViewSingle(o.b);
+            break;
+        default: break;
+        }
         switch (fx.kind) {
         case Effect::Keep: break;
         case Effect::SetScalar: set(fx.dst, 1); break;
@@ -142,8 +171,13 @@ void BlockEmitter::AnalyseForms() {
             break;
         }
         case Effect::Clear:
-            if (fault != 1) scalar = paired = 0;
+            if (fault != 1) scalar = paired = single = 0;
             break;
+        }
+        if (fx.kind != Effect::Clear && fx.kind != Effect::Keep) {
+            const uint32_t bit = 1u << (fx.dst & 31u);
+            // fault 5 (wrong on purpose): every Scalar result "is" a single, lfd's and the double arithmetic's too
+            if ((scalar & bit) != 0 && (makesSingle || fault == 5)) single |= bit;
         }
         if (fault == 4 && fx.kind == Effect::SetPaired) {  // wrong on purpose: the destination "was" Paired already
             formPaired_[i] |= 1u << (fx.dst & 31u);
@@ -154,10 +188,11 @@ void BlockEmitter::AnalyseForms() {
             i + 1 < n) {
             formScalar_[i + 1] = scalar;
             formPaired_[i + 1] = paired;
+            formSingle_[i + 1] = single;
             ++i;
         }
     }
-    formScalar_[n] = formPaired_[n] = 0;
+    formScalar_[n] = formPaired_[n] = formSingle_[n] = 0;
 }
 
 void BlockEmitter::NoteForm(FormEvent e) {

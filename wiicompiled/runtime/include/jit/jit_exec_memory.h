@@ -1,7 +1,9 @@
 #pragma once
 
-// Memory the host runs as code, for the run-time compiler of guest code (src/jit). Emitted code calls runtime helpers
-// through an absolute address in a register, so none of this memory has to be near the executable.
+// Memory the host runs as code, for the run-time compiler of guest code (src/jit). On Linux x86-64 it is mapped within a
+// rel32 displacement of the executable's text while a 256 MiB reservation there lasts, so that emitted code calls translated
+// functions and runtime helpers with `call rel32`; elsewhere it is mapped anywhere, and emitted code, which checks the
+// distance of every such call, goes through an absolute address in a register (BRAWL_JIT_FAR_MEMORY=1 forces that).
 
 #include <cstddef>
 #include <vector>
@@ -28,9 +30,9 @@ void Free(Region region);
 // Hands out code space from chunks, one after another. Nothing is returned piecemeal: Reset and the destructor free
 // every chunk. Used by one thread.
 //
-// On Linux a chunk of a huge page or more (the default) starts on a 2 MiB boundary and is advised MADV_HUGEPAGE, so that a
-// cache of generated code is mapped by a few huge pages and the instruction TLB is not the limit; other hosts and smaller
-// chunks (tests) get plain page mappings.
+// On Linux a chunk of a huge page or more (the default) starts on a 2 MiB boundary; it is advised MADV_HUGEPAGE only with
+// BRAWL_JIT_HUGEPAGES=1 (measured slower; jit_exec_memory.cpp MapRegionHuge). Other
+// hosts and smaller chunks (tests) get plain page mappings.
 class Arena {
 public:
 #if defined(__linux__)
@@ -61,6 +63,8 @@ public:
     size_t BytesUsed() const { return used_; }
     // Bytes mapped in all chunks.
     size_t BytesReserved() const { return reserved_; }
+    // The underlying executable chunks, in allocation order (append-only until Reset).
+    const std::vector<Region>& Chunks() const { return chunks_; }
 
     // Frees every chunk; every pointer handed out is invalid afterwards.
     void Reset();

@@ -14,10 +14,12 @@
 #include "brawl_dirty_memory.h"
 #include "memory.h"
 #include "ppc_interpreter.h"
+#include "recomp_mod_loader.h"
 #include "../src/jit/jit_x64.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdint>
@@ -230,7 +232,7 @@ CpuContext BaseState(Rng& r) {
     c.gpr[29] = kDataBase + 0x800u;
     c.gpr[30] = kDataBase + 0x1000u;
     JitTestCr::Randomize(c, [&] { return r.Next(); });
-    c.xer = r.Below(2) ? 0 : 0x80000000u | (r.Next() & 0x6000007Fu);
+    c.xer = (r.Below(4) != 0 ? 0u : 0x80000000u) | (r.Next() & 0x6000007Fu);  // SO set: compiled code does not run (JitBlocksMayRun)
     c.ctr = Edge(r);
     c.lr = kReturn;
     for (auto& f : c.fpr) f.raw = (static_cast<uint64_t>(r.Next()) << 32) | r.Next();
@@ -493,6 +495,50 @@ void FusedMatrix() {
                     }
 }
 
+// A compare or record form followed by a conditional return (bclr; fused when it tests lt, gt or eq of the compare's field without a
+// ctr decrement): compare fields and bclr fields the same or not, every bit, BO classes with and without ctr, lr the frame's return
+// (with low bits set now and then) or another label.
+void CompareReturnMatrix() {
+    Rng rng(9);
+    constexpr uint32_t bos[] = {12, 4, 8, 0, 16, 18};
+    for (int kind = 0; kind < 6; ++kind)
+        for (uint32_t cmpField : {0u, 6u})
+            for (uint32_t retField : {0u, 6u})
+                for (uint32_t bit = 0; bit < 4; ++bit)
+                    for (uint32_t bo : bos)
+                        for (int elsewhere = 0; elsewhere < 2; ++elsewhere) {
+                            if (kind >= 4 && cmpField != 0) continue;  // record forms write cr0
+                            Asm a;
+                            Label other = a.NewLabel();
+                            a << mflr(6);
+                            if (elsewhere) a.LiLabel(5, other) << mtlr(5);
+                            switch (kind) {
+                            case 0: a << cmpwi(cmpField, 3, 7); break;
+                            case 1: a << cmplwi(cmpField, 3, 0xFFFFu); break;
+                            case 2: a << cmpw(cmpField, 3, 4); break;
+                            case 3: a << cmplw(cmpField, 3, 4); break;
+                            case 4: a << rlwinm(5, 3, rng.Below(32), rng.Below(32), rng.Below(32), 1); break;
+                            default: a << ppc::D(28, 3, 5, 0x8001); break;  // andi. r5, r3, 0x8001
+                            }
+                            a << bclr(bo, retField * 4 + bit) << addi(8, 8, 1) << mtlr(6) << blr();
+                            a.Bind(other);
+                            a << addi(9, 9, 1) << mtlr(6) << blr();
+                            std::vector<CpuContext> states;
+                            for (uint32_t x : {0u, 6u, 7u, 8u, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu, 0xFFFFu, 0x8001u})
+                                for (uint32_t y : {0u, 7u, 0xFFFFFFFFu}) {
+                                    CpuContext c = BaseState(rng);
+                                    c.gpr[3] = x;
+                                    c.gpr[4] = y;
+                                    c.ctr = kCtrs[rng.Below(4)];
+                                    if (!elsewhere) c.lr = kReturn | (rng.Below(4) == 0 ? rng.Below(4) : 0u);
+                                    states.push_back(c);
+                                }
+                            AddProgram(Fmt("compare+bclr kind=%d cmp=cr%u ret=cr%u.%u bo=%u %s", kind, cmpField, retField, bit, bo,
+                                           elsewhere ? "elsewhere" : "return"),
+                                       a, states);
+                        }
+}
+
 // A compare followed by a bc in the middle of a block, and several of them in a row.
 void FusedChains() {
     Rng rng(4);
@@ -595,6 +641,35 @@ void BctrTranslatedAndNot() {
             states.push_back(c);
         }
         AddProgram(Fmt("bctr local/registered pattern %d", pattern), a, states);
+    }
+}
+
+// bctr and bctrl through a ctr whose low bits are set (bcctr ignores them: the cached targets must be found for the masked value):
+// to a local label through a switch's table pattern (lwzx, mtctr, bctr), to the registered function (a tail call, a call),
+// alternating with the exact addresses.
+void CtrLowBits() {
+    Rng rng(8);
+    for (int style = 0; style < 4; ++style) {
+        Asm a;
+        Label t = a.NewLabel(), back = a.NewLabel();
+        a << mflr(0) << stw(0, 0, 1);
+        if (style == 0 || style == 2) a.LiLabel(4, t);
+        else a.Li32(4, kFnModify);
+        a << add(4, 4, 9) << stw(4, 0, 29) << li(5, 0) << ppc::X(6, 29, 5, 23) << mtctr(6);  // lwzx r6, r29, r5
+        a << (style < 2 ? bctr() : bctrl());
+        a.Bind(back);
+        a << addi(7, 7, 1) << lwz(0, 0, 1) << mtlr(0) << blr();
+        a.Bind(t);
+        a << addi(6, 6, 3);
+        if (style == 2) a << blr();  // the bctrl's return
+        else a << lwz(0, 0, 1) << mtlr(0) << blr();
+        std::vector<CpuContext> states;
+        for (int i = 0; i < 24; ++i) {
+            CpuContext c = BaseState(rng);
+            c.gpr[9] = rng.Below(3) == 0 ? rng.Below(4) : 0u;
+            states.push_back(c);
+        }
+        AddProgram(Fmt("ctr low bits style %d", style), a, states);
     }
 }
 
@@ -1158,6 +1233,564 @@ void PatchedSelfModifying() {
     }
 }
 
+// --- subcall frames: patched functions whose guest code is at their own address -------------------------------------------
+// The real RunPatched's case (no redirect): the wrapper of a patched function X runs X's own guest code in a Run of its own. With
+// the patch hooks registered (main), the JIT calls such a function from a jit_enter_direct or subcall frame in a subcall frame
+// linked to X's block (BlockEmitter::CallSubFrame; jit_subcall for a bctrl) and must leave what the wrapper leaves: the guard byte,
+// the redirect bound and RunPatched's Sync test decide as the wrapper does, run by run.
+constexpr uint32_t kSubBase = 0x80060000u, kSubCount = 8, kSubStride = 0x400u;
+constexpr uint32_t kSubThrowLean = 0x80042040u, kSubSetPending = 0x80042050u, kSubSetDirty = 0x80042060u, kLeanPlain = 0x80042070u;
+constexpr uint32_t kSubThrowGuarded = 0x80042080u;  // a native (GPR guard): called through JitThinCall, its exception stored and rethrown
+uint8_t g_subGuard[kSubCount];
+std::atomic<uint64_t> g_subPendingFast{0};
+std::atomic<bool> g_subAnyDirty{false};
+std::atomic<uint32_t> g_subLowestRedirect{UINT32_MAX};
+uint64_t g_subWrapperRuns = 0;      // patched calls that went through a wrapper (not a subcall frame)
+uint64_t g_subTranslationRuns = 0;  // calls of an unpatched function (its translation)
+constexpr uint32_t SubAddress(uint32_t k) { return kSubBase + kSubStride * k; }
+
+void SubSync() {
+    g_subPendingFast.store(0);
+    g_subAnyDirty.store(false);
+    GuestCodePatch::Sync();
+}
+// RunPatched's own path (the hooks' runPatched, for a call RunPatchedJit does not make): the general entry, the Sync test.
+std::atomic<uint32_t> g_subOpenEdges{0};
+uint64_t g_subGeneralRuns = 0;  // calls RunPatchedJit gave back to it
+uint64_t g_subJitPathRuns = 0;  // calls the wrappers made through RunPatchedJit (minus the above: the ones it entered itself)
+bool g_fastEntriesOn = false;   // JIT_BRANCH_DIRECT: no BRAWL_JIT_STATS, so the lean entry may use jit_enter_direct
+void SubRunPatchedGeneral(CpuContext* c, uint32_t address) {
+    ++g_subGeneralRuns;
+    if (!PpcInterpreter::detail::RunCompiledEntry(c, address)) PpcInterpreter::detail::RunGeneral(c, address);
+    if (g_subPendingFast.load() != 0 || g_subAnyDirty.load() || g_subOpenEdges.load() != 0) SubSync();
+}
+template <uint32_t K>
+void SubWrapper(CpuContext* c) {
+    if (g_subGuard[K] != 0) {  // MKW_GUEST_CODE_GUARD, then RunPatched (the redirect bound only routes the JIT here)
+        // alternately RunPatched's two paths: RunPatchedJit (the real one with variants off) and the general one
+        if ((++g_subWrapperRuns & 1u) == 0) {
+            ++g_subJitPathRuns;
+            PpcInterpreter::detail::RunPatchedJit(c, SubAddress(K));
+            return;
+        }
+        if (!PpcInterpreter::detail::RunCompiledEntry(c, SubAddress(K))) PpcInterpreter::Run(c, SubAddress(K));
+        if (g_subPendingFast.load() != 0 || g_subAnyDirty.load() || g_subOpenEdges.load() != 0) SubSync();
+        return;
+    }
+    ++g_subTranslationRuns;
+    ClobberAll(c, 40u + K);  // the translation's body
+    c->gpr[3] = (c->gpr[3] & 0xFFFFu) + 5u;
+}
+template <uint32_t... K>
+constexpr std::array<void (*)(CpuContext*), sizeof...(K)> SubTable(std::integer_sequence<uint32_t, K...>) {
+    return {&SubWrapper<K>...};
+}
+constexpr auto kSubFns = SubTable(std::make_integer_sequence<uint32_t, kSubCount>{});
+void FnSetPending(CpuContext* c) { g_subPendingFast.store(1); c->gpr[3] += 0x100u; }
+void FnSetDirty(CpuContext* c) { g_subAnyDirty.store(true); c->gpr[3] += 0x200u; }
+void FnThrowLean(CpuContext* c) {
+    c->gpr[3] ^= 0x77u;
+    if ((c->gpr[12] & 1u) != 0) throw std::runtime_error("lean callee threw");
+}
+
+void RegisterSubFrameFunctions() {
+    for (uint32_t k = 0; k < kSubCount; ++k)
+        RegisterFunctionEx(SubAddress(k), "SubCallee", kSubFns[k], FunctionKind::BaseTranslated, 0);
+    RegisterFunctionEx(kSubThrowLean, "SubThrowLean", FnThrowLean, FunctionKind::BaseTranslated, 0);
+    RegisterFunctionEx(kSubThrowGuarded, "SubThrowGuarded", FnThrowLean, FunctionKind::Native, 0);
+    RegisterFunctionEx(kSubSetPending, "SubSetPending", FnSetPending, FunctionKind::BaseTranslated, 0);
+    RegisterFunctionEx(kSubSetDirty, "SubSetDirty", FnSetDirty, FunctionKind::BaseTranslated, 0);
+    RegisterFunctionEx(kLeanPlain, "LeanPlain", FnPlain, FunctionKind::BaseTranslated, 0);
+}
+
+// The hooks GuestCodePatch::Protect registers, for the functions above: before any call target record is made (main).
+void RegisterSubFrameHooks() {
+    PpcInterpreter::detail::PatchedHooks hooks;
+    hooks.patchedByteFor = [](uint32_t address) -> const uint8_t* {
+        if (address < kSubBase || address >= kSubBase + kSubStride * kSubCount || (address - kSubBase) % kSubStride != 0) return nullptr;
+        return &g_subGuard[(address - kSubBase) / kSubStride];
+    };
+    hooks.pendingFast = &g_subPendingFast;
+    hooks.anyDirty = &g_subAnyDirty;
+    hooks.lowestRedirect = &g_subLowestRedirect;
+    hooks.sync = &SubSync;
+    hooks.openEdgeCount = &g_subOpenEdges;
+    hooks.runPatched = &SubRunPatchedGeneral;
+    PpcInterpreter::detail::RegisterPatchedHooks(hooks);
+}
+
+// What a run sets before the program: the guard bytes (bit k of `unpatched`: function k runs its translation), the redirect bound,
+// the hook flags.
+bool g_subSkipNote = false;  // the contract below broken on purpose (PatchedCallsContract)
+void SubState(uint32_t unpatched, bool redirect) {
+    // GuestCodePatch's contract with the JIT: a guard byte that drops to 0 or a redirect bound that moves suspends every link
+    // (MarksCleared), as the real one does (NotePatchedCallsChanged)
+    bool changed = false;
+    for (uint32_t k = 0; k < kSubCount; ++k) {
+        const uint8_t guard = (unpatched >> k) & 1u ? 0 : 1;
+        if (g_subGuard[k] != 0 && guard == 0) changed = true;
+        g_subGuard[k] = guard;
+    }
+    const uint32_t bound = redirect ? SubAddress(0) : UINT32_MAX;
+    if (g_subLowestRedirect.load() != bound) changed = true;
+    if (changed && !g_subSkipNote) BrawlDirtyMemory::MarksCleared();
+    g_subLowestRedirect.store(bound);
+    g_subPendingFast.store(0);
+    g_subAnyDirty.store(false);
+}
+
+void WriteImage(const Image& image, uint32_t at) {
+    const std::vector<uint32_t> words = image.Resolve(at);
+    for (size_t i = 0; i < words.size(); ++i) Memory::Write32(at + 4u * static_cast<uint32_t>(i), words[i]);
+}
+
+// Function k of a chain (at its own address): opens a frame, writes non-volatile GPRs and FPRs, leaves f1 paired, calls function
+// k + 1 (or itself while r4 counts down, `recursion`), and leaves by `style`: 0 blr, 1 a conditional return, 2 a tail call of a
+// translated function with an FPR guard, 3 of a lean one (a direct tail call), 4 bctr to a lean one, 5 a tail call of the next
+// patched function, 6 blr to code of its own that then returns (a jump through lr inside the subcall frame), 7 a lean callee that
+// throws on odd r12, 8 a callee that sets the hooks' pending write (RunPatched's Sync), 9 the dirty flag, 10 a bctrl of the next,
+// 11 a guarded callee that throws on odd r12 (the exception stored in the subcall frame and rethrown by its continuation), 12 the
+// same by bctrl.
+Image SubLevel(uint32_t k, uint32_t depth, int style, bool recursion) {
+    Asm a;
+    a << stwu(1, -32, 1) << mflr(0) << stw(0, 36, 1);
+    a << addi(14 + k % 8, 3, static_cast<int32_t>(k)) << lfd(14 + (k * 3) % 10, 0x40, 1) << lfd(20 + k % 8, 0x48, 1);
+    a << ppc::ps_merge10(1, 2 + k % 6, 3 + k % 5) << addi(3, 3, 1 + static_cast<int32_t>(k));
+    const bool next = k + 1 < depth;
+    if (recursion) {
+        Label skip = a.NewLabel();
+        a << cmpwi(0, 4, 0);
+        a.Bc(12, 2, skip);
+        a << addi(4, 4, -1);
+        a.BAbs(SubAddress(k), true);
+        a.Bind(skip);
+    } else if (next && style == 10) {
+        a.Li32(8, SubAddress(k + 1)), a << mtctr(8) << bctrl();
+    } else if (next) {
+        a.BAbs(SubAddress(k + 1), true);
+    }
+    if (style == 7) a.BAbs(kSubThrowLean, true);
+    if (style == 11) a.BAbs(kSubThrowGuarded, true);
+    if (style == 12) a.Li32(8, kSubThrowGuarded), a << mtctr(8) << bctrl();
+    if (style == 8 && k + 1 == depth) a.BAbs(kSubSetPending, true);
+    if (style == 9 && k + 1 == depth) a.BAbs(kSubSetDirty, true);
+    a << addi(11, 11, static_cast<int32_t>(k)) << ppc::ps_merge10(1, 2, 4);
+    a << lwz(0, 36, 1) << mtlr(0) << addi(1, 1, 32);
+    Label own = a.NewLabel();
+    switch (style) {
+    case 1: a << rlwinm(0, 3, 0, 31, 31, 1) << bclr(12, 2) << addi(3, 3, 7) << blr(); break;
+    case 2: a.BAbs(kPlain); break;
+    case 3: a.BAbs(kLeanPlain); break;
+    case 4: a.Li32(8, kLeanPlain), a << mtctr(8) << bctr(); break;
+    case 5: a.BAbs(next ? SubAddress(k + 1) : kLeanPlain); break;
+    case 6:
+        a << mflr(9);
+        a.LiLabel(5, own) << mtlr(5) << blr();
+        a.Bind(own);
+        a << addi(3, 3, 99) << mtlr(9) << blr();
+        break;
+    default: a << blr(); break;
+    }
+    return a.Finish();
+}
+
+void SubFrameChain(uint32_t depth, int style, bool recursion) {
+    Asm a;
+    a << mflr(0) << stw(0, 0, 1);
+    PairedSetup(a, depth);
+    if (style == 10) a.Li32(8, SubAddress(0)), a << mtctr(8) << bctrl();
+    else a.BAbs(SubAddress(0), true);
+    a << addi(10, 10, 1);
+    ObserveFprs(a, 0x40);
+    a << lwz(0, 0, 1) << mtlr(0) << blr();
+    Scenario s;
+    s.image = a.Finish();
+    std::vector<Image> levels;
+    for (uint32_t k = 0; k < depth; ++k) levels.push_back(SubLevel(k, depth, style, recursion));
+    s.runs = [=](uint32_t, std::vector<RunSpec>& runs) {
+        for (uint32_t k = 0; k < depth; ++k) WriteImage(levels[k], SubAddress(k));
+        Rng local(300 + depth * 16 + static_cast<uint32_t>(style) + (recursion ? 1000 : 0));
+        // mostly patched (the subcall frames), now and then a function unpatched, or the redirect bound below them
+        static const uint32_t kUnpatched[] = {0, 0, 0, 0, 0, 1, 0, 2, 0, 0, 0xFF, 0, 4, 0};
+        for (int round = 0; round < 2; ++round)
+            for (size_t i = 0; i < sizeof kUnpatched / sizeof *kUnpatched; ++i) {
+                RunSpec spec;
+                spec.ctx = BaseState(local);
+                spec.ctx.gpr[4] = recursion ? local.Below(3) == 0 ? 40u : local.Below(6) : 0u;
+                spec.ctx.gpr[12] = local.Below(4) == 0 ? 1u : 0u;
+                const uint32_t unpatched = kUnpatched[i];
+                const bool redirect = i == 3;
+                spec.before = [unpatched, redirect] { SubState(unpatched, redirect); };
+                runs.push_back(std::move(spec));
+            }
+    };
+    // the blocks are compiled with the guard bytes set: the call sites are subcalls
+    SubState(0, false);
+    RunCase(Fmt("subcall frame %s depth %u style %d", recursion ? "recursion" : "chain", depth, style), s);
+}
+
+void SubFrameCalls() {
+    for (uint32_t depth : {1u, 2u, 3u, 5u})
+        for (int style = 0; style <= 12; ++style) SubFrameChain(depth, style, false);
+    for (int style : {0, 1, 3, 5, 6, 7, 8, 11, 12}) SubFrameChain(1, style, true);
+    // RunPatchedJit gave some calls back (the redirect bound) and entered others itself (only without BRAWL_JIT_STATS, which
+    // keeps the fast entries off)
+    if (g_subGeneralRuns == 0 || (g_subJitPathRuns > g_subGeneralRuns) != g_fastEntriesOn) {
+        std::fprintf(stderr, "FAIL RunPatchedJit: %llu calls, %llu given back\n", static_cast<unsigned long long>(g_subJitPathRuns),
+                     static_cast<unsigned long long>(g_subGeneralRuns));
+        ++g_failures;
+    }
+    SubState(0, false);
+}
+
+// --- exceptions through the call sites' routines into blocks that keep FPRs in host registers -------------------------------------
+// A bl to an fprsOnly function of at most three FPRs keeps them in rbp, r14, r12 across the call (EmitThinSaveCall); when the callee
+// throws, the blocks' personality routine puts them back. Here the exception comes through the code a bctrl or bctr site calls: the
+// subcall routine of a patched callee (MakeSubThunk: a host call of the callee's block, a frame of its own), a fprsOnly callee's own
+// routine, a native called directly. `top` 0: the program's own thin-save bl calls kReenterFprs (f30, f31 kept), which runs G in a
+// Run of its own (a trampoline between the two thin-save frames); 1: the program is G. `inner`: how G reaches the thrower (f15, f17,
+// f31 kept around its call): 0 bctrl of patched function 0, which calls it by bl; 1 bctrl of it; 2 bctr of it; 3 bctrl of function 0,
+// which calls it by bctrl; 4 bctrl of function 0, which calls the throwing native by bl. The thrower throws on odd r12.
+constexpr uint32_t kReenterFprs = 0x80042090u, kThrowFprs = 0x800420A0u;
+void FnThrowFprs(CpuContext* c) {
+    const bool fail = (c->gpr[12] & 1u) != 0;
+    ClobberAll(c, 6);
+    c->gpr[12] = fail ? 1u : 0u;
+    if (fail) throw std::runtime_error("fprs callee threw");
+}
+void RegisterThinSaveFunctions() {
+    RegisterFunctionEx(kReenterFprs, "ReenterFprs", FnReenter, FunctionKind::BaseTranslated, kMasks[4]);  // f30, f31
+    RegisterFunctionEx(kThrowFprs, "ThrowFprs", FnThrowFprs, FunctionKind::BaseTranslated, kMasks[5]);    // f15, f17, f31
+}
+
+void ThinSavesThroughRoutines(int top, int inner) {
+    Asm a;
+    Label g = a.NewLabel();
+    if (top == 0) {
+        a << mflr(0) << stw(0, 0, 1);
+        PairedSetup(a, 11);
+        a.LiLabel(5, g);
+        a.BAbs(kReenterFprs, true);
+        a << addi(10, 10, 1);
+        ObserveFprs(a, 0x40);
+        a << lwz(0, 0, 1) << mtlr(0) << blr();
+    }
+    a.Bind(g);
+    Label back = a.NewLabel();
+    a << stwu(1, -32, 1) << mflr(0) << stw(0, 36, 1) << lfd(30, 0x48, 1) << lfd(31, 0x50, 1) << addi(16, 3, 3);
+    switch (inner) {
+    case 1: a.Li32(8, kThrowFprs), a << mtctr(8) << bctrl(); break;
+    case 2: a.LiLabel(7, back) << mtlr(7), a.Li32(8, kThrowFprs), a << mtctr(8) << bctr(); break;
+    default: a.Li32(8, SubAddress(0)), a << mtctr(8) << bctrl(); break;
+    }
+    a.Bind(back);
+    a << addi(11, 11, 1) << lfd(30, 0x58, 1) << lwz(0, 36, 1) << mtlr(0) << addi(1, 1, 32) << blr();
+    Asm f;  // patched function 0
+    f << stwu(1, -32, 1) << mflr(0) << stw(0, 36, 1) << lfd(15, 0x40, 1) << lfd(17, 0x48, 1) << lfd(31, 0x58, 1);
+    if (inner == 3) f.Li32(8, kThrowFprs), f << mtctr(8) << bctrl();
+    else if (inner == 4) f.BAbs(kSubThrowGuarded, true);
+    else f.BAbs(kThrowFprs, true);
+    f << addi(11, 11, 2) << lfd(17, 0x50, 1) << lwz(0, 36, 1) << mtlr(0) << addi(1, 1, 32) << blr();
+    Scenario s;
+    s.image = a.Finish();
+    const Image f0 = f.Finish();
+    s.runs = [=](uint32_t, std::vector<RunSpec>& runs) {
+        WriteImage(f0, SubAddress(0));
+        Rng local(500 + static_cast<uint32_t>(top * 8 + inner));
+        static const uint32_t kUnpatched[] = {0, 0, 0, 0, 1, 0, 0, 0};
+        for (int round = 0; round < 3; ++round)
+            for (size_t i = 0; i < sizeof kUnpatched / sizeof *kUnpatched; ++i) {
+                RunSpec spec;
+                spec.ctx = BaseState(local);
+                spec.ctx.gpr[12] = (i + static_cast<size_t>(round)) % 3 == 1 ? 1u : 0u;
+                const uint32_t unpatched = kUnpatched[i];
+                spec.before = [unpatched] { SubState(unpatched, false); };
+                runs.push_back(std::move(spec));
+            }
+    };
+    SubState(0, false);
+    RunCase(Fmt("thin saves through routines, top %d inner %d", top, inner), s);
+}
+
+void ThinSavesThroughRoutinesAll() {
+    for (int top = 0; top < 2; ++top)
+        for (int inner = 0; inner < 5; ++inner) ThinSavesThroughRoutines(top, inner);
+    SubState(0, false);
+}
+
+
+// --- host calls between patched functions that do not return the usual way, and exits from inside one ---------------------------
+// A patched callee runs in a Run of its own under RunPatched; the JIT calls its block with a host call in the caller's Frame instead
+// (jit_x64_branch.cpp, EmitSubFrameBl) and must still leave what the nested Run leaves.
+//
+// A longjmp past a frame: function 1 (called by function 0, both patched) leaves through function 0's own return address (popping
+// function 0's guest frame), so the caller's code after its call of function 0 runs while function 1's Run is still the one running
+// (its frame's pairedMask, its return address). That code then jumps to function 1's abandoned return address, which returns from
+// function 1 at last; function 0 goes on to its own return and the caller's code runs a second time. With `paired`, function 1 leaves
+// f14 paired before it jumps (seen by the code it jumps to, then by function 0 as a scalar's bits) and that code calls function 2
+// (a host call made from inside function 1's) before it jumps back. `style`: how function 1 leaves (0 blr, 1 bctr, 2 a taken bnelr),
+// and with style 1 the jump back is a blr whose lr has its low bits set.
+void SharedCallLongjmp(int style, bool paired) {
+    const uint32_t f0 = SubAddress(0), f1 = SubAddress(1), f2 = SubAddress(2);
+    Asm z;
+    z << stwu(1, -32, 1) << mflr(0) << stw(0, 36, 1) << addi(3, 3, 1);
+    z.BAbs(f1, true);  // index 4: function 1 returns to f0 + 20
+    z << addi(3, 3, 0x10) << lwz(0, 36, 1) << mtlr(0) << addi(1, 1, 32) << blr();
+    Asm o;
+    o << addi(3, 3, 0x100);
+    if (paired) o << ppc::ps_merge10(14, 15, 16);
+    o << lwz(0, 36, 1) << addi(1, 1, 32);
+    if (style == 0) o << mtlr(0) << blr();
+    else if (style == 1) o << mtctr(0) << bctr();
+    else o << mtlr(0) << cmpwi(0, 3, 0x4321) << bclr(4, 2) << blr();
+    Asm t;
+    t << addi(3, 3, 0x1000);
+    if (paired) t << ppc::ps_merge10(1, 2, 3);
+    t << blr();
+    const Image i0 = z.Finish(), i1 = o.Finish(), i2 = t.Finish();
+    Asm a;
+    Label cont = a.NewLabel(), done = a.NewLabel();
+    a << mflr(0) << stw(0, 0, 1) << li(13, 0);  // r13: the count (a translation leaves it, ClobberAll)
+    PairedSetup(a, 5);
+    a.BAbs(f0, true);
+    a.Bind(cont);
+    a << addi(13, 13, 1) << cmpwi(0, 13, 2);
+    a.Bc(12, 2, done);
+    if (paired) a.BAbs(f2, true);
+    a << addi(1, 1, -32);
+    a.Li32(5, f0 + 20);
+    if (style == 1) a << ori(5, 5, 2);
+    a << mtlr(5) << blr();
+    a.Bind(done);
+    ObserveFprs(a, 0x40);
+    a << stfd(14, 0x100, 1) << lwz(0, 0, 1) << mtlr(0) << blr();
+    Scenario s;
+    s.image = a.Finish();
+    s.runs = [=](uint32_t, std::vector<RunSpec>& runs) {
+        WriteImage(i0, f0);
+        WriteImage(i1, f1);
+        WriteImage(i2, f2);
+        Rng local(500 + style * 2 + (paired ? 1 : 0));
+        for (int round = 0; round < 8; ++round) {
+            RunSpec spec;
+            spec.ctx = BaseState(local);
+            const uint32_t unpatched = round == 5 ? 4u : 0u;  // now and then function 2 runs its translation
+            spec.before = [unpatched] { SubState(unpatched, false); };
+            runs.push_back(std::move(spec));
+        }
+    };
+    SubState(0, false);
+    RunCase(Fmt("shared call longjmp style %d%s", style, paired ? " paired" : ""), s);
+}
+
+// Exits to the dispatcher from inside a function called with a host call (JitLiftContinue makes its frame then): function 0 rewrites
+// an instruction of function 1 before calling it, so that function 1's linked entry finds its code changed (the stale path, a
+// suspended call link); function 1 jumps through a table of its own to a target that changes from run to run (inline-cache misses);
+// with `deep`, function 1 calls function 2, which does the same, so the exit is two host calls deep.
+void SharedCallExits(bool deep) {
+    const uint32_t f0 = SubAddress(0), f1 = SubAddress(1), f2 = SubAddress(2);
+    // function 1 (and 2): addi r3,r3,imm (rewritten by function 0), a jump through ctr to one of four cases, each a different add
+    const auto callee = [&](uint32_t k, bool calls) {
+        Asm c;
+        Label table = c.NewLabel(), join = c.NewLabel();
+        c << stwu(1, -16, 1) << mflr(0) << stw(0, 20, 1);
+        c << addi(3, 3, 3);  // index 3: the word function 0 rewrites
+        c << rlwinm(6, 4, 4, 26, 27);  // (r4 & 3) << 4: 16 bytes a case
+        c.LiLabel(7, table);
+        c << add(7, 7, 6) << mtctr(7) << bctr();
+        c.Bind(table);
+        for (uint32_t i = 0; i < 4; ++i) {
+            c << addi(3, 3, static_cast<int32_t>(0x10 * (i + 1) + k)) << addi(4, 4, 1);
+            c.B(join);
+            c << nop();
+        }
+        c.Bind(join);
+        if (calls) c.BAbs(f2, true);
+        c << lwz(0, 20, 1) << mtlr(0) << addi(1, 1, 16) << blr();
+        return c.Finish();
+    };
+    Asm z;
+    z << stwu(1, -32, 1) << mflr(0) << stw(0, 36, 1);
+    z.Li32(6, f1 + 12) << stw(8, 0, 6);  // r8: the new word of function 1's index 3
+    if (deep) z.Li32(6, f2 + 12) << stw(9, 0, 6);
+    z.BAbs(f1, true);
+    z << addi(3, 3, 0x10) << lwz(0, 36, 1) << mtlr(0) << addi(1, 1, 32) << blr();
+    const Image i0 = z.Finish(), i1 = callee(1, deep), i2 = callee(2, false);
+    Asm a;
+    a << mflr(0) << stw(0, 0, 1);
+    a.BAbs(f0, true);
+    a << addi(10, 10, 1) << lwz(0, 0, 1) << mtlr(0) << blr();
+    Scenario s;
+    s.image = a.Finish();
+    s.runs = [=](uint32_t, std::vector<RunSpec>& runs) {
+        WriteImage(i0, f0);
+        WriteImage(i1, f1);
+        WriteImage(i2, f2);
+        Rng local(600 + (deep ? 1 : 0));
+        for (int round = 0; round < 12; ++round) {
+            RunSpec spec;
+            spec.ctx = BaseState(local);
+            spec.ctx.gpr[4] = local.Below(4) == 0 ? round : 1;               // the case: mostly the same one
+            spec.ctx.gpr[8] = addi(3, 3, static_cast<int32_t>(round % 3));   // the rewritten words: the same now and then
+            spec.ctx.gpr[9] = addi(3, 3, static_cast<int32_t>(round % 2) + 7);
+            spec.before = [] { SubState(0, false); };
+            runs.push_back(std::move(spec));
+        }
+    };
+    SubState(0, false);
+    RunCase(Fmt("shared call exits%s", deep ? " deep" : ""), s);
+}
+
+void SharedCalls() {
+    for (int style = 0; style < 3; ++style)
+        for (bool paired : {false, true}) SharedCallLongjmp(style, paired);
+    SharedCallExits(false);
+    SharedCallExits(true);
+    SubState(0, false);
+}
+
+// --- guarded code (BlockEmitter::Guarded) called and returned to with host calls, under the store view ---------------------------
+// With the program slots and the patched functions' pages registered as executable (their chunks flagged in the store policy, as
+// the game's code is), their blocks are guarded code: no dirty-mark test on a linked entry and only the epoch after a call, as a
+// write under them drops them (BrawlDirtyMemory::guardedWritten) before compiled code goes on. A caller that called a patched
+// function's block with a host call is suspended on the host stack inside its block; when the callee (or something it calls)
+// writes the caller's code after the call site, the drop must have rewritten the caller's epoch immediates before the callee's
+// `ret 8` comes back, so that the test after the call sends the rest to the new code. With the store view (lean_window.h), the
+// callee's store into the flagged chunk faults inside a host-called block and resumes at its slow entry (jit_x64_mem.cpp).
+void SetGuardedCode() {
+    using namespace RecompMod;
+    g_executableWriteGuardEnabled.store(true);
+    const auto add = [](uint32_t start, uint32_t end) {
+        for (uint32_t a = start; a < end; a += 1u << kExecutableWriteGuardPageShift) {
+            g_executableWriteGuardPages[a >> kExecutableWriteGuardPageShift].store(1);
+            g_executableWriteGuardMidPages[a >> kExecutableWriteGuardMidPageShift].store(1);
+            g_executableWriteGuardCoarsePages[a >> kExecutableWriteGuardCoarsePageShift].store(1);
+        }
+    };
+    add(kSlotBase, kSlotBase + (kSlotCount + 8) * kSlotBytes);
+    add(kSubBase, kSubBase + kSubCount * kSubStride);
+    Memory::RefreshWritableFastPathsForExecutableRanges();
+}
+uint64_t GuardedCompiles() { return PpcInterpreter::detail::JitX64GetStats().guarded; }
+
+// The caller (a program slot) passes the address of the word after its call (r3) and the new word (r4 = r8) and calls: by `style`
+// 0 patched function 0, which stores the word itself; 1 function 0, which has the registered C++ function FnWrite store it (a
+// guest store's checked path); 2 function 0, which calls function 1 (two host calls deep), which stores it; 3 FnWrite directly (a
+// direct call of translated code); 4 function 0, which stores to r10 (sandbox data, or an address no region maps: the store's
+// fault, its slow entry and the checked path's exception inside a host-called block) and returns.
+void GuardedCallerWrites(int style) {
+    const uint32_t f0 = SubAddress(0), f1 = SubAddress(1);
+    Asm callee0, callee1;
+    switch (style) {
+    case 0: callee0 << stw(4, 0, 3) << blr(); break;
+    case 1:
+        callee0 << stwu(1, -16, 1) << mflr(0) << stw(0, 20, 1);
+        callee0.BAbs(kFnWrite, true);
+        callee0 << lwz(0, 20, 1) << mtlr(0) << addi(1, 1, 16) << blr();
+        break;
+    case 2:
+        callee0 << stwu(1, -16, 1) << mflr(0) << stw(0, 20, 1);
+        callee0.BAbs(f1, true);
+        callee0 << addi(11, 11, 1) << lwz(0, 20, 1) << mtlr(0) << addi(1, 1, 16) << blr();
+        callee1 << addi(12, 12, 3) << stw(4, 0, 3) << blr();
+        break;
+    case 4: callee0 << stw(4, 0, 10) << addi(11, 11, 5) << blr(); break;
+    default: callee0 << blr(); break;
+    }
+    const Image i0 = callee0.Finish(), i1 = callee1.Finish();
+    Asm a;
+    Label after = a.NewLabel();
+    a << mflr(0) << stw(0, 0, 1);
+    a.LiLabel(3, after);
+    a << ori(4, 8, 0);
+    a.BAbs(style == 3 ? kFnWrite : f0, true);
+    a.Bind(after);
+    a << addi(6, 6, 1) << addi(6, 6, 2) << lwz(0, 0, 1) << mtlr(0) << blr();
+    Scenario s;
+    s.image = a.Finish();
+    const size_t at = static_cast<size_t>(std::find(s.image.words.begin(), s.image.words.end(), addi(6, 6, 1)) - s.image.words.begin());
+    s.runs = [=](uint32_t, std::vector<RunSpec>& runs) {
+        WriteImage(i0, f0);
+        if (style == 2) WriteImage(i1, f1);
+        Rng local(700 + static_cast<uint32_t>(style));
+        for (int i = 0; i < 16; ++i) {
+            RunSpec spec;
+            spec.ctx = BaseState(local);
+            if (i % 2 == 0) spec.ctx.xer &= ~0x80000000u;  // compiled code runs (XER[SO] clear) at least every other run
+            spec.ctx.gpr[6] = 0;
+            spec.ctx.gpr[8] = i % 3 == 0 ? addi(6, 6, 1) : addi(6, 6, 1000 + i);
+            spec.ctx.gpr[10] = style == 4 && i % 4 == 1 ? 0x70000000u : kDataBase + 0x100u;
+            spec.writes.push_back({static_cast<uint32_t>(at * 4), addi(6, 6, 1)});  // the word as it was, before every run
+            const uint32_t unpatched = i == 11 ? 1u : 0u;  // now and then function 0 runs its translation
+            spec.before = [unpatched] { SubState(unpatched, false); };
+            runs.push_back(std::move(spec));
+        }
+    };
+    SubState(0, false);
+    RunCase(Fmt("guarded caller written by its callee, style %d", style), s);
+}
+
+// A call link tests neither the callee's guard byte nor the redirect bound once linked: GuestCodePatch suspends every link when either
+// changes (NotePatchedCallsChanged, at each of its writers that drop a guard byte or move the bound). With that left out on purpose,
+// the subcall chains (whose runs drop guard bytes and set the bound now and then) must fail.
+void PatchedCallsContract() {
+    const unsigned failures = g_failures, reported = g_reported;
+    g_reported = 8;
+    g_subSkipNote = true;
+    for (int style : {0, 5, 10}) SubFrameChain(2, style, false);
+    g_subSkipNote = false;
+    const unsigned noticed = g_failures - failures;
+    g_failures = failures;
+    g_reported = reported;
+    SubState(0, false);
+    BrawlDirtyMemory::MarksCleared();
+    std::printf("jit branch: with the patched calls' contract broken on purpose %u failed\n", noticed);
+    if (noticed == 0) {
+        std::fprintf(stderr, "FAIL: a guard byte drop or redirect bound move without NotePatchedCallsChanged was not noticed\n");
+        ++g_failures;
+    }
+}
+
+void GuardedHostCalls() {
+    const char* guardEnv = std::getenv("BRAWL_JIT_GUARD");
+    const bool guardOff = guardEnv != nullptr && *guardEnv == '0';  // every line tested: no guarded block, nothing to notice
+    SetGuardedCode();
+    const uint64_t guarded = GuardedCompiles();
+    for (int style = 0; style < 4; ++style) GuardedCallerWrites(style);
+    // style 4's store to an unmapped address faults in a block run by a host call (with the store view)
+    const uint64_t faults = PpcInterpreter::detail::JitX64GetFaultStats().faults;
+    GuardedCallerWrites(4);
+    if (PpcInterpreter::detail::x64::FaultStores() && PpcInterpreter::detail::JitX64GetFaultStats().faults == faults) {
+        std::fprintf(stderr, "FAIL guarded host calls: the callee's store did not fault\n");
+        ++g_failures;
+    }
+    // the host-call tests again, their blocks guarded now
+    SubFrameCalls();
+    SharedCalls();
+    PatchedSelfModifying();
+    if ((GuardedCompiles() == guarded) != guardOff) {
+        std::fprintf(stderr, "FAIL guarded host calls: %s\n", guardOff ? "guarded blocks with BRAWL_JIT_GUARD=0"
+                                                                     : "no block was compiled as guarded code");
+        ++g_failures;
+    }
+    // The drop made wrong on purpose (g_jitEpochFault 5: a write under guarded code drops nothing): the callers written by their
+    // callees must notice.
+    const unsigned failures = g_failures, reported = g_reported;
+    g_reported = 8;  // the failures expected here are not printed
+    PpcInterpreter::detail::g_jitEpochFault = 5;
+    for (int style = 0; style < 4; ++style) GuardedCallerWrites(style);
+    PpcInterpreter::detail::g_jitEpochFault = 0;
+    const unsigned noticed = g_failures - failures;
+    g_failures = failures;
+    g_reported = reported;
+    std::printf("jit branch: guarded host calls, %llu guarded blocks; with the guard's drop off on purpose %u failed\n",
+                static_cast<unsigned long long>(GuardedCompiles() - guarded), noticed);
+    if (noticed == 0 && !guardOff) {
+        std::fprintf(stderr, "FAIL guarded host calls: the deliberate guard fault was not noticed\n");
+        ++g_failures;
+    }
+    SubState(0, false);
+}
 
 // Float arguments held paired, one register at a time (every position f1-f13, named by the callee's ABI or not): after the call the
 // named one is a scalar, every other stays paired. Callees of every ABI and guard configuration, by bl, bctrl and b.
@@ -1317,10 +1950,98 @@ void LeanEntryHooks() {
     }
 }
 
+// One bctrl or bctr site whose common target changes over a long run, so that its inline ways (x64::JitCallWays) are written by the
+// first miss and then by targets hit out of line 32 times, moving older targets out of the ways: A once, B 40 times, C 40 times, A 20
+// times, then B and a fourth target alternating (translated functions of several kinds, a patched one, or leaf code). Answers
+// whether the ways were written at least three times over all runs of all engines.
+bool IndirectHotWays() {
+    const uint64_t before = JitX64GetStats().wayPatches;
+    for (int style = 0; style < 2; ++style)
+        for (int kinds = 0; kinds < 3; ++kinds) {
+            constexpr int kCalls = 140;
+            Asm a;
+            Label table = a.NewLabel(), loop = a.NewLabel(), done = a.NewLabel(), leaf = a.NewLabel();
+            a << mflr(0) << stw(0, 0, 1);
+            a.LiLabel(4, table) << stw(4, 4, 1) << li(5, kCalls) << stw(5, 8, 1);
+            a.Bind(loop);
+            a << lwz(5, 8, 1) << cmpwi(0, 5, 0);
+            a.Bc(12, 2, done);
+            a << addi(5, 5, -1) << stw(5, 8, 1) << lwz(4, 4, 1) << lwz(6, 0, 4) << addi(4, 4, 4) << stw(4, 4, 1);
+            PairedSetup(a, 5);
+            if (style == 0) {
+                a << mtctr(6) << bctrl() << addi(10, 10, 1);
+                a.B(loop);
+            } else {
+                Label back = a.NewLabel();
+                a.LiLabel(7, back) << mtlr(7) << mtctr(6) << bctr();
+                a.Bind(back);
+                a.B(loop);
+            }
+            a.Bind(done);
+            ObserveFprs(a, 0x40);
+            a << lwz(0, 0, 1) << mtlr(0) << blr();
+            a.Bind(leaf);
+            a << addi(3, 3, 13) << ori(12, 3, 0x50) << blr();
+            a.Bind(table);
+            const size_t tableIndex = a.Here();
+            for (int e = 0; e < kCalls + 2; ++e) a << 0u;
+            Scenario s;
+            s.image = a.Finish();
+            const size_t leafAt = static_cast<size_t>(std::find(s.image.words.begin(), s.image.words.end(), addi(3, 3, 13)) - s.image.words.begin());
+            s.runs = [=](uint32_t base, std::vector<RunSpec>& runs) {
+                Rng local(90 + kinds * 3 + style);
+                for (int round = 0; round < 2; ++round) {
+                    RunSpec spec;
+                    spec.ctx = BaseState(local);
+                    spec.ctx.gpr[3] = local.Next();
+                    const uint32_t leafAddress = base + 4u * static_cast<uint32_t>(leafAt);
+                    uint32_t t[4];
+                    for (uint32_t& x : t) x = kThinBase + kThinStride * local.Below(kThinCount);
+                    if (kinds == 1) t[2] = PatchedAddress(3);
+                    if (kinds == 2) t[3] = leafAddress;
+                    for (int e = 0; e < kCalls; ++e) {
+                        const int w = e < 1 ? 0 : e < 41 ? 1 : e < 81 ? 2 : e < 101 ? 0 : (e & 1) != 0 ? 1 : 3;
+                        spec.writes.push_back({static_cast<uint32_t>(4 * (tableIndex + e)), t[w]});
+                    }
+                    spec.before = [] { ResetPatched(); };
+                    runs.push_back(std::move(spec));
+                }
+            };
+            RunCase(Fmt("indirect hot ways %s kinds %d", style == 0 ? "bctrl" : "bctr", kinds), s);
+        }
+    return JitX64GetStats().wayPatches - before >= 3;
+}
+
 void CallTests() {
     ThinCalls();
+    const uint64_t waysBefore = JitX64GetStats().wayFills, flipsBefore = JitX64GetStats().orderFlips;
     IndirectSites(false);
     IndirectSites(true);
+#if defined(__linux__) && defined(__x86_64__)
+    // the bctrl and bctr sites' inline ways (x64::JitCallWays) were written, so the runs above went through them as well (not with
+    // the code space far from the executable: a way's call does not reach the callees then)
+    const char* far = std::getenv("BRAWL_JIT_FAR_MEMORY");
+    const bool near = far == nullptr || *far == '\0' || *far == '0';
+    if (near && JitX64GetStats().wayFills == waysBefore) {
+        ++g_failures;
+        std::fprintf(stderr, "FAIL indirect sites: no call site's inline ways were written\n");
+    }
+    // their leaf targets (untranslated) switched blocks to probe inline cache 1 first, so the runs went through that order as well
+    const char* cacheFirst = std::getenv("BRAWL_JIT_CACHE_FIRST");
+    if ((JitX64GetStats().orderFlips == flipsBefore) != (cacheFirst != nullptr && *cacheFirst == '0')) {
+        ++g_failures;
+        std::fprintf(stderr, "FAIL indirect sites: probe-order switches %s\n",
+                     JitX64GetStats().orderFlips == flipsBefore ? "never flipped" : "flipped with BRAWL_JIT_CACHE_FIRST=0");
+    }
+    if (!IndirectHotWays() && near) {
+        ++g_failures;
+        std::fprintf(stderr, "FAIL indirect hot ways: the ways were not written by targets hit out of line\n");
+    }
+#else
+    (void)waysBefore;
+    (void)flipsBefore;
+    (void)IndirectHotWays();
+#endif
     for (int depth : {1, 2, 3, 7, 8, 9, 12})
         for (int ret = 0; ret < 4; ++ret) PatchedChain(depth, ret, false);
     for (int ret = 0; ret < 4; ++ret) PatchedChain(3, ret, true);
@@ -1331,6 +2052,9 @@ void CallTests() {
     PatchedExceptions();
     PatchedReenter();
     PatchedSelfModifying();
+    SubFrameCalls();
+    ThinSavesThroughRoutinesAll();
+    SharedCalls();
 }
 
 // Loops: counted bdnz loops of several lengths, and a compare-and-branch loop, from several trip counts.
@@ -1408,6 +2132,46 @@ uint32_t RunJit(uint32_t entry, CpuContext& ctx) {
     PpcInterpreter::Run(&ctx, entry);
     PpcInterpreter::ClearEngineOverride();
     return ctx.gpr[3];
+}
+
+// The calls between patched functions are made in subcall frames: a chain entered through the lean entry (a jit_enter_direct frame)
+// or through Run (a jit_enter frame) calls no wrapper once its blocks are compiled and linked, while the guard bytes stay set; an
+// unpatched function and a redirect bound below the targets go through the wrappers again.
+void SubFramesUsed() {
+    const uint32_t base = kSlotBase + (kSlotCount + 4) * kSlotBytes;
+    for (int style : {0, 10}) {
+        Asm a;
+        a << mflr(0) << stw(0, 0, 1);
+        if (style == 10) a.Li32(8, SubAddress(0)), a << mtctr(8) << bctrl();
+        else a.BAbs(SubAddress(0), true);
+        a << lwz(0, 0, 1) << mtlr(0) << blr();
+        WriteImage(a.Finish(), base);
+        for (uint32_t k = 0; k < 3; ++k) WriteImage(SubLevel(k, 3, style, false), SubAddress(k));
+        PpcInterpreter::SetEngineOverride(Engine::Jit);
+        PpcInterpreter::SetJitThreshold(0);
+        const auto runs = [&](int n, uint32_t unpatched, bool redirect, bool lean) {
+            const uint64_t before = g_subWrapperRuns;
+            for (int i = 0; i < n; ++i) {
+                SubState(unpatched, redirect);
+                CpuContext ctx{};
+                ctx.lr = kReturn;
+                ctx.gpr[1] = kDataBase + 0x1800u;
+                CpuContextScope scope(&ctx);
+                if (!lean || !PpcInterpreter::detail::RunCompiledEntry(&ctx, base)) PpcInterpreter::Run(&ctx, base);
+            }
+            return g_subWrapperRuns - before;
+        };
+        runs(4, 0, false, true);  // compiled and linked
+        CHECK(runs(10, 0, false, true) == 0);
+        const uint64_t translations = g_subTranslationRuns;
+        CHECK(runs(10, 2, false, true) == 0);    // function 1 unpatched: its translation, function 2 not called
+        CHECK(g_subTranslationRuns - translations == 10);
+        CHECK(runs(10, 0, true, true) == 30);    // the redirect bound: every call through its wrapper
+        CHECK(runs(10, 0, false, false) == 0);   // Run's frame (a jit_enter frame) calls in subcall frames too
+        CHECK(runs(10, 0, false, true) == 0);
+        PpcInterpreter::ClearEngineOverride();
+    }
+    SubState(0, false);
 }
 
 void NativeAndLinking() {
@@ -1495,6 +2259,25 @@ void HotLoopsStayCompiled() {
              a << addi(4, 4, 1) << blr();
          },
          8},
+        {"call loop (bctrl to two leaves, blr)",
+         [](Asm& a) {
+             Label loop = a.NewLabel(), leaf = a.NewLabel(), other = a.NewLabel(), skip = a.NewLabel();
+             a << mflr(31) << li(4, 0) << li(5, 0);
+             a.Bind(loop);
+             a.LiLabel(7, leaf);
+             a << rlwinm(0, 3, 0, 31, 31, 1);
+             a.Bc(12, 2, skip);
+             a.LiLabel(7, other);
+             a.Bind(skip);
+             a << mtctr(7) << bctrl() << addi(3, 3, -1) << cmpwi(0, 3, 0);
+             a.Bc(4, 2, loop);
+             a << mtlr(31) << blr();
+             a.Bind(leaf);
+             a << addi(4, 4, 1) << blr();
+             a.Bind(other);
+             a << addi(5, 5, 1) << blr();
+         },
+         8},
         {"jump table loop (bctr, 4 targets)",
          [](Asm& a) {
              Label loop = a.NewLabel(), table = a.NewLabel(), join = a.NewLabel();
@@ -1547,14 +2330,106 @@ void HotLoopsStayCompiled() {
     }
 }
 
+// Regression tests for intra-block GPR caching (subf aliasing o.d == o.a; fused cmpw+bc with both useCtr and useCond
+// when the CR field is dead and the second compare operand is read later) and direct jmp rel32 link/retire.
+void GprCacheAndDirectLinkRegressions() {
+    Rng rng(1337);
+    {
+        Asm a;
+        Label skip = a.NewLabel();
+        // subf r3, r3, r4 -> r3 = r4 - r3 (d == a, both cached), followed by cmpw cr3, r5, r6 + bc 10, 14 (useCtr + useCond)
+        // with cr3 overwritten immediately after (dead) and r6 read afterwards.
+        a << addi(3, 3, 1) << addi(4, 4, 2) << X(3, 3, 4, 40) << addi(5, 5, 3) << cmpw(3, 5, 6);
+        a.Bc(10, 14, skip);
+        a << cmpwi(3, 7, 0) << add(3, 3, 6) << add(3, 3, 5) << blr();
+        a.Bind(skip);
+        a << add(3, 3, 6) << blr();
+        std::vector<CpuContext> states;
+        for (uint32_t ctr : {1u, 2u, 3u}) {
+            for (int eq = 0; eq < 2; ++eq) {
+                CpuContext c = BaseState(rng);
+                c.ctr = ctr;
+                c.gpr[5] = 10;
+                c.gpr[6] = eq ? 13u : 99u;  // after addi(5,5,3), r5 == 13
+                states.push_back(c);
+            }
+        }
+        AddProgram("subf d==a and fused cmpw+bc useCtr+useCond GPR cache", a, states);
+    }
+    {
+        // Direct jmp rel32 link and retire: run a linked jump, rewrite the target block to trigger Retire, run again.
+        const uint32_t base = kSlotBase + (kSlotCount + 8) * kSlotBytes;
+        const uint32_t targetPc = base + 0x40u;
+        Asm entryAsm;
+        entryAsm << addi(3, 3, 1);
+        entryAsm.BAbs(targetPc);
+        const std::vector<uint32_t> entryWords = entryAsm.Finish().Resolve(base);
+        for (size_t i = 0; i < entryWords.size(); ++i) Memory::Write32(base + 4u * static_cast<uint32_t>(i), entryWords[i]);
+        Memory::Write32(targetPc + 0, addi(3, 3, 10));
+        Memory::Write32(targetPc + 4, blr());
+        CpuContext ctx{};
+        ctx.lr = kReturn;
+        ctx.gpr[1] = kDataBase + 0x1800u;
+        ctx.gpr[3] = 5;
+        CHECK(RunJit(base, ctx) == 16);
+        ctx.gpr[3] = 5;
+        CHECK(RunJit(base, ctx) == 16);  // linked direct jmp rel32
+        // Rewrite targetPc so Retire() must unpatch the direct jmp rel32 back to its stub
+        Memory::Write32(targetPc + 0, addi(3, 3, 100));
+        ctx.gpr[3] = 5;
+        CHECK(RunJit(base, ctx) == 106);
+        ctx.gpr[3] = 5;
+        CHECK(RunJit(base, ctx) == 106);  // re-linked to rebuilt target
+    }
+    for (int lone = 0; lone < 2; ++lone) {
+        // Direct conditional link (jcc rel32): a taken bc (fused with its compare, or alone after an unrelated op) jumps straight to
+        // the target's block; rewriting the target must unpatch the jcc (Retire) and the next run links the rebuilt block.
+        const uint32_t base = kSlotBase + (kSlotCount + 9 + static_cast<uint32_t>(lone)) * kSlotBytes;
+        const uint32_t targetPc = base + 0x40u;
+        const auto bc = [](uint32_t at, uint32_t to) { return (16u << 26) | (12u << 21) | (2u << 16) | ((to - at) & 0xFFFCu); };
+        uint32_t at = base;
+        Memory::Write32(at, addi(3, 3, 1)), at += 4;
+        Memory::Write32(at, cmpwi(0, 4, 0)), at += 4;
+        if (lone) Memory::Write32(at, addi(5, 5, 1)), at += 4;
+        Memory::Write32(at, bc(at, targetPc)), at += 4;
+        Memory::Write32(at, addi(3, 3, 2)), at += 4;
+        Memory::Write32(at, blr());
+        Memory::Write32(targetPc + 0, addi(3, 3, 10));
+        Memory::Write32(targetPc + 4, blr());
+        const auto run = [&](uint32_t r3, uint32_t r4) {
+            CpuContext ctx{};
+            ctx.lr = kReturn;
+            ctx.gpr[1] = kDataBase + 0x1800u;
+            ctx.gpr[3] = r3;
+            ctx.gpr[4] = r4;
+            return RunJit(base, ctx);
+        };
+        CHECK(run(5, 0) == 16);
+        CHECK(run(5, 0) == 16);  // the taken bc linked: jcc rel32 to the target block
+        CHECK(run(5, 1) == 8);
+        Memory::Write32(targetPc + 0, addi(3, 3, 100));
+        CHECK(run(5, 0) == 106);
+        CHECK(run(5, 0) == 106);  // re-linked to the rebuilt target
+        CHECK(run(5, 1) == 8);
+    }
+}
+
 }  // namespace
 
 int main() {
-    setenv("BRAWL_JIT_STATS", "1", 1);  // the inline cache's hit and miss counters are emitted only with it
+    // JIT_BRANCH_DIRECT=1 (mkw_jit_branch_direct_tests): without BRAWL_JIT_STATS, which keeps the lean entry off jit_enter_direct, so
+    // that the programs run in direct and subcall frames as in the game; the parts that read the statistics are left out.
+    const char* direct = std::getenv("JIT_BRANCH_DIRECT");
+    const bool stats = direct == nullptr || *direct == '\0' || *direct == '0';
+    if (stats) setenv("BRAWL_JIT_STATS", "1", 1);  // the inline cache's hit and miss counters are emitted only with it
+    g_fastEntriesOn = !stats;
     Memory::Init(0x200000);
     RegisterFunction(kFnModify, "BranchModify", FnModify);
     RegisterFunction(kFnWrite, "BranchWrite", FnWrite);
+    RegisterSubFrameHooks();
     RegisterCallTestFunctions();
+    RegisterSubFrameFunctions();
+    RegisterThinSaveFunctions();
     TranslatedFunctionRegistry::Finalize();
     if (!PpcInterpreter::JitAvailable()) {
         std::printf("jit branch: no JIT backend on this host, nothing to test\n");
@@ -1562,18 +2437,27 @@ int main() {
     }
     BcMatrix();
     BclrMatrix();
+    CompareReturnMatrix();
     FusedMatrix();
     FusedChains();
     ReturnNormalisation();
     JumpTables();
     BctrTranslatedAndNot();
+    CtrLowBits();
     TailCalls();
     Calls();
     CallTests();
     SelfModifying();
     Loops();
-    NativeAndLinking();
-    HotLoopsStayCompiled();
+    if (stats) {
+        NativeAndLinking();
+        HotLoopsStayCompiled();
+    } else {
+        SubFramesUsed();
+    }
+    GprCacheAndDirectLinkRegressions();
+    PatchedCallsContract();
+    GuardedHostCalls();  // last: the pages it registers as executable stay so (executable ranges are only ever added)
     std::printf("jit branch: %u programs, %llu guest runs, %d checks, %u failures\n", g_cases, static_cast<unsigned long long>(g_runs),
                 g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

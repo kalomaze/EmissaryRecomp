@@ -418,7 +418,9 @@ void Load(int frame,CpuContext* ctx) {
     // The restore rewrites guest memory without marks: what was written since the snapshot (all marked and consumed
     // since, or by the Capture below), or everything.
     if(session.fullSnapshots || !session.writeWatch) BrawlDirtyMemory::MarksCleared();
-    else BrawlDirtyMemory::MarksRestored(s.markSeq);
+    else BrawlDirtyMemory::MarksRestoring(s.markSeq);
+    // the code caches compare what the restore wrote once it is done, also when it throws (MarksRestoring's contract)
+    struct RestoreWritten { ~RestoreWritten() { BrawlDirtyMemory::MarksRestoreWritten(); } } restoreWritten;
     if(!session.fullSnapshots) {
         std::vector<uint32_t> all;
         if(!session.writeWatch)for(size_t i=0;i<(total+63)/64;++i)all.push_back(uint32_t(i));

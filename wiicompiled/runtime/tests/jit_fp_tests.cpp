@@ -10,7 +10,9 @@
 //
 //  * FPSCR[NI] clear and set,
 //  * each source arriving as Scalar (as every register is when a function is entered) and as Paired (stfd, then psq_l of
-//    the same bits; Form::Unknown cannot be produced by Run, which starts every register as Scalar),
+//    the same bits; Form::Unknown cannot be produced by Run, which starts every register as Scalar), and every source as a
+//    single made in the same block (frsp r, r: the block knows it is a single-precision value, BlockEmitter::KnownSingle, so
+//    fmuls's multiplier is not rounded, fadds's and fsubs's sums are not range-checked, frsp narrows without a check),
 //  * the destination being each source, and two sources being the same register,
 //  * the full cross product of the first two sources' tables with the native forms (Scalar for the scalar kinds, Paired for the
 //    paired ones), a reduced one for the other forms and the third source, and seeded random bit patterns biased to special
@@ -148,6 +150,8 @@ const Kind kKinds[] = {
     {"ps_mr",   K::PsMr,    true,  4, 72, Shape::B10, 1, 0, false, false, false, false, false},
     {"ps_neg",  K::PsNeg,   true,  4, 40, Shape::B10, 1, 1, false, false, false, false, false},
     {"ps_abs",  K::PsAbs,   true,  4, 264, Shape::B10, 1, 1, false, false, false, false, false},
+    // Decode leaves ps_sel Generic (its counters are K::Generic's, which only it of the kinds here uses)
+    {"ps_sel",  K::Generic, true,  4, 23, Shape::ABC, 3, 3, false, false, false, false, false},
 };
 // clang-format on
 
@@ -214,10 +218,10 @@ void BuildTables() {
 
 // What a source reads from, by the form it arrives in and whether its op is a paired one.
 // (Form::Unknown cannot be produced: PpcInterpreter::Run starts every register as Scalar.)
-enum class SrcForm : uint8_t { Scalar, Paired };
+enum class SrcForm : uint8_t { Scalar, Paired, Single };
 const std::vector<uint64_t>& TableFor(SrcForm f, bool pairedOp) {
     (void)pairedOp;
-    return f == SrcForm::Scalar ? g_doubles : g_pairs;
+    return f == SrcForm::Paired ? g_pairs : g_doubles;
 }
 
 // A random bit pattern biased to special exponents, as a double or as two singles.
@@ -329,7 +333,7 @@ bool Equal(const CpuContext& a, const CpuContext& b) {
            a.lr == b.lr && a.ctr == b.ctr && a.xer == b.xer && a.fpscr == b.fpscr;
 }
 
-const char* FormName(SrcForm f) { return f == SrcForm::Scalar ? "scalar" : "paired"; }
+const char* FormName(SrcForm f) { return f == SrcForm::Scalar ? "scalar" : f == SrcForm::Paired ? "paired" : "single"; }
 
 struct Setup {
     const Kind* kind;
@@ -355,6 +359,8 @@ void RunProgram(const Setup& s, const std::vector<CpuContext>& states) {
         if (s.form[i] == SrcForm::Paired) {  // the same 64 bits, loaded as two singles: held as a pair
             words[n++] = Stfd(r, 0, 30);
             words[n++] = PsqL(r, 0, 30);
+        } else if (s.form[i] == SrcForm::Single) {  // rounded to a single in the block: known to be one
+            words[n++] = Fx(63, r, 0, r, 12);
         }
     }
     uint32_t field[3] = {0, 0, 0};  // the registers of a, b, c
@@ -475,6 +481,19 @@ void RunKind(const Kind& k, uint64_t randomStates, uint64_t seed) {
             s.dest = al.destSource >= 0 ? s.reg[al.destSource] : 5;
             programs.push_back(s);
         }
+        // every source a single made in the block (a scalar kind's knowledge; a paired kind converts it as any scalar)
+        Setup s{};
+        s.kind = &k;
+        s.alias = ai;
+        for (unsigned i = 0; i < n; ++i) {
+            s.form[i] = SrcForm::Single;
+            s.fieldOf[i] = fields[i];
+            s.reg[i] = 2 + i;
+        }
+        const Alias& al = aliases[ai];
+        if (al.hasSame) s.reg[al.same[1]] = s.reg[al.same[0]];
+        s.dest = al.destSource >= 0 ? s.reg[al.destSource] : 5;
+        programs.push_back(s);
     }
     const SrcForm native = k.paired ? SrcForm::Paired : SrcForm::Scalar;
     uint64_t programIndex = 0;
