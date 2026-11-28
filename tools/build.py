@@ -82,6 +82,9 @@ def main():
     parser.add_argument('--code-variants', type=Path,
                         help="a mod's code-variant spec (projects/brawl/tools/gen_variant_spec.py): its patched "
                              'functions are translated as it patches them, beside the unmodified translation')
+    parser.add_argument('--indirect-profile', default='',
+                        help='indirect call target histogram for profile-guided promotion of bctrl/blrl to guarded '
+                             'direct calls (default: projects/brawl/indirect_profile.txt when present; none: off)')
     pgo = parser.add_mutually_exclusive_group()
     pgo.add_argument('--pgo-generate', action='store_true', help='build with frontend PGO instrumentation')
     pgo.add_argument('--pgo-profile', type=Path, help='build using a merged llvm-profdata training profile')
@@ -232,6 +235,14 @@ def build_game(args, game, build):
         for path in sorted(spec.parent.iterdir()):  # the spec and the region dumps beside it
             game_inputs.update(path.name.encode() + path.read_bytes())
         variants = ['--code-variants', spec, '--code-variants-out', 'generated/code_variants']
+    indirect = []
+    if args.indirect_profile != 'none':
+        profile = Path(args.indirect_profile).resolve(strict=True) if args.indirect_profile else \
+            wc / 'projects/brawl/indirect_profile.txt'
+        if profile.exists():
+            game_inputs.update(b'indirect_profile' + profile.read_bytes())
+            indirect = ['--indirect-profile', profile]
+            print(f'build.py: indirect call profile {profile.name}', flush=True)
     translation_key = json.dumps([fingerprint, game_inputs.hexdigest()])
     if not translated_stamp.exists() or translated_stamp.read_text() != translation_key:
         inputs = work / 'game'
@@ -253,7 +264,7 @@ def build_game(args, game, build):
             '--outdir', 'generated/functions', '--output-metadata', 'generated/base_translation_output.json',
             '--production-source-bundle', 'generated/base_translation_sources.bin', '--no-function-files',
             '--no-state-free-abi', '--data-in-text', 'projects/brawl/resident_data_ranges.txt',
-            '--prune-stale', '--threads', args.jobs, *variants, cwd=wc)
+            '--prune-stale', '--threads', args.jobs, *variants, *indirect, cwd=wc)
         run(dotnet, translator, 'generate-data-init', '--project', project, cwd=wc)
         run(dotnet, translator, 'emit-build-shards', '--project', project,
             '--base-metadata', 'generated/base_translation_output.json', '--base-functions-dir', 'generated/functions',

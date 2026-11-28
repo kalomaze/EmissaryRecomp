@@ -780,20 +780,27 @@ public static partial class TranslatedBuildShardEmitter
         return path;
     }
 
+    private static bool LowersToStaticCall(uint address, IReadOnlyDictionary<uint, Trait> traits, out Trait trait) =>
+        traits.TryGetValue(address, out trait!) &&
+        trait.Available &&
+        trait.NonvolatileFprWriteMask == 0 &&
+        !trait.MustRemainDynamicallyDispatchable &&
+        trait.WinnerSymbol is not null &&
+        !trait.WinnerKind.Equals("native", StringComparison.OrdinalIgnoreCase) &&
+        !RequiresGenericDirectCall(address);
+
     private static string LowerStableDirectCalls(
         string source,
         IReadOnlyDictionary<uint, Trait> traits)
     {
+        // A promoted indirect call's arm (IndirectCallProfile) stays only where its call becomes a plain
+        // MKW_STATIC_TRANSLATED_CALL; otherwise the arm goes and the site is the indirect call it was.
+        source = PromotedIndirectArmRegex().Replace(source, match =>
+            LowersToStaticCall(ParseHexUInt32(match.Groups["address"].Value), traits, out _) ? match.Value : string.Empty);
         return DirectCallRegex().Replace(source, match =>
         {
             var address = ParseHexUInt32(match.Groups["address"].Value);
-            if (!traits.TryGetValue(address, out var trait) ||
-                !trait.Available ||
-                trait.NonvolatileFprWriteMask != 0 ||
-                trait.MustRemainDynamicallyDispatchable ||
-                trait.WinnerSymbol is null ||
-                trait.WinnerKind.Equals("native", StringComparison.OrdinalIgnoreCase) ||
-                RequiresGenericDirectCall(address))
+            if (!LowersToStaticCall(address, traits, out var trait))
             {
                 return match.Value;
             }
@@ -801,6 +808,9 @@ public static partial class TranslatedBuildShardEmitter
             return $"MKW_STATIC_TRANSLATED_CALL(0x{address:X8}u, {trait.WinnerSymbol}, ctx)";
         });
     }
+
+    [GeneratedRegex(@"if \(\([A-Za-z_][A-Za-z0-9_]*\) == 0x(?<address>[0-9A-F]{8})u\)(?: \[\[likely\]\])? \{ InvokeDirectCpu<0x\k<address>u>\(ctx\); \} else ")]
+    private static partial Regex PromotedIndirectArmRegex();
 
     private static bool RequiresGenericDirectCall(uint address) => address switch
     {

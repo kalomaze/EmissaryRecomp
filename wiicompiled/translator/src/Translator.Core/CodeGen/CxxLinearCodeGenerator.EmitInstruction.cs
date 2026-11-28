@@ -649,7 +649,26 @@ public sealed partial class CxxLinearCodeGenerator
                             ? ResidencyBoundarySync.ModSafeIndirectCall
                             : ResidencyBoundarySync.Full);
                     AppendFlush(sb, pad, indirectSync, unconditional: true);
-                    sb.AppendLine($"{pad}MKW_INDIRECT_CALL({indirectTarget}, ctx);");
+                    if (IndirectCallProfile.Instrument && _currentGuestSite != 0)
+                    {
+                        sb.AppendLine($"{pad}MKW_INDIRECT_PROFILE_COUNT(0x{_currentEntryPoint:X8}u, 0x{_currentGuestSite:X8}u, {indirectTarget});");
+                    }
+                    // Profile-guided promotion (IndirectCallProfile): exact compares against the site's dominant
+                    // targets, each an ordinary direct call, under the same flush and reload as the indirect call.
+                    // One line: the shard emitter drops an arm it would not lower to MKW_STATIC_TRANSLATED_CALL.
+                    var promotedTargets = _currentEntryPoint == GuestAbiContractAnalyzer.GeckoCodeHandlerAddress
+                        ? Array.Empty<uint>()
+                        : IndirectCallProfile.PromotedTargets(_currentEntryPoint, _currentGuestSite);
+                    if (promotedTargets.Count != 0)
+                    {
+                        foreach (var promoted in promotedTargets) RecordEmittedDirectCallTarget(promoted);
+                        sb.AppendLine(IndirectCallProfile.PromotedLine(
+                            pad, indirectTarget, promotedTargets, $"MKW_INDIRECT_CALL({indirectTarget}, ctx);"));
+                    }
+                    else
+                    {
+                        sb.AppendLine($"{pad}MKW_INDIRECT_CALL({indirectTarget}, ctx);");
+                    }
                     AppendReload(sb, pad, indirectSync, unconditional: true);
                     // f1 is the conventional scalar floating-point return.
                     // Do not retag the other volatile FPRs: a callee that leaves
@@ -665,7 +684,24 @@ public sealed partial class CxxLinearCodeGenerator
                     // locals must not be written back afterwards.
                     AppendFlush(sb, pad);
                     EmitVariantIndirectJumpCheck(sb, pad, jumpTarget, currentLabel);
-                    sb.AppendLine($"{pad}MKW_INDIRECT_JUMP({jumpTarget}, ctx);");
+                    if (IndirectCallProfile.Instrument && _currentGuestSite != 0)
+                    {
+                        sb.AppendLine($"{pad}MKW_INDIRECT_PROFILE_JUMP(0x{_currentEntryPoint:X8}u, 0x{_currentGuestSite:X8}u, {jumpTarget});");
+                    }
+                    // Promotion as for calls: a direct call to the tail jump's dominant target, then the return below.
+                    var promotedJumpTargets = _currentEntryPoint == GuestAbiContractAnalyzer.GeckoCodeHandlerAddress
+                        ? Array.Empty<uint>()
+                        : IndirectCallProfile.PromotedTargets(_currentEntryPoint, _currentGuestSite, jump: true);
+                    if (promotedJumpTargets.Count != 0)
+                    {
+                        foreach (var promoted in promotedJumpTargets) RecordEmittedDirectCallTarget(promoted);
+                        sb.AppendLine(IndirectCallProfile.PromotedLine(
+                            pad, jumpTarget, promotedJumpTargets, $"MKW_INDIRECT_JUMP({jumpTarget}, ctx);"));
+                    }
+                    else
+                    {
+                        sb.AppendLine($"{pad}MKW_INDIRECT_JUMP({jumpTarget}, ctx);");
+                    }
                     sb.AppendLine($"{pad}{ReturnStatement(fromContext: true)}");
                 }
                 break;

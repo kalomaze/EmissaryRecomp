@@ -732,3 +732,67 @@ void MkwInvokeIndirectJumpSiteSlow(uint32_t target, CpuContext* ctx, MkwIndirect
     InvokeIndirectJump(target, cpu);
 }
 #endif
+
+// MKW_INDIRECT_PROFILE_COUNT / MKW_INDIRECT_PROFILE_JUMP (indirect_call_site.h): per (function, site, target) call
+// counts of a profiling build, written to $BRAWL_INDIRECT_PROFILE. One mutex: profiling builds only, never timed.
+namespace {
+struct MkwIndirectProfileKey {
+    uint32_t function;
+    uint32_t site;
+    uint32_t target;
+    uint32_t jump;
+    bool operator==(const MkwIndirectProfileKey&) const = default;
+};
+struct MkwIndirectProfileKeyHash {
+    size_t operator()(const MkwIndirectProfileKey& key) const noexcept {
+        uint64_t h = (uint64_t{key.function} << 32 | key.site) * 0x9E3779B97F4A7C15ull;
+        h ^= (uint64_t{key.target} << 1 | key.jump) * 0xC2B2AE3D27D4EB4Full;
+        return static_cast<size_t>(h ^ (h >> 29));
+    }
+};
+struct MkwIndirectProfile {
+    std::mutex mutex;
+    std::unordered_map<MkwIndirectProfileKey, uint64_t, MkwIndirectProfileKeyHash> counts;
+    uint64_t calls = 0;
+    std::string path;
+};
+MkwIndirectProfile* MkwIndirectProfileState() {
+    static MkwIndirectProfile* state = [] {
+        const char* path = std::getenv("BRAWL_INDIRECT_PROFILE");
+        if (path == nullptr || *path == '\0') return static_cast<MkwIndirectProfile*>(nullptr);
+        auto* profile = new MkwIndirectProfile();  // never destroyed: the atexit writer runs after static destructors
+        profile->path = path;
+        return profile;
+    }();
+    return state;
+}
+void MkwIndirectProfileWriteLocked(MkwIndirectProfile& profile) {
+    const std::string temporary = profile.path + ".tmp";
+    FILE* file = std::fopen(temporary.c_str(), "w");
+    if (file == nullptr) return;
+    std::fprintf(file, "# indirect call profile: FUNCTION SITE TARGET COUNT (%llu calls)\n",
+                 static_cast<unsigned long long>(profile.calls));
+    for (const auto& [key, count] : profile.counts) {
+        std::fprintf(file, "%s%08X %08X %08X %llu\n", key.jump ? "J " : "", key.function, key.site, key.target,
+                     static_cast<unsigned long long>(count));
+    }
+    std::fclose(file);
+    std::rename(temporary.c_str(), profile.path.c_str());
+}
+}  // namespace
+
+void MkwIndirectProfileCount(uint32_t function, uint32_t site, uint32_t target, bool jump) {
+    MkwIndirectProfile* profile = MkwIndirectProfileState();
+    if (profile == nullptr) return;
+    std::lock_guard<std::mutex> lock(profile->mutex);
+    if (profile->calls++ == 0) {
+        std::atexit([] {
+            MkwIndirectProfile* state = MkwIndirectProfileState();
+            if (!state->mutex.try_lock()) return;  // a thread still counting: the last periodic write stands
+            MkwIndirectProfileWriteLocked(*state);
+            state->mutex.unlock();
+        });
+    }
+    ++profile->counts[MkwIndirectProfileKey{function, site, target, jump ? 1u : 0u}];
+    if ((profile->calls & ((uint64_t{1} << 24) - 1)) == 0) MkwIndirectProfileWriteLocked(*profile);
+}

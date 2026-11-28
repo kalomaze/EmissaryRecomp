@@ -250,6 +250,15 @@ int RunTranslateRecursive(string[] argsTail)
     var disableStateFreeAbi = true || HasFlag(argsTail, "--no-state-free-abi");
     // Translations of functions as a mod's fixed code patches leave them (CodeVariants.cs), after the base emission.
     var codeVariantSpecPath = OptionValue(argsTail, "--code-variants");
+    if (OptionValue(argsTail, "--indirect-profile") is { } indirectProfilePath)
+    {
+        IndirectCallProfile.Load(Path.GetFullPath(indirectProfilePath));
+        Console.WriteLine(
+            $"[translator] indirect profile {Path.GetFileName(indirectProfilePath)}: {IndirectCallProfile.PromotedSiteCount:N0} sites, " +
+            $"{IndirectCallProfile.PromotedTargetCount:N0} promoted targets, {IndirectCallProfile.PromotedJumpSiteCount:N0} jump sites");
+    }
+    if (IndirectCallProfile.Instrument)
+        Console.WriteLine("[translator] MKW_INDIRECT_PROFILE_SITES=1: indirect call sites count their targets");
     var codeVariantOutDir = OptionValue(argsTail, "--code-variants-out") ??
         Path.Combine(Path.GetDirectoryName(Path.GetFullPath(outDir))!, "code_variants");
     if (!emitFunctionFiles && string.IsNullOrWhiteSpace(productionSourceBundlePath))
@@ -2317,7 +2326,8 @@ static (string? Positional, CommandOption[] Options)? CommandSpec(string command
         new("--data-in-text", "path"),
         new("--prune-stale"),
         new("--code-variants", "spec"),
-        new("--code-variants-out", "path")
+        new("--code-variants-out", "path"),
+        new("--indirect-profile", "path")
     }),
     "emit-build-shards" => (null, new CommandOption[]
     {

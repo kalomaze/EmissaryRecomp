@@ -366,6 +366,58 @@ public sealed class TranslatedBuildShardEmitterTests
         }
     }
 
+    [Fact]
+    public void PromotedIndirectArmsKeepOnlyTranslatedTargets()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"translator-promoted-indirect-{Guid.NewGuid():N}");
+        var functions = Path.Combine(root, "functions");
+        var native = Path.Combine(root, "runtime", "src");
+        var output = Path.Combine(root, "out");
+        Directory.CreateDirectory(functions);
+        Directory.CreateDirectory(native);
+        try
+        {
+            // 0x80005000 is translated; 0x80007000 has no translation, so its arm goes.
+            const string caller = """
+                #include "abi_bridge.h"
+                extern "C" void func_80001000(CpuContext* MKW_RESTRICT ctx) {
+                    uint32_t ctr = ctx->ctr;
+                    if ((ctr) == 0x80005000u) [[likely]] { InvokeDirectCpu<0x80005000u>(ctx); } else if ((ctr) == 0x80007000u) { InvokeDirectCpu<0x80007000u>(ctx); } else { MKW_INDIRECT_CALL(ctr, ctx); }
+                    if ((ctr) == 0x80007000u) [[likely]] { InvokeDirectCpu<0x80007000u>(ctx); } else { MKW_INDIRECT_CALL(ctr, ctx); }
+                }
+                // RECOMP_REGISTRATION base 0x80001000 func_80001000 preserves=true fpr_mask=0x00000000
+                """;
+            const string target = """
+                #include "abi_bridge.h"
+                extern "C" void func_80005000(CpuContext* MKW_RESTRICT ctx) {
+                    ctx->gpr[3] = 5;
+                }
+                // RECOMP_REGISTRATION base 0x80005000 func_80005000 preserves=true fpr_mask=0x00000000
+                """;
+            Write(Path.Combine(functions, "func_80001000.cpp"), caller);
+            Write(Path.Combine(functions, "func_80005000.cpp"), target);
+            var metadataPath = Path.Combine(root, "base_output.json");
+            BaseTranslationOutputMetadataFile.WriteIfChangedAtomic(metadataPath,
+                BaseTranslationOutputMetadata.Create([
+                    Metadata("func_80001000.cpp", 0x80001000u, caller),
+                    Metadata("func_80005000.cpp", 0x80005000u, target)
+                ], TranslationQualityMetadata.Clean, "promoted-indirect"));
+            TranslatedBuildShardEmitter.Emit(new TranslatedBuildShardOptions(
+                metadataPath, functions, output, native, BaseShardCount: 1, RegistrationShardCount: 1));
+            var shard = File.ReadAllText(Assert.Single(Directory.GetFiles(
+                Path.Combine(output, "base_common"), "shard_*.cpp")));
+            Assert.Contains(
+                "if ((ctr) == 0x80005000u) [[likely]] { MKW_STATIC_TRANSLATED_CALL(0x80005000u, func_80005000, ctx); } else { MKW_INDIRECT_CALL(ctr, ctx); }",
+                shard);
+            Assert.DoesNotContain("0x80007000u", shard);
+            Assert.Equal(2, shard.Split("MKW_INDIRECT_CALL(ctr, ctx);").Length - 1);
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
     private static BaseTranslationFunctionMetadata Metadata(string path, uint address, string content)
     {
         var bytes = Encoding.UTF8.GetBytes(content);

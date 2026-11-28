@@ -74,6 +74,10 @@ public sealed partial class CxxLinearCodeGenerator
     [ThreadStatic]
     private static uint _currentEntryPoint;
 
+    /// <summary>The guest address of the indirect call/jump being emitted (<see cref="FindGuestSiteAddress"/>).</summary>
+    [ThreadStatic]
+    private static uint _currentGuestSite;
+
     [ThreadStatic]
     private static uint? _fixedSda1Base;
 
@@ -531,6 +535,9 @@ public sealed partial class CxxLinearCodeGenerator
                         var inlineGuestThunkStackBase = block.Instructions[i] is IrCall &&
                             HasLocallyProvenStackFrameBase(block.Instructions, i, stackFacts);
                         _activeGpuFifoBurstSlot = gpuFifoBurstPlan.Slot(block.Label, i);
+                        _currentGuestSite = block.Instructions[i] is IrIndirectCall or IrIndirectJump
+                            ? FindGuestSiteAddress(block.Instructions, i)
+                            : 0;
                         var captureBarrier = fprBarrierClobbers is not null && residency is not null &&
                                              IsFprBarrier(block.Instructions[i]);
                         var barrierTextStart = body.Length;
@@ -955,6 +962,38 @@ public sealed partial class CxxLinearCodeGenerator
     private static string EscapeCxxStringLiteral(string value) =>
         value.Replace("\\", "\\\\", StringComparison.Ordinal)
             .Replace("\"", "\\\"", StringComparison.Ordinal);
+
+    /// <summary>
+    /// The guest address of the bctrl/blrl (IrIndirectCall) or bctr (IrIndirectJump) at <paramref name="index"/>, 0 if
+    /// unknown. A call is preceded by its link-register store (the return address, the call's address + 4; conditional
+    /// call blocks have no trace); a terminator's trace comes right before it, a call's right after it.
+    /// </summary>
+    internal static uint FindGuestSiteAddress(IReadOnlyList<IrInstruction> instructions, int index)
+    {
+        if (instructions[index] is IrIndirectCall)
+        {
+            for (var j = index - 1; j >= 0 && j >= index - 2; j--)
+            {
+                if (instructions[j] is IrAssign { Value.Kind: "const", Value.Constant: { } lrValue } lrAssign &&
+                    string.Equals(GetRegisterBaseName(lrAssign.Destination), "lr", StringComparison.OrdinalIgnoreCase))
+                {
+                    return unchecked((uint)lrValue - 4u);
+                }
+            }
+            for (var j = index + 1; j < instructions.Count; j++)
+            {
+                if (instructions[j] is IrTracePpc trace) return trace.Address;
+                if (instructions[j] is IrCall or IrIndirectCall or IrIndirectJump) break;
+            }
+            return 0;
+        }
+        for (var j = index - 1; j >= 0; j--)
+        {
+            if (instructions[j] is IrTracePpc trace) return trace.Address;
+            if (instructions[j] is IrCall or IrIndirectCall) break;
+        }
+        return 0;
+    }
 
     private static uint? TryGetLocalFallthroughLr(
         IReadOnlyList<IrInstruction> instructions,
