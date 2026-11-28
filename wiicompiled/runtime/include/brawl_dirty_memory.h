@@ -82,17 +82,44 @@ inline void LeanMarkBlockPair(uint32_t canonical) {
     const uint16_t both=0x0101;
     std::memcpy(leanBlocks+(canonical>>6),&both,sizeof(both));
 }
+// Guarded code (the JIT's, src/jit/jit_x64.cpp): compiled blocks that lie wholly in 4 KiB pages registered as executable
+// (where every guest store takes the checked path, which marks through Mark below) and that skip the dirty-mark test on
+// their linked entries. Instead, a mark of one of their blocks drops them at once, before compiled code can follow a link
+// slot to them: guardChunks has a byte per 64 KiB chunk and guardLines a bit per mark (one per 64 bytes) under guarded
+// code, set by the interpreter's block cache, which installs guardedWritten (it drops the guarded blocks under the
+// canonical range written). Every other writer that marks a byte of such a page marks through Mark or LeanMarkRange too
+// (natives that write marks themselves test the store policy first, and the policy flags these pages' chunks).
+inline uint8_t* guardChunks=nullptr;
+inline uint64_t* guardLines=nullptr;
+inline void (*guardedWritten)(uint32_t canonical,size_t size)=nullptr;
+BRAWL_DIRTY_MEMORY_SLOW inline void GuardedLinesTest(uint32_t canonical,size_t size) {
+    const size_t first=canonical>>6;
+    size_t last=(size_t(canonical)+size-1)>>6;
+    if(last>=kLeanDirtyBlocks) last=kLeanDirtyBlocks-1;
+    for(size_t w=first>>6;w<=(last>>6);++w) {  // 64 marks per word
+        uint64_t bits=guardLines[w];
+        if(w==(first>>6)) bits&=~uint64_t{0}<<(first&63);
+        if(w==(last>>6) && (last&63)!=63) bits&=(uint64_t{2}<<(last&63))-1u;
+        if(bits!=0) { guardedWritten(canonical,size); return; }
+    }
+}
+inline void NoteGuarded(uint32_t canonical,size_t size) {
+    if(guardChunks!=nullptr && size!=0 && guardChunks[canonical>>16]!=0) [[unlikely]] GuardedLinesTest(canonical,size);
+}
 BRAWL_DIRTY_MEMORY_SLOW inline void LeanMarkRange(uint32_t canonical,size_t size) {
     const size_t first=canonical>>6;
     const size_t last=(size_t(canonical)+size-1)>>6;
     std::memset(leanBlocks+first,1,(last<kLeanDirtyBlocks?last:kLeanDirtyBlocks-1)-first+1);
+    if(guardChunks!=nullptr)
+        for(size_t c=first>>10;c<=(last>>10) && c<(size_t{1}<<14);++c)
+            if(guardChunks[c]!=0) { GuardedLinesTest(canonical,size); break; }
 }
 #endif
 inline void Mark(uint32_t address,size_t size) {
 #if MKW_LEAN_MEMORY && !MKW_LEAN_DIRTY_MARKS
     (void)address;(void)size;
 #elif MKW_LEAN_MEMORY
-    if(size<=64) LeanMarkBlockPair(address&kLeanDirtyMask);
+    if(size<=64) { LeanMarkBlockPair(address&kLeanDirtyMask); NoteGuarded(address&kLeanDirtyMask,size); }
     else if(size) LeanMarkRange(address&kLeanDirtyMask,size);
 #else
     if(active.load(std::memory_order_relaxed))MarkSlow(address,size);

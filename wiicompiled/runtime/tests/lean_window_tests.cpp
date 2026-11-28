@@ -66,6 +66,21 @@ int main() {
     window[kDirty + kMarks] = 1;  // a pair mark's spill byte past MEM1's slice: private, next to the shared slice
     Check(marks[0][kMarks - 1] == 0 && marks[2][kMarks - 1] == 0, "the spill byte is not part of the shared marks");
 
+    // Views of parts of one object (the aliased view's tail): a second reservation, a 128 KiB object shown whole at 0 and
+    // 0x40000, and its first 64 KiB at 0x80000.
+    uint8_t* const other = LeanWindow::Reserve(0x100000);
+    Check(other != nullptr, "reserve a second range");
+    if (other != nullptr) {
+        const LeanWindow::View views[] = {{other, 0, 0x20000}, {other + 0x40000, 0, 0x20000}, {other + 0x80000, 0, 0x10000}};
+        Check(LeanWindow::MapSharedViews(0x20000, views, 3, &error), error.c_str());
+        other[0x1234] = 0x5C;
+        other[0x40000 + 0x1FFFF] = 0x6D;
+        Check(other[0x40000 + 0x1234] == 0x5C && other[0x80000 + 0x1234] == 0x5C, "a partial view shows the object's bytes");
+        Check(other[0x1FFFF] == 0x6D, "the views share the last byte");
+        other[0x80000 + 0xFFFF] = 0x7E;
+        Check(other[0xFFFF] == 0x7E && other[0x40000 + 0xFFFF] == 0x7E, "a store through the partial view reaches the others");
+    }
+
     if (g_failures == 0) std::puts("lean window tests passed");
     return g_failures == 0 ? 0 : 1;
 }

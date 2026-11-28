@@ -159,8 +159,14 @@ void SnapshotRestore(int key) {
     // replays deferred draws from resource display lists, vertex and matrix arrays in guest memory (g3d_native.cpp,
     // G3D_NATIVE_ASYNC=2), and only a GX sync orders those reads before the memory is reused. Without one, a rollback
     // every frame (the rollback benchmark's sync test) had the worker walk display lists of garbage length.
+    // The store's own part of the restore goes first, while the GX thread may still be busy.
+    s.store->PrepareRestore(key, s.anchor);
     aurora_gx_sync();
-    BrawlDirtyMemory::MarksRestored(s.markSequences.at(key));
+    BrawlDirtyMemory::MarksRestoring(s.markSequences.at(key));
+    // the code caches compare what the restore wrote once it is done, also when it throws (MarksRestoring's contract)
+    struct RestoreWritten {
+        ~RestoreWritten() { BrawlDirtyMemory::MarksRestoreWritten(); }
+    } restoreWritten;
     const auto& dirty = s.watch->Capture(s.total, s.store->Jobs());
     auto read = [cursor = size_t{0}](size_t offset, uint8_t* out, size_t n) mutable { s_snap.Transfer<false>(cursor, offset, out, n); };
     auto write = [cursor = size_t{0}](size_t offset, const uint8_t* in, size_t n) mutable { s_snap.Transfer<true>(cursor, offset, const_cast<uint8_t*>(in), n); };

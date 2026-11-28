@@ -3,12 +3,18 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <utility>
 
 #if defined(__linux__)
 #include <sys/mman.h>
 #include <unistd.h>
 #define MKW_JIT_MEMORY_HOST 1
+#if defined(__x86_64__)
+// The linker's symbols for the executable's first byte and the end of its text (GNU ld and lld define both).
+extern "C" char __executable_start[];
+extern "C" char etext[];
+#endif
 #elif defined(_WIN32)
 #include <windows.h>
 #define MKW_JIT_MEMORY_HOST 1
@@ -35,6 +41,90 @@ size_t PageSize() {
     return size;
 }
 
+#if defined(__linux__) && defined(__x86_64__)
+// Code space within a rel32 displacement of the executable's whole text, so that emitted code calls translated functions and
+// runtime helpers with `call rel32` (the emitters check the distance and fall back to an absolute address in a register for
+// memory that is not near). One PROT_NONE reservation at the top of the reachable window (far from the program break, which
+// grows up from the end of the image), carved into 2 MiB slots that are made RWX when handed out and dropped when freed.
+class NearSpace {
+public:
+    static constexpr size_t kSlot = size_t{2} << 20;
+    static constexpr size_t kSlots = 128;  // 256 MiB of address space; past it allocations are mapped anywhere
+
+    static NearSpace& Get() {
+        static NearSpace space;
+        return space;
+    }
+
+    // `size` bytes (a whole number of pages) of RWX memory in whole slots, or null when no near space is left.
+    void* Map(size_t size, bool hugeAdvice) {
+        if (base_ == 0 || size == 0 || size > kSlots * kSlot) return nullptr;
+        const size_t n = (size + kSlot - 1) / kSlot;
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (size_t first = 0; first + n <= kSlots; ++first) {
+            size_t k = 0;
+            while (k < n && !used_[first + k]) ++k;
+            if (k != n) {
+                first += k;
+                continue;
+            }
+            void* const at = reinterpret_cast<void*>(base_ + first * kSlot);
+            if (mprotect(at, n * kSlot, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return nullptr;
+#if defined(MADV_HUGEPAGE)
+            if (hugeAdvice) madvise(at, n * kSlot, MADV_HUGEPAGE);
+#else
+            (void)hugeAdvice;
+#endif
+            for (size_t i = 0; i < n; ++i) used_[first + i] = true;
+            return at;
+        }
+        return nullptr;
+    }
+
+    // Takes back a region Map made (false: not near memory, the caller unmaps it).
+    bool Unmap(void* p, size_t size) {
+        const uintptr_t at = reinterpret_cast<uintptr_t>(p);
+        if (base_ == 0 || at < base_ || at >= base_ + kSlots * kSlot) return false;
+        const size_t first = (at - base_) / kSlot, n = (size + kSlot - 1) / kSlot;
+        std::lock_guard<std::mutex> lock(mutex_);
+        madvise(p, n * kSlot, MADV_DONTNEED);  // the next owner gets zeroed pages, as from a fresh mapping
+        mprotect(p, n * kSlot, PROT_NONE);
+        for (size_t i = 0; i < n && first + i < kSlots; ++i) used_[first + i] = false;
+        return true;
+    }
+
+private:
+    NearSpace() {
+        // BRAWL_JIT_FAR_MEMORY=1 (a diagnostic): code space anywhere, as on a host without the reservation
+        if (const char* v = std::getenv("BRAWL_JIT_FAR_MEMORY"); v != nullptr && *v != '\0' && *v != '0') return;
+        const uintptr_t textLo = reinterpret_cast<uintptr_t>(__executable_start);
+        const uintptr_t textHi = reinterpret_cast<uintptr_t>(etext);
+        constexpr uintptr_t kReach = (uintptr_t{1} << 31) - (uintptr_t{1} << 20);  // a margin under 2 GiB
+        constexpr size_t kBytes = kSlots * kSlot;
+        if (textHi <= textLo || textLo > UINTPTR_MAX - kReach) return;
+        // Every address of [at, at + kBytes) reaches [textLo, textHi) and back: at + kBytes <= textLo + kReach and
+        // at >= textHi - kReach. From the top of that window down, in 64 MiB steps, until a hint is free.
+        const uintptr_t top = (textLo + kReach - kBytes) & ~(uintptr_t{kSlot} - 1);
+        const uintptr_t bottom = textHi > kReach ? textHi - kReach : 0;
+        for (uintptr_t at = top; at >= bottom && at >= (uintptr_t{1} << 30) && at <= top; at -= uintptr_t{64} << 20) {
+            void* const p = mmap(reinterpret_cast<void*>(at), kBytes, PROT_NONE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+            if (p == MAP_FAILED) continue;
+            if (reinterpret_cast<uintptr_t>(p) != at) {  // a kernel without MAP_FIXED_NOREPLACE took it as a hint
+                munmap(p, kBytes);
+                continue;
+            }
+            base_ = at;
+            return;
+        }
+    }
+
+    std::mutex mutex_;
+    uintptr_t base_ = 0;
+    bool used_[kSlots] = {};
+};
+#endif
+
 Region MapRegion(size_t bytes) {
     Region region;
     if (bytes == 0) {
@@ -45,6 +135,13 @@ Region MapRegion(size_t bytes) {
         return region;
     }
     const size_t size = (bytes + page - 1) / page * page;
+#if defined(__linux__) && defined(__x86_64__)
+    if (void* const near = NearSpace::Get().Map(size, false)) {
+        region.base = near;
+        region.size = size;
+        return region;
+    }
+#endif
 #if defined(_WIN32)
     void* base = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!base) {
@@ -62,8 +159,11 @@ Region MapRegion(size_t bytes) {
 }
 
 #if defined(__linux__)
-// A region of whole 2 MiB pages starting on a 2 MiB boundary, advised for transparent huge pages (the advice is a hint: a
-// host that refuses it still has the mapping).
+// A region of whole 2 MiB pages starting on a 2 MiB boundary, advised for transparent huge pages only with BRAWL_JIT_HUGEPAGES=1
+// (the advice is a hint: a host that refuses it still has the mapping). Without it (the default) the code cache's chunks are on 4 KiB
+// pages, measured faster: block cycles -2.5%, engine cycles -2.0% (11 paired rounds, same binary; game thread -0.6%, within its
+// noise). Suspected, not measured: on huge pages every chunk's hot part starts at the same offset of a physically contiguous 2 MiB
+// page, so the hottest code of every chunk falls into the same L2 sets.
 Region MapRegionHuge(size_t bytes) {
     Region region;
     constexpr size_t kHuge = Arena::kHugePageBytes;
@@ -71,6 +171,21 @@ Region MapRegionHuge(size_t bytes) {
         return region;
     }
     const size_t size = (bytes + kHuge - 1) / kHuge * kHuge;
+    // BRAWL_JIT_HUGEPAGES=1: the same aligned chunks with the advice (BRAWL_JIT_NO_HUGEPAGES=1, the older switch, still means none)
+    static const bool noAdvice = [] {
+        const char* on = std::getenv("BRAWL_JIT_HUGEPAGES");
+        const char* off = std::getenv("BRAWL_JIT_NO_HUGEPAGES");
+        if (off != nullptr && *off != '\0' && *off != '0') return true;
+        return !(on != nullptr && *on != '\0' && *on != '0');
+    }();
+#if defined(__x86_64__)
+    static_assert(NearSpace::kSlot == kHuge, "near slots are huge pages");
+    if (void* const near = NearSpace::Get().Map(size, !noAdvice)) {
+        region.base = near;
+        region.size = size;
+        return region;
+    }
+#endif
     void* raw = mmap(nullptr, size + kHuge, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (raw == MAP_FAILED) {
         return region;
@@ -85,8 +200,6 @@ Region MapRegionHuge(size_t bytes) {
         munmap(reinterpret_cast<void*>(aligned + size), end - (aligned + size));
     }
 #if defined(MADV_HUGEPAGE)
-    // BRAWL_JIT_NO_HUGEPAGES=1 (a diagnostic for measuring): the same aligned chunks without the advice
-    static const bool noAdvice = [] { const char* v = std::getenv("BRAWL_JIT_NO_HUGEPAGES"); return v != nullptr && *v != '\0' && *v != '0'; }();
     if (!noAdvice) madvise(reinterpret_cast<void*>(aligned), size, MADV_HUGEPAGE);
 #endif
     region.base = reinterpret_cast<void*>(aligned);
@@ -99,6 +212,9 @@ void UnmapRegion(Region region) {
 #if defined(_WIN32)
     VirtualFree(region.base, 0, MEM_RELEASE);
 #else
+#if defined(__x86_64__)
+    if (NearSpace::Get().Unmap(region.base, region.size)) return;
+#endif
     munmap(region.base, region.size);
 #endif
 }

@@ -41,9 +41,13 @@ constexpr uint32_t kPage = 4096;
 
 std::atomic<bool> g_active{false};
 std::atomic<bool> g_anyDirty{false};  // pending write notifications or retained edge pages
+// Lock-free single-word fast path for lean-memory NoteWrite: 0 = clean, (wordAddr | (1ULL<<32)) = 1 dirty 8-byte
+// aligned span (covers 1/2/4/8-byte writes within a page), ~0ULL = overflowed to page bitmap.
+std::atomic<uint64_t> g_pendingFast{0};
 // NoteWrite runs inside memory-fault recovery. Its lookup and notification must
 // neither allocate nor wait for a lock held by the interrupted thread.
 static_assert(std::atomic<uint32_t>::is_always_lock_free);
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
 static_assert(std::atomic<bool>::is_always_lock_free);
 constexpr uint32_t kPageWords = (1u << 20) / 32;
 std::atomic<uint32_t> g_guardedPages[kPageWords]{};
@@ -58,7 +62,17 @@ std::unordered_map<uint32_t, std::unique_ptr<std::array<uint8_t, kPage>>> g_pris
 // SnapshotLocked). A word equal here was already handled with this same value; data that permanently differs from the
 // disc (a module's variables beside its code) then costs one page compare per Sync, not a lookup per word.
 std::unordered_map<uint32_t, std::unique_ptr<std::array<uint8_t, kPage>>> g_seen;  // by page address
-std::unordered_set<uint32_t> g_dirty;                                              // page addresses written since Sync
+std::vector<uint32_t> g_dirty;                                                     // page addresses written since Sync
+// 1-entry MRU caches for ComparePageLocked / CompareWordPairLocked (under g_mutex): avoids hash lookups + range scan
+// when the same page/word is written repeatedly (e.g. a mod variable embedded inside a code page). Invalidated on
+// SnapshotLocked / Protect / ResetPristine.
+uint32_t g_lastComparedPage = UINT32_MAX;
+const uint8_t* g_lastPristine = nullptr;
+uint8_t* g_lastSeen = nullptr;
+uint32_t g_lastSpanLo = 0, g_lastSpanHi = 0;
+uint32_t g_lastPatchedWordAddr = UINT32_MAX;
+uint32_t* g_lastPatchedSitePtr = nullptr;
+uint8_t* g_lastPatchedSeenPtr = nullptr;
 std::unordered_map<uint32_t, uint32_t> g_sites;  // every word a mod patched, and what it wrote there (guest order)
 std::unordered_set<uint32_t> g_reported;                                           // functions logged as patched
 std::unordered_set<uint32_t> g_loggedWords;                                        // BRAWL_PATCH_LOG words logged
@@ -93,6 +107,11 @@ void BumpVariantCallEpoch() {
     g_variantCallEpoch.store(next, std::memory_order_release);
 }
 
+// A guard byte went back to 0 or the redirect bound moved: the JIT's calls of patched functions' blocks (call links, which test
+// neither once linked: src/jit/jit_x64_branch.cpp) are suspended before compiled code can follow one, as for memory rewritten
+// without marks; a call link is aimed again only by its own stub, which tests both.
+void NotePatchedCallsChanged() { BrawlDirtyMemory::MarksCleared(); }
+
 void UpdateLowestRedirectLocked() {
     uint32_t lowest = UINT32_MAX;
     for (const Redirect& r : g_redirects) {
@@ -109,8 +128,12 @@ struct PatchStats {
         pagesCompared{0}, pagesChanged{0};
 };
 PatchStats g_stats;
+// Read once at load (a namespace-scope constant: no guard variable to test on every patched call and NoteWrite).
+const bool g_patchStatsOn = std::getenv("BRAWL_PATCH_STATS") != nullptr;
+inline bool PatchStatsEnabled() { return g_patchStatsOn; }
 inline void Bump(std::atomic<uint32_t>& counter, uint32_t n = 1) {
-    counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
+    if (__builtin_expect(PatchStatsEnabled(), 0))
+        counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
 }
 
 // Code variants (guest_code_patch.h): per variant, whether guest memory still holds the words it was translated from.
@@ -124,6 +147,7 @@ std::vector<std::pair<uint32_t, uint32_t>> g_variantSlots;              // open-
 uint32_t g_variantSlotMask = 0;
 bool g_variantsEnabled = false;
 std::once_flag g_variantsOnce;
+std::atomic<bool> g_variantsReady{false};  // InitVariants has run: g_variantsEnabled and g_variantSlots are final
 
 uint32_t VariantSlot(uint32_t address) { return ((address >> 2) * 0x9E3779B1u) >> 8; }
 
@@ -195,6 +219,8 @@ void ProtectVariantRegions() {
     std::sort(pages.begin(), pages.end());
     {
         std::lock_guard<std::mutex> lock(g_mutex);
+        g_lastComparedPage = UINT32_MAX;
+        g_lastPatchedWordAddr = UINT32_MAX;
         for (const uint32_t page : pages) {
             if (!Memory::Contains(page, kPage)) continue;
             auto& slot = g_pristine[page];
@@ -314,6 +340,7 @@ std::pair<uint32_t, uint32_t> CompareSpanLocked(uint32_t page) {
 // summary levels avoid scanning the entire guest address space on every Sync.
 void CollectPendingPagesLocked() {
     for (uint32_t root = 0; root < std::size(g_pendingRoots); ++root) {
+        if (g_pendingRoots[root].load(std::memory_order_relaxed) == 0) continue;
         uint32_t groups = g_pendingRoots[root].exchange(0, std::memory_order_acquire);
         while (groups) {
             const uint32_t group = root * 32 + std::countr_zero(groups);
@@ -324,12 +351,24 @@ void CollectPendingPagesLocked() {
                 words &= words - 1;
                 uint32_t pages = g_pendingPages[word].exchange(0, std::memory_order_acquire);
                 while (pages) {
-                    g_dirty.insert((word * 32 + std::countr_zero(pages)) * kPage);
+                    g_dirty.push_back((word * 32 + std::countr_zero(pages)) * kPage);
                     pages &= pages - 1;
                 }
             }
         }
     }
+}
+
+inline void MarkPendingPage(uint32_t address) {
+    const uint32_t page = address / kPage;
+    const uint32_t word = page / 32;
+    const uint32_t bit = 1u << (page % 32);
+    // a page already pending (written since the Sync that last took it) has its group and root bits set too, or they were taken
+    // by a Sync that has yet to take its page word: three locked or-s fewer for every further write to a pending page
+    if ((g_pendingPages[word].load(std::memory_order_relaxed) & bit) != 0) return;
+    g_pendingPages[word].fetch_or(bit, std::memory_order_relaxed);
+    g_pendingGroups[word / 32].fetch_or(1u << (word % 32), std::memory_order_release);
+    g_pendingRoots[word / 32 / 32].fetch_or(1u << ((word / 32) % 32), std::memory_order_release);
 }
 
 // The translated function holding `address`: the last start at or below it.
@@ -409,6 +448,8 @@ void ForEachBaked(uint32_t start, uint32_t end, Fn&& fn) {
 void HoldBakedLocked(uint32_t start, uint32_t end);
 
 void SnapshotLocked(uint32_t start, uint32_t end) {
+    g_lastComparedPage = UINT32_MAX;
+    g_lastPatchedWordAddr = UINT32_MAX;
     for (uint32_t page = start & ~(kPage - 1); page < end; page += kPage) {
         auto& slot = g_pristine[page];
         if (!slot) slot = std::make_unique<std::array<uint8_t, kPage>>();
@@ -513,10 +554,15 @@ bool TrapStats() {
     return on;
 }
 
+// Code variants off: what the JIT calls patched functions and RunPatched with (PpcInterpreter::detail::PatchedHooks).
+void RegisterJitHooks();
+
 void Protect(uint32_t start, uint32_t end, const char* name) {
     std::call_once(g_variantsOnce, [] {
         InitVariants();
+        g_variantsReady.store(true, std::memory_order_release);
         ProtectVariantRegions();
+        if (!g_variantsEnabled) RegisterJitHooks();
     });
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -541,15 +587,35 @@ bool NoteWrite(uint32_t address) {
     const uint32_t word = page / 32;
     const uint32_t bit = 1u << (page % 32);
     if ((g_guardedPages[word].load(std::memory_order_acquire) & bit) == 0) return false;
-    if (TrapStat* const stats = g_trapStats.load(std::memory_order_acquire)) {
+    if (__builtin_expect(g_trapStats.load(std::memory_order_acquire) != nullptr, 0)) {
+        TrapStat* const stats = g_trapStats.load(std::memory_order_acquire);
         stats[page].count.fetch_add(1, std::memory_order_relaxed);
         stats[page].last.store(address, std::memory_order_relaxed);
         if (const CpuContext* c = TryGetCpuContext()) stats[page].pc.store(c->pc, std::memory_order_relaxed);
     }
-    g_pendingPages[word].fetch_or(bit, std::memory_order_relaxed);
-    g_pendingGroups[word / 32].fetch_or(1u << (word % 32), std::memory_order_release);
-    g_pendingRoots[word / 32 / 32].fetch_or(1u << ((word / 32) % 32), std::memory_order_release);
+    // Lean-memory single-word fast path: when only one aligned 8-byte span inside a page is pending (e.g. a mod
+    // variable embedded inside a code page), record its address directly and skip the 3-level bitmap and 4 KiB scan.
+    if (!GuestFlat::IsActive() && ((address & (kPage - 1)) <= kPage - 8)) {
+        const uint64_t tag = static_cast<uint64_t>(address & ~3u) | (uint64_t{1} << 32);
+        uint64_t cur = g_pendingFast.load(std::memory_order_acquire);
+        if (cur == tag) {  // the word is pending already (a locked compare-exchange of the same value would be all it did)
+            HZ_PERF_ADD(kHzNoteWrite, 1);
+            Bump(g_stats.noteWrites);
+            return true;
+        }
+        if (cur == 0 &&
+            g_pendingFast.compare_exchange_strong(cur, tag, std::memory_order_release, std::memory_order_relaxed)) {
+            HZ_PERF_ADD(kHzNoteWrite, 1);
+            Bump(g_stats.noteWrites);
+            return true;
+        }
+        if (cur != ~uint64_t{0} && cur != 0) {
+            MarkPendingPage(static_cast<uint32_t>(cur));
+        }
+    }
+    MarkPendingPage(address);
     g_anyDirty.store(true, std::memory_order_release);
+    g_pendingFast.store(~uint64_t{0}, std::memory_order_release);
     HZ_PERF_ADD(kHzNoteWrite, 1);
     Bump(g_stats.noteWrites);
     return true;
@@ -579,25 +645,42 @@ void ForgetOpenEdgeLocked(uint32_t page) {
 // Compares a written page's code with what the last Sync saw there and handles every changed word.
 void ComparePageLocked(uint32_t page) {
     Bump(g_stats.pagesCompared);
-    const auto found = g_pristine.find(page);
-    if (found == g_pristine.end() || !Memory::Contains(page, kPage)) return;
+    const uint8_t* was = nullptr;
+    uint8_t* seen = nullptr;
+    uint32_t spanStart = 0, spanEnd = 0;
+    if (page == g_lastComparedPage && Memory::Contains(page, kPage)) {
+        was = g_lastPristine;
+        seen = g_lastSeen;
+        spanStart = g_lastSpanLo;
+        spanEnd = g_lastSpanHi;
+    } else {
+        const auto found = g_pristine.find(page);
+        if (found == g_pristine.end() || !Memory::Contains(page, kPage)) return;
+        was = found->second->data();
+        auto& seenSlot = g_seen[page];
+        if (!seenSlot) seenSlot = std::make_unique<std::array<uint8_t, kPage>>(*found->second);
+        seen = seenSlot->data();
+        // Only the page's code: an edge page's data (a module's variables after its last code, main.dol's data
+        // after .text) changes all the time, and comparing it made every Sync walk the page word by word.
+        const auto span = CompareSpanLocked(page);
+        spanStart = span.first;
+        spanEnd = span.second;
+        g_lastComparedPage = page;
+        g_lastPristine = was;
+        g_lastSeen = seen;
+        g_lastSpanLo = spanStart;
+        g_lastSpanHi = spanEnd;
+    }
     const uint8_t* now = Memory::GetPointer(page, kPage);
-    const uint8_t* was = found->second->data();
-    auto& seenSlot = g_seen[page];
-    if (!seenSlot) seenSlot = std::make_unique<std::array<uint8_t, kPage>>(*found->second);
-    uint8_t* seen = seenSlot->data();
-    // Only the page's code: an edge page's data (a module's variables after its last code, main.dol's data
-    // after .text) changes all the time, and comparing it made every Sync walk the page word by word.
-    const auto [spanStart, spanEnd] = CompareSpanLocked(page);
     if (std::memcmp(now + spanStart, seen + spanStart, spanEnd - spanStart) == 0) return;
     Bump(g_stats.pagesChanged);
     DirtyVariantsOnPageLocked(page);
-    for (uint32_t offset = spanStart; offset < spanEnd; offset += 4) {
-        if (std::memcmp(now + offset, seen + offset, 4) == 0) continue;
+    const auto handleWord = [&](uint32_t offset) {
+        if (std::memcmp(now + offset, seen + offset, 4) == 0) return;
         std::memcpy(seen + offset, now + offset, 4);
-        if (std::memcmp(now + offset, was + offset, 4) == 0) continue;
+        if (std::memcmp(now + offset, was + offset, 4) == 0) return;
         const uint32_t address = page + offset;
-        if (!IsGuardedLocked(address)) continue;
+        if (!IsGuardedLocked(address)) return;
         std::memcpy(&g_sites[address], now + offset, 4);
         // BRAWL_PATCH_LOG: every changed word, once (the pristine copy stays the disc's code).
         static const bool logWords = std::getenv("BRAWL_PATCH_LOG") != nullptr;
@@ -609,7 +692,105 @@ void ComparePageLocked(uint32_t page) {
                     __builtin_bswap32(after));
         }
         const int64_t index = FunctionIndex(address);
-        if (index < 0 || g_mkwGuestCodePatched[index]) continue;
+        if (index < 0 || g_mkwGuestCodePatched[index]) return;
+        g_mkwGuestCodePatched[index] = 1;
+        const uint32_t function = g_mkwGuardedFunctionStarts[index];
+        if (g_reported.insert(function).second) {
+            RT_LOGF(RT_TAG_MOD, "[mods] code at 0x%08X changed: function 0x%08X now runs in the interpreter\n",
+                    address, function);
+        }
+        MarkInliningCallers(static_cast<uint32_t>(index));
+    };
+    uint32_t offset = spanStart;
+    for (; offset + 8 <= spanEnd; offset += 8) {
+        uint64_t a, b;
+        std::memcpy(&a, now + offset, 8);
+        std::memcpy(&b, seen + offset, 8);
+        if (__builtin_expect(a == b, 1)) continue;
+        handleWord(offset);
+        handleWord(offset + 4);
+    }
+    for (; offset < spanEnd; offset += 4) handleWord(offset);
+}
+
+// Fast single-span compare for lean-memory NoteWrite: checks only the 8 bytes [wordAddr, wordAddr + 8) instead of
+// scanning 4 KiB. Caches the last already-patched word so repeated writes to a mod variable inside code cost 2 compares.
+void CompareWordPairLocked(uint32_t wordAddr) {
+    Bump(g_stats.pagesCompared);
+    if (__builtin_expect(wordAddr == g_lastPatchedWordAddr && !g_variantsEnabled && Memory::Contains(wordAddr, 8), 1)) {
+        const uint8_t* const now = Memory::GetPointer(wordAddr, 8);
+        uint32_t now0, now1, seen0, seen1;
+        std::memcpy(&now0, now, 4);
+        std::memcpy(&now1, now + 4, 4);
+        std::memcpy(&seen0, g_lastPatchedSeenPtr, 4);
+        std::memcpy(&seen1, g_lastPatchedSeenPtr + 4, 4);
+        if (__builtin_expect(now1 == seen1, 1)) {
+            if (now0 != seen0) {
+                Bump(g_stats.pagesChanged);
+                std::memcpy(g_lastPatchedSeenPtr, &now0, 4);
+                std::memcpy(g_lastPatchedSitePtr, &now0, 4);
+            }
+            return;
+        }
+    }
+    const uint32_t page = wordAddr & ~(kPage - 1);
+    const uint32_t off = wordAddr & (kPage - 1);
+    const uint8_t* was = nullptr;
+    uint8_t* seen = nullptr;
+    uint32_t spanStart = 0, spanEnd = 0;
+    if (page == g_lastComparedPage && Memory::Contains(page, kPage)) {
+        was = g_lastPristine;
+        seen = g_lastSeen;
+        spanStart = g_lastSpanLo;
+        spanEnd = g_lastSpanHi;
+    } else {
+        const auto found = g_pristine.find(page);
+        if (found == g_pristine.end() || !Memory::Contains(page, kPage)) return;
+        was = found->second->data();
+        auto& seenSlot = g_seen[page];
+        if (!seenSlot) seenSlot = std::make_unique<std::array<uint8_t, kPage>>(*found->second);
+        seen = seenSlot->data();
+        const auto span = CompareSpanLocked(page);
+        spanStart = span.first;
+        spanEnd = span.second;
+        g_lastComparedPage = page;
+        g_lastPristine = was;
+        g_lastSeen = seen;
+        g_lastSpanLo = spanStart;
+        g_lastSpanHi = spanEnd;
+    }
+    const uint8_t* now = Memory::GetPointer(page, kPage);
+    if (std::memcmp(now + off, seen + off, 8) == 0) return;
+    Bump(g_stats.pagesChanged);
+    DirtyVariantsOnPageLocked(page);
+    static const bool logWords = std::getenv("BRAWL_PATCH_LOG") != nullptr;
+    for (uint32_t delta = 0; delta < 8; delta += 4) {
+        const uint32_t offset = off + delta;
+        if (offset < spanStart || offset >= spanEnd) continue;
+        if (std::memcmp(now + offset, seen + offset, 4) == 0) continue;
+        std::memcpy(seen + offset, now + offset, 4);
+        if (std::memcmp(now + offset, was + offset, 4) == 0) continue;
+        const uint32_t address = page + offset;
+        if (!IsGuardedLocked(address)) continue;
+        uint32_t& site = g_sites[address];
+        std::memcpy(&site, now + offset, 4);
+        if (logWords && g_loggedWords.insert(address).second) {
+            uint32_t before = 0, after = 0;
+            std::memcpy(&before, was + offset, 4);
+            std::memcpy(&after, now + offset, 4);
+            RT_LOGF(RT_TAG_MOD, "[mods] word 0x%08X: %08X -> %08X\n", address, __builtin_bswap32(before),
+                    __builtin_bswap32(after));
+        }
+        const int64_t index = FunctionIndex(address);
+        if (index < 0) continue;
+        if (g_mkwGuestCodePatched[index]) {
+            if (delta == 0 && !g_variantsEnabled && !logWords) {
+                g_lastPatchedWordAddr = wordAddr;
+                g_lastPatchedSitePtr = &site;
+                g_lastPatchedSeenPtr = seen + offset;
+            }
+            continue;
+        }
         g_mkwGuestCodePatched[index] = 1;
         const uint32_t function = g_mkwGuardedFunctionStarts[index];
         if (g_reported.insert(function).second) {
@@ -621,14 +802,36 @@ void ComparePageLocked(uint32_t page) {
 }
 
 void SyncPages(bool frame) {
-    // Sync follows every patched call: the plain loads keep the usual nothing-pending case off the atomic exchange.
+    // Sync follows every patched call: plain loads keep the usual nothing-pending case off the atomic exchanges.
+    const uint64_t fast = g_pendingFast.load(std::memory_order_acquire);
+    const bool dirtyFlag = g_anyDirty.load(std::memory_order_acquire);
+    const uint32_t openEdges = g_openEdgeCount.load(std::memory_order_acquire);
+    if (fast == 0 && !dirtyFlag && openEdges == 0) return;
+    // Fast single-word path (lean memory, no bitmap overflow, no open edges).
+    if (!frame && fast != 0 && fast != ~uint64_t{0} && !dirtyFlag && openEdges == 0) {
+        const uint64_t took = g_pendingFast.exchange(0, std::memory_order_acq_rel);
+        if (took != 0 && took != ~uint64_t{0}) {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            HZ_PERF_ADD(kHzSyncWork, 1);
+            CompareWordPairLocked(static_cast<uint32_t>(took));
+            HZ_PERF_ADD(kHzPagesCompared, 1);
+            return;
+        }
+    }
+    const uint64_t tookFast = fast != 0 ? g_pendingFast.exchange(0, std::memory_order_acq_rel) : 0;
     const bool pending =
         g_anyDirty.load(std::memory_order_acquire) && g_anyDirty.exchange(false, std::memory_order_acq_rel);
-    if (!pending && g_openEdgeCount.load(std::memory_order_acquire) == 0) return;
+    const bool hasFastWord = tookFast != 0 && tookFast != ~uint64_t{0};
+    if (!pending && !hasFastWord && g_openEdgeCount.load(std::memory_order_acquire) == 0) return;
+    const bool flatActive = GuestFlat::IsActive();
     std::vector<uint32_t> reprotect;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         HZ_PERF_ADD(kHzSyncWork, 1);
+        if (hasFastWord) {
+            CompareWordPairLocked(static_cast<uint32_t>(tookFast));
+            HZ_PERF_ADD(kHzPagesCompared, 1);
+        }
         // Pages a notification brought (each compared here) and, below, the open edge pages it did not.
         uint32_t written[8];
         uint32_t writtenCount = 0;
@@ -639,42 +842,48 @@ void SyncPages(bool frame) {
                 if (writtenCount < std::size(written)) written[writtenCount++] = page;
                 // Only where a store to guarded code traps (the flat build's page protection): a build that notices
                 // every store without a trap (lean memory's checked stores) compares an edge page when it is written.
-                if (!frame && GuestFlat::IsActive() && IsEdgePageLocked(page)) {
-                    if (std::none_of(g_openEdges.begin(), g_openEdges.end(),
-                                     [&](const OpenEdge& e) { return e.page == page; })) {
-                        const auto [lo, hi] = CompareSpanLocked(page);
-                        g_openEdges.push_back({page, lo, hi});
+                if (flatActive) {
+                    if (!frame && IsEdgePageLocked(page)) {
+                        if (std::none_of(g_openEdges.begin(), g_openEdges.end(),
+                                         [&](const OpenEdge& e) { return e.page == page; })) {
+                            const auto [lo, hi] = CompareSpanLocked(page);
+                            g_openEdges.push_back({page, lo, hi});
+                        }
+                    } else {
+                        reprotect.push_back(page);
                     }
-                } else {
-                    reprotect.push_back(page);
                 }
             }
             HZ_PERF_ADD(kHzPagesCompared, g_dirty.size());
             g_dirty.clear();
         }
-        const auto comparedAbove = [&](uint32_t page) {
-            return std::find(written, written + writtenCount, page) != written + writtenCount;
-        };
-        if (frame) {
-            for (const OpenEdge& e : g_openEdges) {
-                if (!comparedAbove(e.page)) ComparePageLocked(e.page);
-                reprotect.push_back(e.page);
+        if (flatActive || !g_openEdges.empty()) {
+            const auto comparedAbove = [&](uint32_t page) {
+                return std::find(written, written + writtenCount, page) != written + writtenCount;
+            };
+            if (frame) {
+                for (const OpenEdge& e : g_openEdges) {
+                    if (!comparedAbove(e.page)) ComparePageLocked(e.page);
+                    if (flatActive) reprotect.push_back(e.page);
+                }
+                g_openEdges.clear();
+            } else {
+                for (const OpenEdge& e : g_openEdges) {
+                    if (comparedAbove(e.page)) continue;
+                    const auto seen = g_seen.find(e.page);
+                    if (seen != g_seen.end() && seen->second && Memory::Contains(e.page, kPage) &&
+                        std::memcmp(Memory::GetPointer(e.page, kPage) + e.lo, seen->second->data() + e.lo, e.hi - e.lo) == 0)
+                        continue;
+                    ComparePageLocked(e.page);
+                }
             }
-            g_openEdges.clear();
-        } else {
-            for (const OpenEdge& e : g_openEdges) {
-                if (comparedAbove(e.page)) continue;
-                const auto seen = g_seen.find(e.page);
-                if (seen != g_seen.end() && seen->second && Memory::Contains(e.page, kPage) &&
-                    std::memcmp(Memory::GetPointer(e.page, kPage) + e.lo, seen->second->data() + e.lo, e.hi - e.lo) == 0)
-                    continue;
-                ComparePageLocked(e.page);
-            }
+            g_openEdgeCount.store(static_cast<uint32_t>(g_openEdges.size()), std::memory_order_release);
+            HZ_PERF_SET(kHzEdgeDirty, g_openEdges.size());
         }
-        g_openEdgeCount.store(static_cast<uint32_t>(g_openEdges.size()), std::memory_order_release);
-        HZ_PERF_SET(kHzEdgeDirty, g_openEdges.size());
     }
-    for (const uint32_t page : reprotect) GuestFlat::ReprotectExecutablePage(page);
+    if (flatActive) {
+        for (const uint32_t page : reprotect) GuestFlat::ReprotectExecutablePage(page);
+    }
 }
 
 } // namespace
@@ -707,6 +916,7 @@ void ReleaseBaked() {
         g_mkwGuestCodePatched[index] = 0;
         ++released;
     }
+    if (released != 0) NotePatchedCallsChanged();
     for (const uint32_t index : differing) MarkInliningCallers(index);  // their inlining callers stay with them
     RT_LOGF(RT_TAG_MOD, "[mods] baked code: %u function(s) run translated, %zu differ from the bake and stay in the "
             "interpreter\n", released, differing.size());
@@ -797,8 +1007,9 @@ void ResetPristine(uint32_t start, uint32_t end) {
             if (function >= start && function < end) g_mkwGuestCodePatched[index] = 1;
         }
         RemarkInliningCallersIn(start, end);
+        NotePatchedCallsChanged();
         for (uint32_t page = start & ~(kPage - 1); page < end; page += kPage) {
-            g_dirty.erase(page);
+            g_dirty.erase(std::remove(g_dirty.begin(), g_dirty.end(), page), g_dirty.end());
             ForgetOpenEdgeLocked(page);
             const uint32_t index = page / kPage;
             g_pendingPages[index / 32].fetch_and(~(1u << (index % 32)), std::memory_order_relaxed);
@@ -856,6 +1067,7 @@ void RedirectModule(uint32_t homeStart, uint32_t homeEnd, uint32_t target, const
     slot->start.store(homeStart, std::memory_order_release);
     UpdateLowestRedirectLocked();
     BumpVariantCallEpoch();
+    NotePatchedCallsChanged();
     uint32_t count = 0;
     for (int64_t index = std::max<int64_t>(FunctionIndex(homeStart), 0);
          index < static_cast<int64_t>(g_mkwGuardedFunctionCount); ++index) {
@@ -890,9 +1102,20 @@ void ClearRedirect(uint32_t homeStart) {
     }
     UpdateLowestRedirectLocked();  // raised only once the slot is off
     BumpVariantCallEpoch();
+    NotePatchedCallsChanged();
 }
 
 void (*ContinuationAt(uint32_t address))(CpuContext*) { return MatchingVariant(address); }
+
+bool ContinuationPossibleAt(uint32_t address) {
+    if (!g_variantsReady.load(std::memory_order_acquire)) return true;  // before the first Protect: not settled yet
+    if (!g_variantsEnabled) return false;
+    for (uint32_t slot = VariantSlot(address) & g_variantSlotMask;; slot = (slot + 1) & g_variantSlotMask) {
+        const auto& [key, value] = g_variantSlots[slot];
+        if (value == 0) return false;
+        if (key == address) return true;
+    }
+}
 
 void ModuleLinkedInPlace(uint32_t start, uint32_t end) {
     if (!g_variantsEnabled || end <= start) return;
@@ -900,26 +1123,29 @@ void ModuleLinkedInPlace(uint32_t start, uint32_t end) {
     for (uint32_t page = start & ~(kPage - 1); page < end; page += kPage) DirtyVariantsOnPageLocked(page);
 }
 
-void RunPatched(CpuContext* ctx, uint32_t address) {
-    // The common case: the same code variant this thread last found for this address, nothing changed since.
-    VariantCallCacheSlot& cached = t_variantCallCache[(address >> 2) & (kVariantCallCacheSlots - 1)];
-    const uint32_t epoch = g_variantCallEpoch.load(std::memory_order_acquire);
-    if (cached.address == address && cached.epoch == epoch) {
-        Bump(g_stats.variantCalls);
-        cached.entry(ctx);
-        Sync();
-        return;
-    }
-    bool redirected = false;
-    if (address >= g_lowestRedirect.load(std::memory_order_acquire)) {
-        for (const Redirect& r : g_redirects) {
-            const uint32_t start = r.start.load(std::memory_order_acquire);
-            if (start != 0 && address >= start && address < r.end.load(std::memory_order_relaxed)) {
-                address = address - start + r.target.load(std::memory_order_relaxed);
-                redirected = true;
-                break;
-            }
+namespace {
+
+inline bool SyncNeeded() {
+    return g_pendingFast.load(std::memory_order_acquire) != 0 || g_anyDirty.load(std::memory_order_acquire) ||
+           g_openEdgeCount.load(std::memory_order_acquire) != 0;
+}
+
+MKW_PPC_NO_INLINE uint32_t ResolveRedirect(uint32_t address, bool* redirected = nullptr) {
+    for (const Redirect& r : g_redirects) {
+        const uint32_t start = r.start.load(std::memory_order_acquire);
+        if (start != 0 && address >= start && address < r.end.load(std::memory_order_relaxed)) {
+            if (redirected) *redirected = true;
+            return address - start + r.target.load(std::memory_order_relaxed);
         }
+    }
+    return address;
+}
+
+MKW_PPC_NO_INLINE void RunPatchedWithVariantsSlow(CpuContext* ctx, uint32_t address, VariantCallCacheSlot& cached,
+                                                  uint32_t epoch) {
+    bool redirected = false;
+    if (__builtin_expect(address >= g_lowestRedirect.load(std::memory_order_acquire), 0)) {
+        address = ResolveRedirect(address, &redirected);
     }
     // A function patched exactly as the build saw the mod patch it runs that translation (code variants).
     if (!redirected) {
@@ -928,7 +1154,7 @@ void RunPatched(CpuContext* ctx, uint32_t address) {
             cached = {address, epoch, variant};
             Bump(g_stats.variantCalls);
             variant(ctx);
-            Sync();  // as after the interpreter below: what it called may have patched code
+            if (__builtin_expect(SyncNeeded(), 0)) Sync();
             return;
         }
     }
@@ -937,13 +1163,95 @@ void RunPatched(CpuContext* ctx, uint32_t address) {
     HZ_PHASE(kHzPatchedTopTicks);
     {
         HZ_PERF_T0();
-        if (!PpcInterpreter::detail::RunCompiledEntry(ctx, address)) PpcInterpreter::Run(ctx, address);
+        if (!PpcInterpreter::detail::RunCompiledEntry(ctx, address)) PpcInterpreter::detail::RunGeneral(ctx, address);
+        HZ_PERF_SINCE(kHzPatchedTicks);
+        HZ_PERF_SET(kHzInterpInstructions, PpcInterpreter::InstructionCount());
+    }
+    if (__builtin_expect(SyncNeeded(), 0)) Sync();
+}
+
+MKW_PPC_NO_INLINE void RunPatchedFallback(CpuContext* ctx, uint32_t address) {
+    PpcInterpreter::detail::RunGeneral(ctx, address);
+}
+
+// RunPatched hands every call without code variants to PpcInterpreter::detail::RunPatchedJit (which makes the common one itself
+// and gives the rest back to RunPatchedGeneral): set once the JIT hooks are registered (only with variants off), with nothing
+// counted per call.
+bool g_jitRunsPatched = false;
+
+void RunPatchedGeneral(CpuContext* ctx, uint32_t address);
+void RunPatchedVariants(CpuContext* ctx, uint32_t address);
+
+}  // namespace
+
+void RegisterJitHooks() {
+    PpcInterpreter::detail::PatchedHooks hooks;
+    hooks.patchedByteFor = [](uint32_t address) -> const uint8_t* {
+        const uint32_t* begin = g_mkwGuardedFunctionStarts;
+        const uint32_t* end = begin + g_mkwGuardedFunctionCount;
+        const uint32_t* it = std::lower_bound(begin, end, address);
+        if (it == end || *it != address) return nullptr;
+        return &g_mkwGuestCodePatched[static_cast<size_t>(it - begin)];
+    };
+    hooks.pendingFast = &g_pendingFast;
+    hooks.anyDirty = &g_anyDirty;
+    hooks.lowestRedirect = &g_lowestRedirect;
+    hooks.sync = &Sync;
+    hooks.openEdgeCount = &g_openEdgeCount;
+    hooks.runPatched = &RunPatchedGeneral;
+    PpcInterpreter::detail::RegisterPatchedHooks(hooks);
+    g_jitRunsPatched = !PatchStatsEnabled() && !MKW_HZ_PERF;
+}
+
+// Each path a tail call of its own, so that none pays for another's frame: with code variants off RunPatchedJit, with them the
+// variant cache, else (before the first Protect, or the statistics on) the general path.
+void RunPatched(CpuContext* ctx, uint32_t address) {
+    if (__builtin_expect(g_jitRunsPatched, 1)) {
+        PpcInterpreter::detail::RunPatchedJit(ctx, address);
+        return;
+    }
+    if (g_variantsEnabled) {
+        RunPatchedVariants(ctx, address);
+        return;
+    }
+    RunPatchedGeneral(ctx, address);
+}
+
+namespace {
+
+MKW_PPC_NO_INLINE void RunPatchedVariants(CpuContext* ctx, uint32_t address) {
+    VariantCallCacheSlot& cached = t_variantCallCache[(address >> 2) & (kVariantCallCacheSlots - 1)];
+    const uint32_t epoch = g_variantCallEpoch.load(std::memory_order_acquire);
+    if (__builtin_expect(cached.address == address && cached.epoch == epoch, 1)) {
+        Bump(g_stats.variantCalls);
+        cached.entry(ctx);
+        if (__builtin_expect(SyncNeeded(), 0)) Sync();
+        return;
+    }
+    RunPatchedWithVariantsSlow(ctx, address, cached, epoch);
+}
+
+// RunPatched with code variants off: the redirect, the compiled entry or the general one, the Sync test.
+void RunPatchedGeneral(CpuContext* ctx, uint32_t address) {
+    if (__builtin_expect(address >= g_lowestRedirect.load(std::memory_order_acquire), 0)) {
+        address = ResolveRedirect(address);
+    }
+    Bump(g_stats.interpreterCalls);
+    HZ_PERF_ADD(kHzPatched, 1);
+    HZ_PHASE(kHzPatchedTopTicks);
+    {
+        HZ_PERF_T0();
+        if (__builtin_expect(!PpcInterpreter::detail::RunCompiledEntry(ctx, address), 0)) {
+            RunPatchedFallback(ctx, address);
+        }
         HZ_PERF_SINCE(kHzPatchedTicks);
         HZ_PERF_SET(kHzInterpInstructions, PpcInterpreter::InstructionCount());
     }
     // A patched function is usually a mod hook, and what it called may have patched more code (a Gecko hook runs
     // the code handler): that takes effect now, as the handler's isync makes it on a Wii.
-    Sync();
+    if (__builtin_expect(SyncNeeded(), 0)) Sync();
 }
+
+}  // namespace
 
 } // namespace GuestCodePatch

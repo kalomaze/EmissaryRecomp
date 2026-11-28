@@ -56,6 +56,9 @@ void RunPatched(CpuContext* ctx, uint32_t address);
 // loader's "call the original" stub branches to a replaced function's second instruction), else null. For the
 // interpreter's branches to addresses no translated function starts at.
 void (*ContinuationAt(uint32_t address))(CpuContext*);
+// Whether ContinuationAt(address) can ever answer non-null, whatever guest memory holds: a code variant is keyed at the
+// address (true before the variants are set up). For a JIT block to settle a branch to address at compile time.
+bool ContinuationPossibleAt(uint32_t address);
 // The game linked a module in place over [start, end) (its bytes came from a file read, past the write trap): the code
 // variants with words there are checked against guest memory again before they next run.
 void ModuleLinkedInPlace(uint32_t start, uint32_t end);

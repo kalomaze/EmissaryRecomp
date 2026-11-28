@@ -11,8 +11,8 @@
 //    sraw., extsb., extsh., cntlzw., rlwimi.): the plain form (EmitIntOp), then CR0 from the register it wrote;
 //  * orc, nand, eqv, sraw;
 //  * the condition register ops: crand ... cror, mcrf, mtcrf;
-//  * the loads and stores of the memory group's Generic forms (EmitMemGeneric), the float ops (EmitFpGeneric), and the ops that
-//    do nothing (sync, eieio, cache hints, isync).
+//  * the loads and stores of the memory group's Generic forms (EmitMemGeneric), the float ops and ps_sel (EmitFpGeneric), and the
+//    ops that do nothing (sync, eieio, cache hints, isync).
 //
 // An OE form (overflow enable) is left to the interpreter's handler: nothing in the hot code uses one. DescribeGeneric holds
 // for those as for the native forms.
@@ -104,7 +104,9 @@ void Cr0FromGpr(BlockEmitter& e, uint32_t r) {
         BlockEmitter::NoteCr(BlockEmitter::CrEvent::WriteSkipped);
         return;
     }
-    e.a.movsxd(rax, e.Gpr(r));
+    const int hit = e.FindCachedGpr(r);
+    if (hit >= 0) e.a.movsxd(rax, BlockEmitter::GprCacheReg(static_cast<uint32_t>(hit)));
+    else e.a.movsxd(rax, e.Gpr(r));
     e.CrStore(0);
 }
 
@@ -377,6 +379,7 @@ GenericFacts DescribeGeneric(uint32_t w) {
     const auto floatLoad = [&] { return F{F::CrPass, F::FormScalar, 0, static_cast<uint8_t>(f.d)}; };
     switch (f.po) {
     case 3: return pass;  // twi
+    case 4: return f.rc == 0 && ((w >> 1) & 31u) == 23 ? F{F::CrPass, F::FormBarrier, 0, 0} : barrier;  // ps_sel: no CR
     case 12: return pass;
     case 13: return writer0();
     case 19:
@@ -428,6 +431,7 @@ uint32_t EmitGenericWord(BlockEmitter& e, uint32_t w) {
     const Fields f(w);
     switch (f.po) {
     case 3: return 1;  // twi: a debug assert, nothing here
+    case 4: return EmitFpGeneric(e, w);  // ps_sel (the other paired words Decode leaves Generic are the interpreter's)
     case 12:    // addic
     case 13: {  // addic.
         auto& c = e.a;

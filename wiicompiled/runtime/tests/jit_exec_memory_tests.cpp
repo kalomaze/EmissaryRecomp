@@ -8,6 +8,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -327,7 +328,8 @@ bool ThpDisabledBySystem() {
     return !read || std::strstr(text, "[never]") != nullptr;
 }
 
-// Linux: the default chunk starts on a 2 MiB boundary, is a whole number of huge pages, and is advised for huge pages.
+// Linux: the default chunk starts on a 2 MiB boundary and is a whole number of huge pages; it is advised for huge pages only with
+// BRAWL_JIT_HUGEPAGES=1 (THPeligible then).
 void TestArenaHugePages() {
     using JitExecMemory::Arena;
     Arena arena;
@@ -336,7 +338,8 @@ void TestArenaHugePages() {
     assert(reinterpret_cast<uintptr_t>(first) % Arena::kHugePageBytes == 0);
     assert(arena.BytesReserved() % Arena::kHugePageBytes == 0);
     first[0] = 1;
-    if (!ThpDisabledBySystem()) {
+    const char* advise = std::getenv("BRAWL_JIT_HUGEPAGES");
+    if (!ThpDisabledBySystem() && advise != nullptr && *advise == '1') {
         const int eligible = ThpEligible(first);
         assert(eligible == 1 || eligible == -1);
         (void)eligible;
@@ -359,6 +362,44 @@ void TestArenaHugePages() {
     arena.Reset();
     assert(arena.BytesReserved() == 0);
 }
+
+#if defined(__x86_64__)
+// Linux x86-64: code space is within a rel32 call of the executable's functions (unless BRAWL_JIT_FAR_MEMORY=1), and code
+// there calls one that way.
+void TestNearExecutable() {
+    using namespace Xbyak::util;
+    const char* far = std::getenv("BRAWL_JIT_FAR_MEMORY");
+    const bool wantNear = far == nullptr || *far == '\0' || *far == '0';
+    const auto reaches = [](const void* from, const void* to) {
+        const int64_t d = reinterpret_cast<const uint8_t*>(to) - reinterpret_cast<const uint8_t*>(from);
+        return d > INT32_MIN + 64 && d < INT32_MAX - 64;
+    };
+    JitExecMemory::Arena arena;
+    for (int i = 0; i < 3; ++i) {
+        void* mem = arena.Allocate(JitExecMemory::Arena::kHugePageBytes - 64, 16);
+        assert(mem);
+        assert(reaches(mem, reinterpret_cast<const void*>(&CalleeDouble)) == wantNear);
+        if (!wantNear) continue;
+        Xbyak::CodeGenerator code(64, mem);
+        code.push(rbx);
+        code.mov(Arg0().cvt32(), 20 + i);
+        code.call(reinterpret_cast<const void*>(&CalleeDouble));  // rel32
+        code.pop(rbx);
+        code.ret();
+        assert(code.getCode<int (*)()>()() == 41 + 2 * i);
+    }
+    JitExecMemory::Region r = JitExecMemory::Allocate(4096);
+    assert(r && reaches(r.base, reinterpret_cast<const void*>(&CalleeDouble)) == wantNear);
+    JitExecMemory::Free(r);
+    // freed near space is handed out again: many more allocations than the reservation has slots
+    for (int i = 0; i < 300; ++i) {
+        JitExecMemory::Region t = JitExecMemory::Allocate(3u << 20);
+        assert(t);
+        static_cast<uint8_t*>(t.base)[(3u << 20) - 1] = 1;
+        JitExecMemory::Free(t);
+    }
+}
+#endif
 #endif
 
 void TestThreads() {
@@ -391,6 +432,9 @@ int main() {
     TestArenaShrink();
 #if defined(__linux__)
     TestArenaHugePages();
+#if defined(__x86_64__)
+    TestNearExecutable();
+#endif
 #endif
     TestThreads();
     std::puts("jit exec memory tests passed");
