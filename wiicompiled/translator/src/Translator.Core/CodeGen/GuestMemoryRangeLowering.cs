@@ -30,10 +30,13 @@ public static class GuestMemoryRangeLowering
     public static IrFunction Lower(IrFunction function, int minimumAccesses = 8,
         bool ignoreDisabledPcTraces = false,
         bool scalarOnly = false,
-        bool liveInRanges = true)
+        bool liveInRanges = true,
+        uint? fixedSda1Base = null,
+        uint? fixedSda2Base = null)
     {
         var nextRange = 0;
-        var hardwareConstants = CxxLinearCodeGenerator.BuildKnownUIntConstants(function);
+        var hardwareConstants = CxxLinearCodeGenerator.BuildKnownUIntConstants(
+            function, fixedSda1Base, fixedSda2Base);
         if (liveInRanges)
             function = LowerFunctionLiveInRanges(
                 function, ref nextRange, minimumAccesses, ignoreDisabledPcTraces,

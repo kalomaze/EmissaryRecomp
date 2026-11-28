@@ -80,10 +80,24 @@ public sealed partial class CxxLinearCodeGenerator
     private static bool IsProvenRamStore(uint address, int sizeBytes)
     {
         if (sizeBytes <= 0 || sizeBytes > 8) return false;
-        var last = unchecked(address + (uint)(sizeBytes - 1));
+        return IsProvenRamRange(address, sizeBytes);
+    }
+
+    /// <summary>
+    /// True when the entire byte span <c>[address, address + length)</c> is provably ordinary guest RAM:
+    /// does not wrap, does not intersect the MMIO window or any lean-memory alias of it, and does not overlap
+    /// any guarded guest code range.
+    /// </summary>
+    private static bool IsProvenRamRange(uint address, int length)
+    {
+        if (length <= 0) return false;
+        var last = unchecked(address + (uint)(length - 1));
         if (last < address) return false; // wraps past the end of the address space
+        var canonicalFirst = address & 0x3FFFFFFFu;
+        var canonicalLast = last & 0x3FFFFFFFu;
+        if (canonicalLast < canonicalFirst) return false; // crosses 1 GiB alias boundary
+        if (canonicalFirst < 0x0E000000u && canonicalLast >= 0x0C000000u) return false; // MMIO / lean MMIO alias
         return !FlatWriteNeedsPolicy(address) && !FlatWriteNeedsPolicy(last) &&
-               !IsLeanMmioAlias(address) && !IsLeanMmioAlias(last) &&
                !OverlapsGuardedCode(address, last);
     }
 

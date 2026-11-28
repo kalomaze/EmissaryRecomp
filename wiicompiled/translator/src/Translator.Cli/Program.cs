@@ -171,7 +171,8 @@ int RunEmitBuildShards(string[] argsTail)
             // Brawl translates main.dol with all 126 .rel modules (~100k functions): far more shards than 72.
             BaseShardCount: int.Parse(OptionValue(argsTail, "--base-shards") ?? "72", CultureInfo.InvariantCulture),
             NativeIndex: nativeIndex,
-            CodeVariantsDirectory: OptionValue(argsTail, "--code-variants") is { } variants ? Path.GetFullPath(variants) : null));
+            CodeVariantsDirectory: OptionValue(argsTail, "--code-variants") is { } variants ? Path.GetFullPath(variants) : null,
+            InlineProfilePath: OptionValue(argsTail, "--inline-profile") is { } inlineProfile ? Path.GetFullPath(inlineProfile) : null));
         Console.WriteLine("[translator] emitted stable translated build graph");
         Console.WriteLine($"  base functions: {result.BaseFunctionCount:N0}");
         Console.WriteLine($"  shared base functions: {result.SharedBaseFunctionCount:N0}");
@@ -250,6 +251,15 @@ int RunTranslateRecursive(string[] argsTail)
     var disableStateFreeAbi = true || HasFlag(argsTail, "--no-state-free-abi");
     // Translations of functions as a mod's fixed code patches leave them (CodeVariants.cs), after the base emission.
     var codeVariantSpecPath = OptionValue(argsTail, "--code-variants");
+    if (OptionValue(argsTail, "--indirect-profile") is { } indirectProfilePath)
+    {
+        IndirectCallProfile.Load(Path.GetFullPath(indirectProfilePath));
+        Console.WriteLine(
+            $"[translator] indirect profile {Path.GetFileName(indirectProfilePath)}: {IndirectCallProfile.PromotedSiteCount:N0} sites, " +
+            $"{IndirectCallProfile.PromotedTargetCount:N0} promoted targets, {IndirectCallProfile.PromotedJumpSiteCount:N0} jump sites");
+    }
+    if (IndirectCallProfile.Instrument)
+        Console.WriteLine("[translator] MKW_INDIRECT_PROFILE_SITES=1: indirect call sites count their targets");
     var codeVariantOutDir = OptionValue(argsTail, "--code-variants-out") ??
         Path.Combine(Path.GetDirectoryName(Path.GetFullPath(outDir))!, "code_variants");
     if (!emitFunctionFiles && string.IsNullOrWhiteSpace(productionSourceBundlePath))
@@ -777,7 +787,30 @@ int RunTranslateRecursive(string[] argsTail)
             // Calls to a registered native observe the native implementation's
             // contract, not the excluded PPC body that happens to share its address.
             foreach (var pair in nativeGuestEffects.Contracts)
-                guestAbiContracts[pair.Key] = GuestEabi.Enabled ? GuestEabi.ClassifyNative(pair.Key, pair.Value).Contract : pair.Value;
+            {
+                guestAbiContracts[pair.Key] = GuestEabi.Enabled
+                    ? GuestEabi.ClassifyNative(pair.Key, pair.Value).Contract
+                    : GuestAbiContractAnalyzer.ModSafeIndirectAbi
+                        ? GuestEabi.ClassifyModSafeNative(pair.Key, pair.Value)
+                        : pair.Value;
+            }
+
+            {
+                var fencedFunctions = emissionAddresses.Count(address => guestAbiContracts[address].HasFullSynchronizationFence);
+                var nvGprWriters = emissionAddresses.Count(address =>
+                    !guestAbiContracts[address].HasFullSynchronizationFence &&
+                    (guestAbiContracts[address].GprPossibleWriteMask & GuestEabi.NonvolatileGprMask) != 0);
+                var r1Writers = emissionAddresses.Count(address =>
+                    !guestAbiContracts[address].HasFullSynchronizationFence &&
+                    (guestAbiContracts[address].GprPossibleWriteMask & (1u << 1)) != 0);
+                var sdaWriters = emissionAddresses.Count(address =>
+                    !guestAbiContracts[address].HasFullSynchronizationFence &&
+                    (guestAbiContracts[address].GprPossibleWriteMask & ((1u << 2) | (1u << 13))) != 0);
+                Console.WriteLine(
+                    $"[translator] Interprocedural ABI contracts: {emissionAddresses.Length:N0} total, " +
+                    $"{fencedFunctions:N0} fence=1, {emissionAddresses.Length - fencedFunctions:N0} precise " +
+                    $"(r14-r31 writers: {nvGprWriters:N0}, r1 writers: {r1Writers:N0}, r2/r13 writers: {sdaWriters:N0}).");
+            }
 
             if (GuestEabi.Enabled)
             {
@@ -1122,6 +1155,7 @@ int RunTranslateRecursive(string[] argsTail)
                     StringComparer.OrdinalIgnoreCase);
             }
 
+            var projectMemory = RequireProject().Memory;
             TranslationOptions BuildEmissionOptions(
                 uint address,
                 IReadOnlyDictionary<uint, GuestAbiContract> stateFreeAbiContracts)
@@ -1143,9 +1177,11 @@ int RunTranslateRecursive(string[] argsTail)
                         StateFreeAbiContracts: stateFreeAbiContracts,
                         StateFreeCallSymbols: stateFreeCallSymbols,
                         StateFreeCallSiteVariants: stateFreeCallSiteVariantsByCaller.GetValueOrDefault(address),
-                         StateFreeEntryVariants: stateFreeEntryVariantsByTarget.GetValueOrDefault(address),
-                         ModOverridableCallTargets: modOverridableCallTargets,
-                         EabiVariants: eabiVariants),
+                        StateFreeEntryVariants: stateFreeEntryVariantsByTarget.GetValueOrDefault(address),
+                        ModOverridableCallTargets: modOverridableCallTargets,
+                        EabiVariants: eabiVariants,
+                        Sda1Base: projectMemory.SdaBase,
+                        Sda2Base: projectMemory.Sda2Base),
                     residentPolicy,
                     address);
             }
@@ -1503,7 +1539,9 @@ int RunTranslateRecursive(string[] argsTail)
                     guestAbiContracts,
                     allowUnsupportedInstructions,
                     codeVariantOutDir,
-                    maxThreads);
+                    maxThreads,
+                    projectMemory.SdaBase,
+                    projectMemory.Sda2Base);
                 LogPhase("code variants");
             }
             // The float ABI translated callers assume of each translated function (EmitNormalizeGuestCallFloatArguments /
@@ -2289,7 +2327,8 @@ static (string? Positional, CommandOption[] Options)? CommandSpec(string command
         new("--data-in-text", "path"),
         new("--prune-stale"),
         new("--code-variants", "spec"),
-        new("--code-variants-out", "path")
+        new("--code-variants-out", "path"),
+        new("--indirect-profile", "path")
     }),
     "emit-build-shards" => (null, new CommandOption[]
     {
@@ -2298,7 +2337,8 @@ static (string? Positional, CommandOption[] Options)? CommandSpec(string command
         new("--native-source-dir", "path"),
         new("--out", "generated/build_shards"),
         new("--base-shards", "72"),
-        new("--code-variants", "path")
+        new("--code-variants", "path"),
+        new("--inline-profile", "path")
     }),
     _ => null
 };

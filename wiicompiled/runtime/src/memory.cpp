@@ -177,6 +177,30 @@ template void MemoryInline::WriteResolvedFallback<uint8_t>(uint32_t, uint8_t);
 template void MemoryInline::WriteResolvedFallback<uint16_t>(uint32_t, uint16_t);
 template void MemoryInline::WriteResolvedFallback<uint32_t>(uint32_t, uint32_t);
 template void MemoryInline::WriteResolvedFallback<uint64_t>(uint32_t, uint64_t);
+#if MKW_LEAN_MEMORY
+bool MemoryInline::LeanStoresArePlain(uint32_t addr, uint32_t size) {
+    if (size == 0) return true;
+    const uint32_t last = addr + (size - 1u);
+    if (last < addr || ((addr ^ last) & ~kLeanMask) != 0) return false;  // one view of the window
+    const uint32_t c = addr & kLeanMask;
+    if (static_cast<uint64_t>(c) + size > kLeanWindowSize) return false;
+    const uint8_t* const policy = g_leanBase + kLeanPolicyOffset;
+    bool flagged = false;
+    for (uint32_t chunk = c >> kLeanPolicyShift; chunk <= (c + (size - 1u)) >> kLeanPolicyShift; ++chunk)
+        flagged |= policy[chunk] != 0;
+    if (!flagged) return true;
+    // WriteResolvedFallback's fast exit, for every store of the range at once.
+    const uint32_t top = addr >> 28, offset = addr & 0x0FFFFFFFu;
+    if (!g_leanFallbackFast ||
+        !((top == 0x8u && offset + static_cast<uint64_t>(size) <= Memory::kMem1BankSize) ||
+          (top == 0x9u && offset + static_cast<uint64_t>(size) <= Memory::kMem2Size)))
+        return false;
+    for (uint32_t page = addr >> RecompMod::kExecutableWriteGuardPageShift;
+         page <= last >> RecompMod::kExecutableWriteGuardPageShift; ++page)
+        if (RecompMod::g_executableWriteGuardPages[page].load(std::memory_order_relaxed) != 0) return false;
+    return true;
+}
+#endif
 void MemoryInline::WriteResolvedFallbackFloat32(uint32_t addr, double val) { Memory::WriteFloat32(addr, val); }
 void MemoryInline::WriteResolvedFallbackFloat64(uint32_t addr, double val) { Memory::WriteFloat64(addr, val); }
 namespace {

@@ -125,27 +125,35 @@ struct SparseWritablePageTable {
 };
 extern const SparseWritablePageTable* g_sparseWritablePageTables[kPageCount];
 
-// The cold paths translated code calls take MKW_GUEST_OP_CC (isa/ppc_isa_config.h): a call site then spills nothing.
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC uint8_t Read8Slow(uint32_t addr);
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC uint16_t Read16Slow(uint32_t addr);
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC uint32_t Read32Slow(uint32_t addr);
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC uint64_t Read64Slow(uint32_t addr);
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC float ReadFloat32Slow(uint32_t addr);
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC double ReadFloat64Slow(uint32_t addr);
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC void Write8Slow(uint32_t addr, uint8_t val);
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC void Write16Slow(uint32_t addr, uint16_t val);
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC void Write32Slow(uint32_t addr, uint32_t val);
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC void Write64Slow(uint32_t addr, uint64_t val);
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC void WriteFloat32Slow(uint32_t addr, double val);
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC void WriteFloat64Slow(uint32_t addr, double val);
+// The cold paths translated code calls take MKW_COLD_OP_CC (isa/ppc_isa_config.h, preserve_all): a call site then
+// spills nothing, so a function whose only calls are these needs no callee-saved registers.
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC uint8_t Read8Slow(uint32_t addr);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC uint16_t Read16Slow(uint32_t addr);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC uint32_t Read32Slow(uint32_t addr);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC uint64_t Read64Slow(uint32_t addr);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC float ReadFloat32Slow(uint32_t addr);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC double ReadFloat64Slow(uint32_t addr);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC void Write8Slow(uint32_t addr, uint8_t val);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC void Write16Slow(uint32_t addr, uint16_t val);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC void Write32Slow(uint32_t addr, uint32_t val);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC void Write64Slow(uint32_t addr, uint64_t val);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC void WriteFloat32Slow(uint32_t addr, double val);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC void WriteFloat64Slow(uint32_t addr, double val);
 template <typename T>
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC T ReadResolvedFallback(uint32_t addr);
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC float ReadResolvedFallbackFloat32(uint32_t addr);
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC double ReadResolvedFallbackFloat64(uint32_t addr);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC T ReadResolvedFallback(uint32_t addr);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC float ReadResolvedFallbackFloat32(uint32_t addr);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC double ReadResolvedFallbackFloat64(uint32_t addr);
 template <typename T>
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC void WriteResolvedFallback(uint32_t addr, T value);
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC void WriteResolvedFallbackFloat32(uint32_t addr, double val);
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC void WriteResolvedFallbackFloat64(uint32_t addr, double val);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC void WriteResolvedFallback(uint32_t addr, T value);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC void WriteResolvedFallbackFloat32(uint32_t addr, double val);
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC void WriteResolvedFallbackFloat64(uint32_t addr, double val);
+#if MKW_LEAN_MEMORY
+// Every guest store into [addr, addr + size) ends as the dirty marks and the bytes in the window, on whichever path the
+// policy sends it: the chunks are unflagged, or the range lies in MEM1's or MEM2's cached view where
+// WriteResolvedFallback's fast exit takes it (no guarded code in any of its 4 KiB pages). For natives that write a
+// whole range at once (memcpy, memset's body): plain host stores plus the marks of the run are then exact.
+bool LeanStoresArePlain(uint32_t addr, uint32_t size);
+#endif
 #if MKW_OUTLINE_GUEST_OPS && MKW_LEAN_MEMORY
 // Lean stores and exact single loads/stores, out of line (src/guest_ops_outlined.cpp): FlatStore/FlatStoreRam's lean
 // bodies and lfs/stfs's conversions, each the inline code below compiled once.
@@ -195,7 +203,7 @@ MKW_MEMORY_FORCE_INLINE bool FlatWriteNeedsPolicy(uint32_t address) {
 // in double precision, and it has hardware-tested handling for tiny values.
 // ConvertPpcDoubleToSingleBits' subnormal-single arm (exponents 874..896), out of line: rare, and inlined at every
 // stfs it was most of the conversion's code.
-MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_GUEST_OP_CC inline uint32_t ConvertPpcDoubleToSubnormalSingleBits(uint64_t bits, uint32_t exponent) {
+MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC inline uint32_t ConvertPpcDoubleToSubnormalSingleBits(uint64_t bits, uint32_t exponent) {
     uint32_t narrowed = static_cast<uint32_t>(
         0x80000000ULL | ((bits & 0x000FFFFFFFFFFFFFULL) >> 21));
     narrowed >>= (905u - exponent);

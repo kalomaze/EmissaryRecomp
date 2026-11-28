@@ -16,7 +16,9 @@ public sealed record TranslatedBuildShardOptions(
     int RegistrationShardCount = 16,
     RuntimeNativeIndex? NativeIndex = null,
     // translate-recursive --code-variants-out: translations of functions as a mod's fixed patches leave them.
-    string? CodeVariantsDirectory = null);
+    string? CodeVariantsDirectory = null,
+    // emit-build-shards --inline-profile: direct call edges to inline at C++ level (TranslatedBuildShardEmitter.Inline.cs).
+    string? InlineProfilePath = null);
 
 /// <summary>
 /// Per-shard compile-cost spread for one partition. Frozen membership does not
@@ -176,16 +178,17 @@ public static partial class TranslatedBuildShardEmitter
         // table keeps shard identity independent of other functions' compile cost.
         var baseCommonBoundaries = ResolveBaseCommonBoundaries(
             outputRoot, activeBase, options.BaseShardCount);
+        var inlinePlan = BuildInlinePlan(options.InlineProfilePath, activeBase, baseTraits, guardIndex, nativeBodies);
         var baseCommonShards = WriteFunctionShards(
             outputRoot, "base_common", activeBase, options.BaseShardCount, baseTraits,
             "Brawl translated functions", weightedSequential: true, guardIndex, nativeBodies,
-            frozenBoundaries: baseCommonBoundaries?.Table);
+            frozenBoundaries: baseCommonBoundaries?.Table, inlinePlan: inlinePlan);
         shards.AddRange(baseCommonShards);
         var baseRegistration = WriteRegistrationShards(
             outputRoot, "base", activeBase, baseTraits, options.RegistrationShardCount).ToList();
         baseRegistration.Add(WriteIndirectDispatchTable(outputRoot, "base", baseTraits));
         baseRegistration.Add(WriteGuestCodeGuardTable(outputRoot, guardIndex, activeBase));
-        baseRegistration.Add(WriteCodeVariantTable(outputRoot, options.CodeVariantsDirectory, baseTraits));
+        baseRegistration.Add(WriteCodeVariantTable(outputRoot, options.CodeVariantsDirectory, baseTraits, inlinePlan));
         baseRegistration.Add(WriteGuestFloatAbiTable(outputRoot, options.BaseMetadataPath, activeBase));
         var cmakeManifestPath = Path.Combine(outputRoot, "shards.cmake");
         WriteCMakeManifest(cmakeManifestPath, outputRoot, activeBase.Length, shards, baseRegistration);
@@ -424,9 +427,11 @@ public static partial class TranslatedBuildShardEmitter
         bool weightedSequential,
         IReadOnlyDictionary<uint, int> guardIndex,
         IReadOnlyDictionary<uint, string> nativeBodies,
-        ShardBoundaryTable? frozenBoundaries = null)
+        ShardBoundaryTable? frozenBoundaries = null,
+        InlinePlan? inlinePlan = null)
     {
         if (functions.Count == 0) return Array.Empty<ShardInfo>();
+        inlinePlan ??= InlinePlan.Empty;
         var shardCount = Math.Min(requestedShardCount, functions.Count);
         // A frozen boundary table supersedes the packer that produced it: the
         // membership it encodes is identical to that packer run, and it stays
@@ -449,8 +454,33 @@ public static partial class TranslatedBuildShardEmitter
         {
             var group = groups[index];
             if (group.Count == 0) return;
+            var ordered = group
+                .OrderBy(static function => function.Address)
+                .ThenBy(static function => function.Symbol, StringComparer.Ordinal)
+                .ToList();
+            var inlineUsed = new SortedSet<uint>();
+            var inlineIdentity = new StringBuilder();
+            var functionSources = ordered.Select(function =>
+            {
+                var functionSource = function.SourceText ?? File.ReadAllText(function.SourcePath);
+                functionSource = RegistrationMarkerRegex().Replace(functionSource, string.Empty);
+                functionSource = LowerStableDirectCalls(functionSource, traits);
+                if (!inlinePlan.IsEmpty)
+                {
+                    var used = new SortedSet<uint>();
+                    functionSource = RewriteInlineCalls(
+                        functionSource, inlinePlan.BaseEdges.GetValueOrDefault(function.Address), inlinePlan, 1, used);
+                    foreach (var callee in used)
+                        inlineIdentity.Append(CultureInfo.InvariantCulture, $"inl-edge:{function.Address:X8}:{callee:X8}:0\n");
+                    inlineUsed.UnionWith(used);
+                }
+                return InsertGuestCodeGuard(functionSource, guardIndex, nativeBodies);
+            }).ToList();
+            var inlineCalls = new HashSet<uint>();
+            var inlineCopies = BuildInlineCopies(inlineUsed, inlinePlan, traits, inlineCalls, inlineIdentity);
             var dependencyTraits = group
                 .SelectMany(static function => function.DirectCalls)
+                .Concat(inlineCalls)
                 .Distinct()
                 .Where(traits.ContainsKey)
                 .ToDictionary(address => address, address => traits[address]);
@@ -463,7 +493,7 @@ public static partial class TranslatedBuildShardEmitter
                     ? $"{function.Address:X8}:{function.SourceFingerprint}:native={native}"
                     : $"{function.Address:X8}:{function.SourceFingerprint}") +
                 (NativeHookSlot(function.Address) is var hookSlot and >= 0 ? $":hook={hookSlot}" : ""))) + "\n" +
-                traitIdentity;
+                traitIdentity + (inlineIdentity.Length == 0 ? "" : "\n" + inlineIdentity);
             var hash = ChecksumUtilities.Sha256Hex(Encoding.UTF8.GetBytes($"{partition}\n{identity}"));
             // Membership, not the transient scheduling position, is the shard
             // identity.  This lets an unchanged shard retain its source/object
@@ -480,14 +510,20 @@ public static partial class TranslatedBuildShardEmitter
             // the shard text free of the emitting machine's absolute paths.
             source.AppendLine($"#include \"{Path.GetFileName(traitsPath)}\"");
             source.AppendLine("#define MKW_STATIC_TRANSLATED_CALL(Target, Entry, Context) do { Entry(Context); if constexpr ((Target) == 0x80029438u) BrawlRollback::AnchorPads(); } while (false)");
-            foreach (var function in group
-                         .OrderBy(static function => function.Address)
-                         .ThenBy(static function => function.Symbol, StringComparer.Ordinal))
+            if (inlineCopies.Length != 0)
             {
-                var functionSource = function.SourceText ?? File.ReadAllText(function.SourcePath);
-                functionSource = RegistrationMarkerRegex().Replace(functionSource, string.Empty);
-                functionSource = LowerStableDirectCalls(functionSource, traits);
-                functionSource = InsertGuestCodeGuard(functionSource, guardIndex, nativeBodies);
+                // The headers the translated sources include, ahead of the copies that use them.
+                source.AppendLine("#include <cstdint>");
+                source.AppendLine("#include \"ppc_runtime.h\"");
+                source.AppendLine("#include \"memory.h\"");
+                source.AppendLine("#include \"recomp_mod_loader.h\"");
+                source.AppendLine("#line 1 \"inline_copies.cpp\"");
+                source.Append(inlineCopies);
+            }
+            for (var functionIndex = 0; functionIndex < ordered.Count; functionIndex++)
+            {
+                var function = ordered[functionIndex];
+                var functionSource = functionSources[functionIndex];
                 // Diagnostics only; the named file no longer exists on disk (sources live in the
                 // bundle), so only the bare file name is kept, not the emitting machine's path.
                 source.Append($"#line 1 \"{Escape(Path.GetFileName(function.SourcePath))}\"{Environment.NewLine}");
@@ -683,8 +719,9 @@ public static partial class TranslatedBuildShardEmitter
     /// the same symbols. Variants are not registered at any address: only the runtime's patched-code path calls them.
     /// </summary>
     private static string WriteCodeVariantTable(
-        string outputRoot, string? variantsDirectory, IReadOnlyDictionary<uint, Trait> traits)
+        string outputRoot, string? variantsDirectory, IReadOnlyDictionary<uint, Trait> traits, InlinePlan? inlinePlan = null)
     {
+        inlinePlan ??= InlinePlan.Empty;
         var variants = new List<(uint Address, string Symbol, List<(uint Start, List<uint> Words)> Guards)>();
         var regions = new List<uint>();
         var manifest = variantsDirectory is null ? null : Path.Combine(variantsDirectory, "variants.txt");
@@ -714,8 +751,24 @@ public static partial class TranslatedBuildShardEmitter
         var bodies = variants.Select(variant => File.ReadAllText(Path.Combine(variantsDirectory!, variant.Symbol + ".cpp")))
             .Select(body => RegistrationMarkerRegex().Replace(body, string.Empty))
             .ToArray();
+        // Inlined edges out of the variants (TranslatedBuildShardEmitter.Inline.cs): the calls are lowered here, so the
+        // rewrite needs the base traits; the copies' own calls join the traits below.
+        var inlineUsed = new SortedSet<uint>();
+        var inlineCalls = new HashSet<uint>();
+        var inlineCopies = string.Empty;
+        if (!inlinePlan.IsEmpty)
+        {
+            for (var i = 0; i < bodies.Length; i++)
+            {
+                bodies[i] = RewriteInlineCalls(LowerStableDirectCalls(bodies[i], traits),
+                    inlinePlan.VariantEdges.GetValueOrDefault(variants[i].Address), inlinePlan, 1, inlineUsed);
+            }
+            inlineCopies = BuildInlineCopies(inlineUsed, inlinePlan, traits, inlineCalls, new StringBuilder());
+        }
         var calleeTraits = bodies
             .SelectMany(static body => DirectCallRegex().Matches(body).Select(match => ParseHexUInt32(match.Groups["address"].Value)))
+            .Concat(StaticCallTargetRegex().Matches(string.Join("\n", bodies)).Select(match => ParseHexUInt32(match.Groups["address"].Value)))
+            .Concat(inlineCalls).Concat(inlineUsed)
             .Distinct()
             .Where(traits.ContainsKey)
             .ToDictionary(static address => address, address => traits[address]);
@@ -733,6 +786,14 @@ public static partial class TranslatedBuildShardEmitter
                 if (trimmed.Length != 0 && trimmed != "#pragma once") source.AppendLine(trimmed);
             }
             source.AppendLine("#define MKW_STATIC_TRANSLATED_CALL(Target, Entry, Context) do { Entry(Context); if constexpr ((Target) == 0x80029438u) BrawlRollback::AnchorPads(); } while (false)");
+            if (inlineCopies.Length != 0)
+            {
+                source.AppendLine("#include \"ppc_runtime.h\"");
+                source.AppendLine("#include \"memory.h\"");
+                source.AppendLine("#include \"recomp_mod_loader.h\"");
+                source.AppendLine("#line 1 \"inline_copies.cpp\"");
+                source.Append(inlineCopies);
+            }
             for (var i = 0; i < variants.Count; i++)
             {
                 source.AppendLine($"#line 1 \"{variants[i].Symbol}.cpp\"");
@@ -780,20 +841,27 @@ public static partial class TranslatedBuildShardEmitter
         return path;
     }
 
+    private static bool LowersToStaticCall(uint address, IReadOnlyDictionary<uint, Trait> traits, out Trait trait) =>
+        traits.TryGetValue(address, out trait!) &&
+        trait.Available &&
+        trait.NonvolatileFprWriteMask == 0 &&
+        !trait.MustRemainDynamicallyDispatchable &&
+        trait.WinnerSymbol is not null &&
+        !trait.WinnerKind.Equals("native", StringComparison.OrdinalIgnoreCase) &&
+        !RequiresGenericDirectCall(address);
+
     private static string LowerStableDirectCalls(
         string source,
         IReadOnlyDictionary<uint, Trait> traits)
     {
+        // A promoted indirect call's arm (IndirectCallProfile) stays only where its call becomes a plain
+        // MKW_STATIC_TRANSLATED_CALL; otherwise the arm goes and the site is the indirect call it was.
+        source = PromotedIndirectArmRegex().Replace(source, match =>
+            LowersToStaticCall(ParseHexUInt32(match.Groups["address"].Value), traits, out _) ? match.Value : string.Empty);
         return DirectCallRegex().Replace(source, match =>
         {
             var address = ParseHexUInt32(match.Groups["address"].Value);
-            if (!traits.TryGetValue(address, out var trait) ||
-                !trait.Available ||
-                trait.NonvolatileFprWriteMask != 0 ||
-                trait.MustRemainDynamicallyDispatchable ||
-                trait.WinnerSymbol is null ||
-                trait.WinnerKind.Equals("native", StringComparison.OrdinalIgnoreCase) ||
-                RequiresGenericDirectCall(address))
+            if (!LowersToStaticCall(address, traits, out var trait))
             {
                 return match.Value;
             }
@@ -801,6 +869,9 @@ public static partial class TranslatedBuildShardEmitter
             return $"MKW_STATIC_TRANSLATED_CALL(0x{address:X8}u, {trait.WinnerSymbol}, ctx)";
         });
     }
+
+    [GeneratedRegex(@"if \(\([A-Za-z_][A-Za-z0-9_]*\) == 0x(?<address>[0-9A-F]{8})u\)(?: \[\[likely\]\])? \{ InvokeDirectCpu<0x\k<address>u>\(ctx\); \} else ")]
+    private static partial Regex PromotedIndirectArmRegex();
 
     private static bool RequiresGenericDirectCall(uint address) => address switch
     {
@@ -1224,5 +1295,8 @@ public static partial class TranslatedBuildShardEmitter
 
     [GeneratedRegex(@"InvokeDirectCpu<0x(?<address>[0-9A-Fa-f]{8})u>\s*\(\s*ctx\s*\)")]
     private static partial Regex DirectCallRegex();
+
+    [GeneratedRegex(@"MKW_STATIC_TRANSLATED_CALL\(0x(?<address>[0-9A-F]{8})u,")]
+    private static partial Regex StaticCallTargetRegex();
 
 }

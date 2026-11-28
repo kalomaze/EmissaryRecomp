@@ -51,6 +51,18 @@ inline constexpr bool MkwStateFreeAbiEnabled(uint32_t) noexcept
 #define MKW_GUEST_OP_CC
 #endif
 
+// MKW_COLD_OP_CC: the cold out-of-line arms of inline guest operations (lfs's exact widening of a subnormal or NaN,
+// stfs's subnormal narrowing, psq's generic GQR fallbacks) use preserve_all whatever MKW_OUTLINE_GUEST_OPS says. Under
+// the default convention each of those never-taken calls was a call site to the register allocator: every live XMM
+// value (x86-64 has no callee-saved XMM registers) and caller-saved GPR had to survive it, so a hot body around an lfs
+// or stfs saved callee-saved GPRs in its prologue and spilled floats around the call. The callees are the same code;
+// only who saves registers changes, so results are identical. Clang on x86-64 only.
+#if defined(__clang__) && defined(__x86_64__)
+#define MKW_COLD_OP_CC __attribute__((preserve_all))
+#else
+#define MKW_COLD_OP_CC MKW_GUEST_OP_CC
+#endif
+
 
 using MkwStateFreeResult2 = uint64_t __attribute__((ext_vector_type(2)));
 

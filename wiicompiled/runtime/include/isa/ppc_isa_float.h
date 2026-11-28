@@ -227,16 +227,13 @@ inline bool MkwHostNiActiveInline() noexcept
 
 // MKW_OUTLINE_GUEST_OPS (ppc_isa_config.h): each exact operation below is its Body, inline, and a Ppc*Inline entry
 // point that calls the Body compiled once in src/guest_ops_outlined.cpp (MKW_GUEST_OP_CC). Bodies call Bodies.
-inline float PpcForceSingleValueBody(double value)
+
+// FPSCR[NI] flushes an exact pre-round single-subnormal even when rounding would promote it to the smallest normal.
+// g_mkwNiFlushThreshold (2^-126 active, 0.0 inactive) turns the flush into a branchless mask: a set compare lane keeps
+// just the sign bit, a clear lane passes the value to the double->float conversion. DAZ/FZ (set exactly when NI is)
+// makes the compare itself treat a subnormal as zero, matching the mask's answer.
+inline float PpcForceSingleValueMaskedInline(double value)
 {
-#if MKW_FAST_FLOAT
-    return static_cast<float>(value);
-#endif
-    // FPSCR[NI] flushes an exact pre-round single-subnormal even when rounding would promote it
-    // to the smallest normal. g_mkwNiFlushThreshold (2^-126 active, 0.0 inactive) turns the
-    // flush into a branchless mask: a set compare lane keeps just the sign bit, a clear lane
-    // passes the value to the double->float conversion. DAZ/FZ (set exactly when NI is) makes
-    // the compare itself treat a subnormal as zero, matching the mask's answer.
 #if defined(__x86_64__)
     const __m128d v = _mm_set_sd(value);
     const __m128d signMask = _mm_set_sd(-0.0);
@@ -252,6 +249,35 @@ inline float PpcForceSingleValueBody(double value)
     const uint64x1_t signOnly = vand_u64(vreinterpret_u64_f64(v), signMask);
     const uint64x1_t kept = vbsl_u64(flush, signOnly, vreinterpret_u64_f64(v));
     return static_cast<float>(vget_lane_f64(vreinterpret_f64_u64(kept), 0));
+#endif
+}
+
+#if defined(__x86_64__)
+// PpcForceSingleValueBody's cold arm: the conversion gave +-2^-126, the one result the mask can disagree with.
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_COLD_OP_CC inline float PpcForceSingleValueEdgeSlow(double value)
+{
+    return PpcForceSingleValueMaskedInline(value);
+}
+#endif
+
+inline float PpcForceSingleValueBody(double value)
+{
+#if MKW_FAST_FLOAT
+    return static_cast<float>(value);
+#endif
+#if defined(__x86_64__)
+    // The plain conversion, checked: it equals the mask's answer except where it returns +-2^-126. With NI off the
+    // threshold is 0 and the mask is the conversion. With NI on, FTZ and DAZ are set: a magnitude >= 2^-126 is
+    // converted by both; below it the mask gives the signed zero, and the conversion gives a signed zero too (FTZ
+    // flushes every tiny result, DAZ every subnormal input, each keeping the sign) unless rounding carried it up to
+    // the smallest normal, +-2^-126, which FTZ leaves. A NaN is neither. So only a +-2^-126 result asks the mask, out
+    // of line, and the hot path loses the thread-local threshold load and the mask.
+    const float rounded = static_cast<float>(value);
+    if ((PpcBitCastToU32Inline(rounded) & 0x7FFFFFFFu) == 0x00800000u) [[unlikely]]
+        return PpcForceSingleValueEdgeSlow(value);
+    return rounded;
+#else
+    return PpcForceSingleValueMaskedInline(value);
 #endif
 }
 
@@ -283,34 +309,38 @@ inline double PpcFlushPairedForNiInline(double value)
     return value;
 }
 
+// PpcForce25BitInline's double-subnormal arm, out of line (MKW_COLD_OP_CC): no single-precision operand reaches it.
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_COLD_OP_CC inline double PpcForce25BitSubnormalSlow(double value)
+{
+    constexpr uint64_t kDoubleFracMask = 0x000FFFFFFFFFFFFFULL;
+    constexpr int kDoubleFracWidth = 52;
+    uint64_t integral = PpcBitCastToU64Inline(value);
+    const uint64_t fraction = integral & kDoubleFracMask;
+    int64_t keepMask = 0xFFFFFFFFF8000000LL;
+    uint64_t round = 0x8000000ULL;
+    // Shifts until bit 63 is set, i.e. the leading zero count (fraction is nonzero here): one lzcnt/clz.
+    // __builtin_clzll, not std::countl_zero: some translation units including this header build as C++17.
+    const uint32_t leadingZeros = static_cast<uint32_t>(__builtin_clzll(fraction));
+    const uint32_t shift = leadingZeros - (63 - kDoubleFracWidth);
+    keepMask >>= shift;
+    round >>= shift;
+    integral = (integral & static_cast<uint64_t>(keepMask)) + (integral & round);
+    return PpcBitCastToDoubleInline(integral);
+}
+
 inline double PpcForce25BitInline(double value)
 {
     constexpr uint64_t kDoubleExpMask = 0x7FF0000000000000ULL;
     constexpr uint64_t kDoubleFracMask = 0x000FFFFFFFFFFFFFULL;
-    constexpr int kDoubleFracWidth = 52;
 
     uint64_t integral = PpcBitCastToU64Inline(value);
 
     const uint64_t exponent = integral & kDoubleExpMask;
     const uint64_t fraction = integral & kDoubleFracMask;
 
-    if (exponent == 0 && fraction != 0)
-    {
-        int64_t keepMask = 0xFFFFFFFFF8000000LL;
-        uint64_t round = 0x8000000ULL;
-        // Shifts until bit 63 is set, i.e. the leading zero count (fraction is nonzero here): one lzcnt/clz.
-        // __builtin_clzll, not std::countl_zero: some translation units including this header build as C++17.
-        const uint32_t leadingZeros = static_cast<uint32_t>(__builtin_clzll(fraction));
-        const uint32_t shift = leadingZeros - (63 - kDoubleFracWidth);
-        keepMask >>= shift;
-        round >>= shift;
-        integral = (integral & static_cast<uint64_t>(keepMask)) + (integral & round);
-    }
-    else
-    {
-        integral = (integral & 0xFFFFFFFFF8000000ULL) + (integral & 0x8000000ULL);
-    }
-
+    if (exponent == 0 && fraction != 0) [[unlikely]]
+        return PpcForce25BitSubnormalSlow(value);
+    integral = (integral & 0xFFFFFFFFF8000000ULL) + (integral & 0x8000000ULL);
     return PpcBitCastToDoubleInline(integral);
 }
 
@@ -526,6 +556,25 @@ inline double PpcFdivBody(double a, double b)
     return PpcResolveNan2Inline(a / b, a, b);
 }
 
+// PpcAccurateSingleMaddIntermediateInline's tie recovery, out of line (MKW_COLD_OP_CC): taken only when the double FMA
+// result lies exactly on a float32 halfway point. The same operations as when it was inline.
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_COLD_OP_CC inline double PpcSingleMaddTieSlow(double a, double roundedC, double signedB,
+                                                                                double result)
+{
+    const uint64_t resultBits = PpcBitCastToU64Inline(result);
+    const double aPrime = signedB - result;
+    const double bPrime = result + aPrime;
+    const double deltaA = std::fma(a, roundedC, aPrime);
+    const double deltaB = signedB - bPrime;
+    const double error = deltaA + deltaB;
+    if (error != 0.0)
+    {
+        result = PpcBitCastToDoubleInline(
+            (error > 0.0) == (result > 0.0) ? resultBits + 1 : resultBits - 1);
+    }
+    return result;
+}
+
 // CIsSingle: the translator proved C a single-precision value (see PpcFmulsSingleCInline), on which the 25-bit
 // rounding below is the identity.
 template <bool Subtract, bool CIsSingle = false>
@@ -548,19 +597,8 @@ inline double PpcAccurateSingleMaddIntermediateInline(double a, double c, double
     const uint64_t resultBits = PpcBitCastToU64Inline(result);
     constexpr uint64_t kDiscardedMask = 0x000000001FFFFFFFULL;
     constexpr uint64_t kEvenTie = 0x0000000010000000ULL;
-    if ((resultBits & kDiscardedMask) == kEvenTie)
-    {
-        const double aPrime = signedB - result;
-        const double bPrime = result + aPrime;
-        const double deltaA = std::fma(a, roundedC, aPrime);
-        const double deltaB = signedB - bPrime;
-        const double error = deltaA + deltaB;
-        if (error != 0.0)
-        {
-            result = PpcBitCastToDoubleInline(
-                (error > 0.0) == (result > 0.0) ? resultBits + 1 : resultBits - 1);
-        }
-    }
+    if ((resultBits & kDiscardedMask) == kEvenTie) [[unlikely]]
+        result = PpcSingleMaddTieSlow(a, roundedC, signedB, result);
     return PpcResolveNanInline(result, a, b, c);
 }
 
@@ -665,6 +703,27 @@ extern "C" inline double PPC_FnmsubsSingleC(double a, double c, double b)
 {
     const float result = PpcForceSingleValueBody(PpcAccurateSingleMaddIntermediateInline<true, true>(a, c, b));
     return static_cast<double>(PpcNegateMaddResultInline(result));
+}
+
+// fmuls and the fused single family as the float they round to, for a result whose single bits the translator keeps
+// for a store (CxxLinearCodeGenerator.SingleFpr.cs): the double entry points above return exactly
+// static_cast<double>() of these (same operations; the negation of fnmadds/fnmsubs is applied to the float there too).
+template <bool CIsSingle>
+inline float PpcFmulsFloatInline(double a, double c)
+{
+#if MKW_FAST_FLOAT
+    return static_cast<float>(a * c);
+#endif
+    return PpcForceSingleValueBody(PpcFmulBody(a, CIsSingle || std::isnan(c) ? c : PpcForce25BitInline(c)));
+}
+
+template <bool Subtract, bool Negate, bool CIsSingle>
+inline float PpcFusedSingleFloatInline(double a, double c, double b)
+{
+    const float result = PpcForceSingleValueBody(PpcAccurateSingleMaddIntermediateInline<Subtract, CIsSingle>(a, c, b));
+    if constexpr (Negate)
+        return PpcNegateMaddResultInline(result);
+    return result;
 }
 
 // The entry points translated code calls (see PpcForceSingleValueBody).
@@ -1096,7 +1155,7 @@ inline uint32_t PpcPsqStoreSingleBitsInline(double value)
 // The PowerPC manual's single-to-double algorithm (lfs, ps loads), kept out of line for the inputs the host cast in
 // PpcConvertToDoubleBitsInline can't reproduce: subnormals (a DAZ host would flush them) and NaNs (a host cast sets
 // the quiet bit of a signalling NaN; Gekko keeps the payload). Infinities land here too; their result is the same.
-MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline uint64_t PpcConvertToDoubleBitsSlow(uint32_t value)
+MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_COLD_OP_CC inline uint64_t PpcConvertToDoubleBitsSlow(uint32_t value)
 {
     uint64_t x = value;
     uint64_t exp = (x >> 23) & 0xFFu;
@@ -1126,6 +1185,21 @@ MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_GUEST_OP_CC inline uint64_t PpcConvertToDoubl
     return ((x & 0xC0000000ULL) << 32) | z | ((x & 0x3FFFFFFFULL) << 29);
 }
 
+// Whether single `value` is a normal number or a zero: the words the host's float->double cast widens exactly under
+// any MXCSR (DAZ flushes subnormal inputs, and a cast quiets a signalling NaN). The direct test, `magnitude - 2^23 <
+// 0x7F000000 || magnitude == 0`, is two compares joined branchlessly (mov, and, lea, cmp, setae, test, setne, test,
+// jne at every lfs). One compare does it: shifting out the sign leaves the exponent in the top byte; flipping the 23
+// fraction bits moves +-0 to the top of the exponent-0 block (0x00FFFFFE) and the subnormals below it; adding 2^24
+// wraps the exponent-255 block (infinities, NaNs) to [0, 0x00FFFFFF] and puts the subnormals at
+// [0x01000000, 0x01FFFFFC], directly above it, and zero at 0x01FFFFFE, just past both. Normals land at 0x02000000 or
+// higher. So the not-normal-not-zero words are exactly the keys below 0x01FFFFFE (checked over all 2^32 words by
+// tests/single_widen_exhaustive.cpp). Clang emits lea, xor, add, cmp, ja.
+inline bool PpcSingleWidensByCastInline(uint32_t value)
+{
+    const uint32_t key = ((value ^ 0x007FFFFFu) << 1) + 0x01000000u;
+    return key >= 0x01FFFFFEu;
+}
+
 inline uint64_t PpcConvertToDoubleBitsInline(uint32_t value)
 {
     float single;
@@ -1135,8 +1209,7 @@ inline uint64_t PpcConvertToDoubleBitsInline(uint32_t value)
 #endif
     // Normal singles and zeros widen exactly, so the host cast gives the manual's bits (its normal arm is this exact
     // widening written in integer ops); everything else takes the manual's algorithm.
-    const uint32_t magnitude = value & 0x7FFFFFFFu;
-    if (magnitude - 0x00800000u < 0x7F000000u || magnitude == 0) [[likely]]
+    if (PpcSingleWidensByCastInline(value)) [[likely]]
         return PpcBitCastToU64Inline(static_cast<double>(single));
     return PpcConvertToDoubleBitsSlow(value);
 }

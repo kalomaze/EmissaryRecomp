@@ -178,3 +178,13 @@ MKW_INDIRECT_IC_HIT_FUNCTION void MkwInvokeIndirectJumpSite(uint32_t target, Cpu
 #define MKW_INDIRECT_JUMP(target, ctx) InvokeIndirectJump(target, ctx)
 
 #endif
+
+// Profiling builds of the translated code (MKW_INDIRECT_PROFILE_SITES=1 in the translator's environment) emit
+// MKW_INDIRECT_PROFILE_COUNT(function, site, target) before each indirect call and MKW_INDIRECT_PROFILE_JUMP before
+// each indirect tail jump: function is the translated function's entry, site the bctrl/blrl/bctr's guest address. The
+// counts go to $BRAWL_INDIRECT_PROFILE (rewritten every 2^24 calls and at exit), one "FUNCTION SITE TARGET COUNT"
+// line per pair (jumps as "J FUNCTION SITE TARGET COUNT"): the translator's --indirect-profile input
+// (Translator.Core/CodeGen/IndirectCallProfile.cs). Without the variable nothing is counted.
+void MkwIndirectProfileCount(uint32_t function, uint32_t site, uint32_t target, bool jump);
+#define MKW_INDIRECT_PROFILE_COUNT(function, site, target) MkwIndirectProfileCount((function), (site), (target), false)
+#define MKW_INDIRECT_PROFILE_JUMP(function, site, target) MkwIndirectProfileCount((function), (site), (target), true)
