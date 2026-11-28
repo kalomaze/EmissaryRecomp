@@ -14,12 +14,16 @@ namespace BrawlRollback {
 // raw 64-byte granules, retained slot buffers, asynchronous
 // eviction into a base image, and backward source lookup on restore. Guest RAM
 // is supplied by the recomp's selected-region reader/writer instead of Dolphin.
+// Each saved granule also links to the previous saved copy of its block, so the
+// restore finds a block's source from its first discarded copy instead of
+// scanning every older slot.
 class SnapshotStore {
 public:
     static constexpr size_t BlockSize=64, Capacity=16;
 private:
     struct Delta {
         std::unique_ptr<uint32_t[]> indices;
+        std::unique_ptr<uint32_t[]> previous;  // each block's copy before this one (a Location), or kNone
         std::unique_ptr<uint8_t[]> bytes;
         size_t count=0,capacity=0;
         int frame=0;
@@ -28,23 +32,39 @@ private:
             // Like Dolphin's slot buffers, grow only when needed and overwrite
             // the new storage directly; old deltas in this slot are discarded.
             auto newIndices=std::make_unique_for_overwrite<uint32_t[]>(blocks);
+            auto newPrevious=std::make_unique_for_overwrite<uint32_t[]>(blocks);
             auto newBytes=std::make_unique_for_overwrite<uint8_t[]>(blocks*BlockSize);
-            indices=std::move(newIndices);bytes=std::move(newBytes);capacity=blocks;
+            indices=std::move(newIndices);previous=std::move(newPrevious);bytes=std::move(newBytes);capacity=blocks;
         }
-        size_t ResidentBytes() const {return capacity*(sizeof(uint32_t)+BlockSize);}
+        size_t ResidentBytes() const {return capacity*(2*sizeof(uint32_t)+BlockSize);}
     };
-    struct Source {size_t slot,index;};
+    // A saved copy of a block: its slot (top 4 bits) and its position in the slot. A location can outlive its copy
+    // (the slot evicted and reused, or discarded by a restore), so Core::Valid checks one before it is followed.
+    static constexpr uint32_t kNone=~uint32_t{0},kIndexBits=28;
+    static_assert(Capacity<=(size_t{1}<<(32-kIndexBits)),"slot number must fit a location");
+    static constexpr uint32_t Location(size_t slot,size_t index){return uint32_t(slot<<kIndexBits|index);}
+    static constexpr size_t SlotOf(uint32_t at){return at>>kIndexBits;}
+    static constexpr size_t IndexOf(uint32_t at){return at&((uint32_t{1}<<kIndexBits)-1);}
     struct Core {
         SnapshotJobs jobs;
         std::array<Delta,Capacity> slots;
         Delta evicted;
         job::Job* eviction=nullptr;
         std::vector<uint8_t> base,scratch,needsSource;
-        std::vector<uint32_t> dirtyKeys,flagged,restoreKeys;
-        std::vector<Source> restoreSources;
+        std::vector<uint32_t> dirtyKeys,flagged;
+        std::vector<uint32_t> flaggedSources;
+        std::vector<uint32_t> latest;  // per block: its newest saved copy (a Location), or kNone (base only)
         size_t next=0,count=0;
         ~Core(){jobs.Wait(eviction);}
         size_t Oldest() const {return (next+Capacity-count)%Capacity;}
+        // A slot's age in the retained history: 0 for the oldest, count-1 for the newest, Capacity if not retained.
+        size_t Age(size_t slot) const {const size_t age=(slot+Capacity-Oldest())%Capacity;return age<count?age:Capacity;}
+        // `at` still holds a copy of `key` saved before a slot of age `before`: retained, older, and that key.
+        bool Valid(uint32_t at,uint32_t key,size_t before) const {
+            if(at==kNone)return false;
+            const size_t slot=SlotOf(at),index=IndexOf(at);
+            return Age(slot)<before && index<slots[slot].count && slots[slot].indices[index]==key;
+        }
         size_t Find(int frame) const {
             for(size_t n=0;n<count;++n){size_t i=(next+Capacity-1-n)%Capacity;if(slots[i].frame==frame)return i;}
             throw std::runtime_error("rollback: snapshot outside retained history");
@@ -57,14 +77,26 @@ private:
         }
         size_t ResidentBytes() const {
             size_t bytes=jobs.ResidentBytes()+base.capacity()+scratch.capacity()+needsSource.capacity();
-            bytes+=(dirtyKeys.capacity()+flagged.capacity()+restoreKeys.capacity())*sizeof(uint32_t);
-            bytes+=restoreSources.capacity()*sizeof(Source)+evicted.ResidentBytes();
+            bytes+=(dirtyKeys.capacity()+flagged.capacity()+flaggedSources.capacity()+latest.capacity())*sizeof(uint32_t);
+            bytes+=evicted.ResidentBytes();
             for(const auto& slot:slots)bytes+=slot.ResidentBytes();
             return bytes;
         }
     };
     // Stable storage: an in-flight eviction must survive Session's move/reset.
     std::unique_ptr<Core> core;
+    bool prepared=false;int preparedFrame=0,preparedAnchor=0;
+    uint64_t preparedIndexNs=0,preparedEvictWaitNs=0;
+    static void Flag(Core& c,uint32_t key,uint32_t source) {
+        if(c.needsSource[key])return;
+        c.needsSource[key]=1;c.flagged.push_back(key);c.flaggedSources.push_back(source);
+    }
+    void DropPrepared() {
+        if(!prepared)return;
+        prepared=false;
+        for(uint32_t key:core->flagged)core->needsSource[key]=0;
+        core->flagged.clear();core->flaggedSources.clear();
+    }
 public:
     size_t lastPayload=0,peakResident=0,lastReadBytes=0;
     size_t lastRestoreReadBytes=0,lastRestoreWriteBytes=0;
@@ -105,9 +137,11 @@ public:
             core=std::make_unique<Core>();auto& c=*core;
             c.base.resize(size);read(0,c.base.data(),size);
             c.needsSource.resize((size+BlockSize-1)/BlockSize);
+            c.latest.assign(c.needsSource.size(),kNone);
             c.slots[0].frame=frame;c.count=1;c.next=1;
             lastReadBytes=lastPayload=size;Measure();return;
         }
+        DropPrepared();
         auto& c=*core;
         if(size!=c.base.size())throw std::runtime_error("snapshot region layout changed during match");
         if(frame<=c.slots[(c.next+Capacity-1)%Capacity].frame)
@@ -131,7 +165,9 @@ public:
         if(std::adjacent_find(keys.begin(),keys.end(),[](uint32_t a,uint32_t b){return a>=b;})!=keys.end() ||
            (!keys.empty() && keys.back()>=c.needsSource.size()))
             throw std::runtime_error("rollback: invalid dirty block list");
+        if(keys.size()>=(size_t{1}<<kIndexBits))throw std::runtime_error("rollback: too many dirty blocks for one save");
         slot.Reserve(keys.size());
+        const size_t slotNumber=c.next;
         std::array<size_t,SnapshotJobs::SaveChunks> readBytes{};
         const size_t split=(keys.size()+SnapshotJobs::SaveChunks-1)/SnapshotJobs::SaveChunks;
         lastIndexNs=Elapsed(indexStart);
@@ -149,6 +185,8 @@ public:
                 read(offset,slot.bytes.get()+i*BlockSize,count);examined+=count;
                 if(count<BlockSize)std::memset(slot.bytes.get()+i*BlockSize+count,0,BlockSize-count);
                 slot.indices[i]=key;
+                // keys are distinct, so each chunk owns its keys' links
+                slot.previous[i]=c.latest[key];c.latest[key]=Location(slotNumber,i);
             }
             readBytes[chunk]=examined;workerNs[chunk]=Elapsed(workerStart);
         });
@@ -159,57 +197,62 @@ public:
         lastPayload=slot.count*(BlockSize+sizeof(uint32_t));
         c.next=(c.next+1)%Capacity;c.count=std::min(c.count+1,Capacity);Measure();lastFinishNs=Elapsed(finishStart);
     }
-    template<class Reader,class Writer> void Restore(int frame,int anchor,const std::vector<uint32_t>& dirty,Reader read,Writer write) {
+    // The part of Restore(frame, anchor, ...) that needs neither guest memory nor the dirty list, done ahead (while
+    // something else finishes, e.g. the GX thread). The next Restore must be that one; a Save drops it.
+    void PrepareRestore(int frame,int anchor) {
         if(!core)throw std::runtime_error("rollback: no snapshot");
+        DropPrepared();
         auto& c=*core;const size_t target=c.Find(frame);
         if(anchor!=c.slots[(c.next+Capacity-1)%Capacity].frame)
             throw std::runtime_error("rollback: invalid restore anchor or dirty bitmap");
-        lastIndexNs=lastJobsNs=lastWorkerNs=lastFinishNs=lastEvictWaitNs=0;
-        const auto waitStart=Clock::now();c.jobs.Wait(c.eviction);lastEvictWaitNs=Elapsed(waitStart);
+        const auto waitStart=Clock::now();c.jobs.Wait(c.eviction);preparedEvictWaitNs=Elapsed(waitStart);
+        const auto indexStart=Clock::now();
+        c.flagged.clear();c.flaggedSources.clear();
+        // Only writes after the target can differ from its saved image: the blocks saved in the discarded slots
+        // (here) and those written since the newest (Restore's dirty list). Including the target would rescan its
+        // dirty list and needlessly restore blocks untouched since that snapshot. Each one's source is its newest
+        // copy at or before the target: for a block saved after the target, the link of its first copy after it (the
+        // discarded slots oldest first); for one only written since, its newest copy. A copy not retained means the
+        // base image (evicted copies are applied there). The source is the block's newest copy from now on.
+        const size_t framesBack=((c.next+Capacity-1)%Capacity+Capacity-target)%Capacity;
+        for(size_t n=1;n<=framesBack;++n) {
+            const auto& slot=c.slots[(target+n)%Capacity];
+            for(size_t i=0;i<slot.count;++i)Flag(c,slot.indices[i],slot.previous[i]);
+        }
+        preparedIndexNs=Elapsed(indexStart);
+        prepared=true;preparedFrame=frame;preparedAnchor=anchor;
+    }
+    template<class Reader,class Writer> void Restore(int frame,int anchor,const std::vector<uint32_t>& dirty,Reader read,Writer write) {
+        if(!prepared || preparedFrame!=frame || preparedAnchor!=anchor)PrepareRestore(frame,anchor);
+        prepared=false;
+        auto& c=*core;const size_t target=c.Find(frame);
+        lastIndexNs=preparedIndexNs;lastEvictWaitNs=preparedEvictWaitNs;lastJobsNs=lastWorkerNs=lastFinishNs=0;
         const size_t framesBack=((c.next+Capacity-1)%Capacity+Capacity-target)%Capacity;
         std::array<size_t,SnapshotJobs::Chunks> reads{},writes{};
         auto prepare=[&] {
-        const auto indexStart=Clock::now();
-        c.flagged.clear();c.restoreKeys.clear();c.restoreSources.clear();
-        auto flag=[&](uint32_t key){if(!c.needsSource[key]){c.needsSource[key]=1;c.flagged.push_back(key);}};
-        // Only writes after the target can differ from its saved image. Including the target
-        // rescans its dirty list and needlessly restores blocks untouched since that snapshot.
-        for(uint32_t key:dirty) {
-            if(key>=c.needsSource.size())throw std::runtime_error("rollback: dirty block outside memory");
-            flag(key);
-        }
-        for(size_t n=1;n<=framesBack;++n) {
-            const auto& slot=c.slots[(target+n)%Capacity];
-            for(size_t i=0;i<slot.count;++i)flag(slot.indices[i]);
-        }
-        // Backward indexing: newest saved contents at or before the target.
-        size_t remaining=c.flagged.size();
-        for(size_t index=target;;index=(index+Capacity-1)%Capacity) {
-            const auto& slot=c.slots[index];
-            for(size_t i=0;i<slot.count;++i) {
-                const uint32_t key=slot.indices[i];
-                if(!c.needsSource[key])continue;
-                c.needsSource[key]=0;--remaining;
-                c.restoreKeys.push_back(key);c.restoreSources.push_back({index,i});
+            const auto indexStart=Clock::now();
+            for(uint32_t key:dirty) {
+                if(key>=c.needsSource.size())throw std::runtime_error("rollback: dirty block outside memory");
+                Flag(c,key,c.latest[key]);
             }
-            if(!remaining || index==c.Oldest())break;
-        }
-        for(uint32_t key:c.flagged)if(c.needsSource[key]) {
-            c.needsSource[key]=0;c.restoreKeys.push_back(key);c.restoreSources.push_back({Capacity,0});
-        }
-        lastIndexNs=Elapsed(indexStart);
+            lastIndexNs+=Elapsed(indexStart);
         };
         std::array<uint64_t,SnapshotJobs::Chunks> workerNs{};
+        const size_t through=c.Age(target)+1;
         const auto jobsStart=Clock::now();
         c.jobs.RunPrepared(prepare,[&,read,write](size_t chunk) mutable {
             const auto workerStart=Clock::now();
-            const size_t begin=c.restoreKeys.size()*chunk/SnapshotJobs::Chunks;
-            const size_t end=c.restoreKeys.size()*(chunk+1)/SnapshotJobs::Chunks;
+            const size_t begin=c.flagged.size()*chunk/SnapshotJobs::Chunks;
+            const size_t end=c.flagged.size()*(chunk+1)/SnapshotJobs::Chunks;
             size_t examined=0,written=0;
             for(size_t n=begin;n<end;++n) {
-                const size_t offset=size_t(c.restoreKeys[n])*BlockSize,count=std::min(BlockSize,c.base.size()-offset);
-                const auto source=c.restoreSources[n];
-                const uint8_t* saved=source.slot==Capacity?c.base.data()+offset:c.slots[source.slot].bytes.get()+source.index*BlockSize;
+                // flagged keys are distinct: each chunk owns its keys' entries
+                const uint32_t key=c.flagged[n];
+                uint32_t at=c.flaggedSources[n];
+                if(!c.Valid(at,key,through))at=kNone;
+                c.needsSource[key]=0;c.latest[key]=at;
+                const size_t offset=size_t(key)*BlockSize,count=std::min(BlockSize,c.base.size()-offset);
+                const uint8_t* saved=at==kNone?c.base.data()+offset:c.slots[SlotOf(at)].bytes.get()+IndexOf(at)*BlockSize;
                 uint8_t now[BlockSize];read(offset,now,count);examined+=count;
                 if(std::memcmp(now,saved,count)){write(offset,saved,count);written+=count;}
             }

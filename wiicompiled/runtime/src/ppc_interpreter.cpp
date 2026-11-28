@@ -1481,7 +1481,25 @@ struct BlockCache {
     std::vector<uint32_t> codeMarks;
     bool codeMarksSorted = true;
     std::vector<MarkCheck> codeWindows;  // codeMarks as 8-mark loads, rebuilt when it changes
-    std::unordered_map<uint32_t, uint32_t> writtenAt;
+    // (consume count, mark) in count order: each time a consume found a code mark set (the newest entry of a mark is
+    // its last such consume). A restore reads it back from the end, only as far as its snapshot's count.
+    std::vector<std::pair<uint32_t, uint32_t>> writtenAt;
+    void NoteWritten(uint32_t mark, uint32_t seq) {  // with CachesMutex held
+        auto at = writtenAt.end();
+        while (at != writtenAt.begin() && std::prev(at)->first > seq) --at;  // counts arrive in order but one thread
+        writtenAt.insert(at, {seq, mark});                                   // may take its count before another
+        if (writtenAt.size() > writtenCompactAt) CompactWritten();
+    }
+    // Drop the entries a newer one of the same mark supersedes, keeping the order; next time at twice what is left.
+    size_t writtenCompactAt = size_t{1} << 16;
+    void CompactWritten() {
+        std::unordered_set<uint32_t> seen;
+        size_t keep = writtenAt.size();
+        for (size_t i = writtenAt.size(); i-- > 0;)
+            if (seen.insert(writtenAt[i].second).second) writtenAt[--keep] = writtenAt[i];
+        writtenAt.erase(writtenAt.begin(), writtenAt.begin() + static_cast<std::ptrdiff_t>(keep));
+        writtenCompactAt = std::max(size_t{1} << 16, 2 * writtenAt.size());
+    }
     std::vector<std::pair<uint32_t, Block*>> builtAt;
     // Every thread's cache, for retiring blocks under a mark another thread's cache (or a scanner) clears.
     static std::mutex& CachesMutex() { static std::mutex m; return m; }
@@ -1553,7 +1571,7 @@ struct BlockCache {
                         !BrawlDirtyMemory::trackedPages[(m >> 10) & 0x3FFFu].load(std::memory_order_relaxed))
                         continue;
                     c->RetireAll(m);
-                    c->writtenAt[m] = seq;
+                    c->NoteWritten(m, seq);
                 }
             }
         }
@@ -1565,11 +1583,23 @@ struct BlockCache {
         const uint32_t now = BrawlDirtyMemory::consumeSeq.fetch_add(1, std::memory_order_acq_rel) + 1;
         std::lock_guard<std::mutex> lock(CachesMutex());
         for (BlockCache* c : Caches()) {
-            for (auto& [m, at] : c->writtenAt)
-                if (at > snapshotSeq) {
+            // the marks last found set after the snapshot; the restore writes them again, now
+            size_t first = c->writtenAt.size();
+            while (first > 0 && c->writtenAt[first - 1].first > snapshotSeq) --first;
+            if (first < c->writtenAt.size()) {
+                std::vector<std::pair<uint32_t, uint32_t>> again(c->writtenAt.begin() + static_cast<std::ptrdiff_t>(first),
+                                                                 c->writtenAt.end());
+                c->writtenAt.resize(first);
+                std::sort(again.begin(), again.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+                again.erase(std::unique(again.begin(), again.end(),
+                                        [](const auto& a, const auto& b) { return a.second == b.second; }),
+                            again.end());
+                for (auto& [at, m] : again) {
                     c->RetireAll(m);
                     at = now;
                 }
+                c->writtenAt.insert(c->writtenAt.end(), again.begin(), again.end());
+            }
             for (auto it = c->builtAt.rbegin(); it != c->builtAt.rend() && it->first >= snapshotSeq; ++it)
                 if (it->second->epoch != 0) { it->second->epoch = 0; ++c->retired; }
         }
