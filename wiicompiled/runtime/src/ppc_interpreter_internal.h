@@ -2,6 +2,7 @@
 // types, the helpers compiled code calls, and the interface a backend implements. Private to src/.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -26,55 +27,59 @@ struct JitCallTarget {
     uint32_t target;               // the guest address
     uint32_t address;              // the raw record's address (the execution address the call scopes)
     void (*entry)(CpuContext*);    // the raw record's entry: the function's wrapper
+    const uint8_t* patchedByte;    // &g_mkwGuestCodePatched[guardIdx] when variants are off, else null
     uint32_t fprMask;              // nonvolatile FPRs the callee may write, as PpcNonvolatileFprGuard takes it
+    uint32_t argMask;              // float arguments NormalizeCallFloatArguments checks: bit r for f1..f13
     uint8_t fprFirst, fprCount;    // the mask as one run of registers (first - 14, length), or fprCount 0: not a single run
     bool preserveGprs;             // PpcNonvolatileGprGuard enabled
     bool special;                  // 0x80017618, 0x8002A210, 0x80029438: Call treats them specially
     bool returnsPaired;            // NormalizeCalleeFloatReturn converts f1
-    uint32_t argMask;              // the float arguments NormalizeCallFloatArguments looks at, bit r - 1 for fr
-    // argMask as the register numbers it names, in ascending order: the callers that cannot test them in line read each form byte.
-    // (padded with kFormZero up to argRounded, 0, 4, 8 or 16 entries, so the shims read a fixed number of bytes without a branch each)
-    uint8_t argCount;
-    uint8_t argRounded;
-    uint8_t argRegs[16];
     bool lean;                     // fprMask == 0 and no GPR guard: the call needs no guard, only the execution address and the context
     bool fprsOnly;                 // an FPR guard and no GPR guard
+    bool fastDirect;               // lean && !returnsPaired && !special: callable directly from JIT
 };
 
 // One guest function's run in the interpreter. Run keeps its own copies of what it needs in the interpreter loop; the
-// members after `pc` are the JIT's, kept in memory because compiled code reads and writes them.
-constexpr uint32_t kFormZero = 32;  // Frame::form[kFormZero] is always Form::Unknown (see formZero)
+// members are kept in memory because compiled code reads and writes them.
+constexpr uint32_t kFrameFlagLoopFrame = 1u << 0;   // this frame is BrawlRollback::RunLoop's frame
+constexpr uint32_t kFrameFlagDirectEnter = 1u << 1; // entered via jit_enter_direct (in-trampoline Frame)
+constexpr uint32_t kFrameFlagSubCall = 1u << 2;     // entered via jit_subcall (JIT->patched-JIT direct call)
 
 struct Frame {
-    Frame(CpuContext* c, uint32_t at) : ctx(c), form{}, formZero{}, pc(at), entry(at) {}
+    Frame(CpuContext* c, uint32_t at) : ctx(c), pc(at), entry(at) {}
     CpuContext* ctx;
-    Form form[32];
-    Form formZero[16];                // never written: padding entries of JitCallTarget::argRegs read it as Unknown
+    uint32_t pairedMask = 0;          // bit r is 1 when fpr[r] holds a paired value, 0 when it holds a scalar double
+    uint32_t flags = 0;               // kFrameFlag*
     uint32_t pc;
     uint32_t returnAddress = 0;       // the lr the frame was entered with
+    uint32_t entry;                   // the address the function running was entered at
+    uint32_t reserved = 0;
     uint64_t executed = 0;            // guest instructions compiled code ran since the dispatcher last collected them
     std::exception_ptr pending;       // an exception caught by a helper compiled code called
-    uint32_t entry;                   // the address the function running was entered at
 };
-
-static_assert(offsetof(Frame, formZero) == offsetof(Frame, form) + 32, "padding reads of argRegs go through form + kFormZero");
 
 // --- FPR forms ------------------------------------------------------------------------------------------------
 
+inline bool IsPaired(const Frame& f, uint32_t r) { return ((f.pairedMask >> (r & 31u)) & 1u) != 0; }
 inline double Scalar(Frame& f, uint32_t r) {
-    if (f.form[r] == Form::Paired) {
+    if (IsPaired(f, r)) {
         return PPC_PsToScalarInline(f.ctx->fpr[r].d);
     }
     return f.ctx->fpr[r].d;
 }
 inline double Paired(Frame& f, uint32_t r) {
-    if (f.form[r] == Form::Scalar) {
+    if (!IsPaired(f, r)) {
         return PPC_PsFromScalarInline(f.ctx->fpr[r].d);
     }
     return f.ctx->fpr[r].d;
 }
-inline void SetScalar(Frame& f, uint32_t r, double v) { f.ctx->fpr[r].d = v; f.form[r] = Form::Scalar; }
-inline void SetPaired(Frame& f, uint32_t r, double v) { f.ctx->fpr[r].d = v; f.form[r] = Form::Paired; }
+inline void SetScalar(Frame& f, uint32_t r, double v) { f.ctx->fpr[r].d = v; f.pairedMask &= ~(1u << (r & 31u)); }
+inline void SetPaired(Frame& f, uint32_t r, double v) { f.ctx->fpr[r].d = v; f.pairedMask |= (1u << (r & 31u)); }
+inline void CopyForm(Frame& f, uint32_t dst, uint32_t src) {
+    const uint32_t bit = 1u << (dst & 31u);
+    if (IsPaired(f, src)) f.pairedMask |= bit;
+    else f.pairedMask &= ~bit;
+}
 
 // Branch condition (BO/BI) with the ctr decrement.
 inline bool BranchTaken(CpuContext* c, uint32_t bo, uint32_t bi) {
@@ -221,6 +226,40 @@ enum class JitStatus : uint32_t { Continue, Return, Pending };
 struct JitCodeCache;  // the backend's: one per BlockCache, owns its blocks' code
 // next: where to go on, for Continue. link: the slot the exit left through, or null.
 struct JitExit { JitStatus status; uint32_t next; JitLink* link; };
+// L1 direct-mapped cache of compiled, non-hook entry points -> jitChecked, shared with jit_subcall.
+struct FastEntrySlot {
+    uint32_t pc = 0;
+    uint32_t pad = 0;
+    const void* jitChecked = nullptr;
+};
+inline constexpr uint32_t kFastEntrySlots = 2048;
+inline uint32_t FastEntryIdx(uint32_t pc) { return ((pc >> 2) * 0x9E3779B1u) >> 21; }
+
+// Per-thread state passed to jit_enter_direct so its fast exit counts instructions without TLS, jit_subcall can probe
+// fastEntries without TLS, and its slow exit can continue in RunLoop. First field is insnCount (read by exitReturn).
+struct DirectEnterState {
+    uint64_t* insnCount;
+    void* threadState;
+    const FastEntrySlot* fastEntries;
+};
+
+// Hooks registered once by GuestCodePatch::Protect (when code variants are off) so JIT-to-patched-JIT calls can
+// bypass RunPatched/RunCompiledEntry/jit_enter_direct while preserving redirect/unpatch/Sync checks.
+struct PatchedHooks {
+    const uint8_t* (*patchedByteFor)(uint32_t address) = nullptr;
+    const std::atomic<uint64_t>* pendingFast = nullptr;
+    const std::atomic<bool>* anyDirty = nullptr;
+    const std::atomic<uint32_t>* lowestRedirect = nullptr;
+    void (*sync)() = nullptr;
+};
+void RegisterPatchedHooks(const PatchedHooks& hooks) noexcept;
+const PatchedHooks& GetPatchedHooks() noexcept;
+
+// Direct call to a non-throwing-guard fprsOnly target (no try/catch: unwinds directly through chunk .eh_frame).
+void JitDirectFprsCall(CpuContext* cpu, const JitCallTarget* t);
+
+using EnterDirectFn = void (*)(CpuContext* ctx, uint32_t entry, const void* jitChecked, DirectEnterState* state);
+
 struct JitBackend {
     JitCodeCache* (*createCache)();
     void (*destroyCache)(JitCodeCache* cache);          // frees every block's code in it
@@ -229,7 +268,12 @@ struct JitBackend {
     void (*link)(JitLink& slot, Block& to);              // aims slot at `to` (compiled) and adds it to to.jitIncoming
     void (*retire)(Block& b);                            // b is being replaced or dropped: resets every slot aimed at it, clears b.jitIncoming
     size_t (*codeBytes)(const JitCodeCache& cache);      // bytes of code the cache holds (the interpreter drops the cache past a limit); may be null
+    EnterDirectFn enterDirect;                           // fast AOT->JIT trampoline (may be null)
 };
+
+// Called from jit_enter_direct's slow exit when a compiled block leaves without returning (stale, unlinked, hook, or
+// pending exception). May throw (unwinds through jit_enter_direct's FDE).
+void JitDirectContinue(DirectEnterState* state, Frame* f, uint64_t statusAndNext, JitLink* link);
 // The backend this build has, or null: JitX64Backend() under MKW_JIT (defined in src/jit/jit_x64.cpp; it may itself
 // return null), otherwise none.
 const JitBackend* Backend();

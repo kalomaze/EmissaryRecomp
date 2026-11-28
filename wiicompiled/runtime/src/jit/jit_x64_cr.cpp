@@ -152,8 +152,15 @@ void BlockEmitter::CrDiffImm(bool isSigned, uint32_t imm, bool flags) {
 }
 
 void BlockEmitter::CrDiffGpr(bool isSigned, uint32_t reg) {
-    if (isSigned) a.movsxd(rcx, Gpr(reg));
-    else a.mov(ecx, Gpr(reg));
+    const int hit = FindCachedGpr(reg);
+    if (hit >= 0) {
+        const Xbyak::Reg32& src = GprCacheReg(static_cast<uint32_t>(hit));
+        if (isSigned) a.movsxd(rcx, src);
+        else a.mov(ecx, src);
+    } else {
+        if (isSigned) a.movsxd(rcx, Gpr(reg));
+        else a.mov(ecx, Gpr(reg));
+    }
     a.sub(rax, rcx);
 }
 
@@ -161,12 +168,15 @@ void BlockEmitter::CrStore(uint32_t field) {
     if (!MKW_LEAN_FLAGS) {  // XER[SO] is copied into the field; translated code never sets it, so the call is out of line
         Xbyak::Label& so = NewLabel();
         Xbyak::Label& store = NewLabel();
+        const GprSnapshot snap = SnapshotGprs();
         a.cmp(Xer(), 0);
         a.js(so);
         a.L(store);
-        Cold([&so, &store](BlockEmitter& cold) {
+        Cold([&so, &store, snap](BlockEmitter& cold) {
             cold.a.L(so);
+            cold.EmitFlushSnapshot(snap);
             cold.CallHelper(&PpcCrvWithSo, rax);
+            cold.EmitReloadSnapshotVolatile(snap);
             cold.a.jmp(store);
         });
     }
@@ -174,25 +184,116 @@ void BlockEmitter::CrStore(uint32_t field) {
     NoteCr(CrEvent::CompactWrite);
 }
 
-// mfcr, crnor ... cror: the interpreter's code (PpcGetCr, PpcCrvWithBit and PpcCrvLogic) behind a noexcept call.
+// mfcr: the interpreter's code (PpcGetCr) behind a noexcept call.
 namespace {
 
 uint32_t CrPackCall(Frame* f) noexcept { return PpcGetCr(f->ctx); }
 
-// spec: op | bt << 3 | ba << 8 | bb << 13 (CrLogic).
-void CrLogicCall(Frame* f, uint32_t spec) noexcept {
-    int64_t* const crv = f->ctx->crv;
-    const uint32_t op = spec & 7u, bt = (spec >> 3) & 31u, ba = (spec >> 8) & 31u, bb = (spec >> 13) & 31u;
-    crv[bt >> 2] = PpcCrvWithBit(crv[bt >> 2], bt & 3u,
-                                 PpcCrvLogic(op, PpcCrvBit(crv[ba >> 2], ba & 3u), PpcCrvBit(crv[bb >> 2], bb & 3u)));
+// Extracts CR bit `bit` (0 LT, 1 GT, 2 EQ, 3 SO) of field `field` into `dst` (0 or 1). Clobbers `tmp` and flags.
+void EmitExtractCrBit(BlockEmitter& e, uint32_t field, uint32_t bit, const Xbyak::Reg64& dst, const Xbyak::Reg64& tmp) {
+    auto& a = e.a;
+    const Xbyak::Address cr = e.Crv(field);
+    switch (bit & 3u) {
+    case 0:  // LT: bit 62
+        a.mov(dst, cr);
+        a.shr(dst, 62);
+        a.and_(dst.cvt32(), 1);
+        break;
+    case 1:  // GT: signed > 0
+        a.cmp(cr, 0);
+        a.setg(dst.cvt8());
+        a.movzx(dst.cvt32(), dst.cvt8());
+        break;
+    case 2:  // EQ: low 32 bits == 0
+        a.cmp(a.dword[cr.getRegExp()], 0);
+        a.sete(dst.cvt8());
+        a.movzx(dst.cvt32(), dst.cvt8());
+        break;
+    default:  // SO: bit 59 ^ bit 62
+        a.mov(dst, cr);
+        a.mov(tmp, dst);
+        a.shr(tmp, 3);
+        a.xor_(dst, tmp);
+        a.shr(dst, 59);
+        a.and_(dst.cvt32(), 1);
+        break;
+    }
 }
 
 }  // namespace
 
 void BlockEmitter::CrPack() { CallHelper(&CrPackCall, kFrame); }
 
+// Native crnor..cror (op 0..7 as PpcCrvLogic's) on CR bits bt, ba, bb: computes the result bit in eax (0 or 1),
+// extracts the other 3 bits of field bt>>2 into a nibble, and writes kPpcCrvTable[nibble] into Crv(bt>>2).
 void BlockEmitter::CrLogic(uint32_t op, uint32_t bt, uint32_t ba, uint32_t bb) {
-    CallHelper(&CrLogicCall, kFrame, op | (bt & 31u) << 3 | (ba & 31u) << 8 | (bb & 31u) << 13);
+    const uint32_t btField = (bt >> 2) & 7u, btBit = bt & 3u;
+    const uint32_t baField = (ba >> 2) & 7u, baBit = ba & 3u;
+    const uint32_t bbField = (bb >> 2) & 7u, bbBit = bb & 3u;
+    // Compute result bit in eax (0 or 1).
+    if (ba == bb) {
+        if (op == 2) {  // crxor a, a -> 0 (crclr)
+            a.xor_(eax, eax);
+        } else if (op == 5) {  // creqv a, a -> 1 (crset)
+            a.mov(eax, 1);
+        } else if (op == 1) {  // crandc a, a -> 0
+            a.xor_(eax, eax);
+        } else if (op == 6) {  // crorc a, a -> 1
+            a.mov(eax, 1);
+        } else {
+            EmitExtractCrBit(*this, baField, baBit, rax, rcx);
+            if (op == 0 || op == 3) a.xor_(eax, 1);  // crnor/crnand -> !a (crnot); crand/cror -> a (crmove)
+        }
+    } else {
+        EmitExtractCrBit(*this, baField, baBit, rax, rdx);
+        EmitExtractCrBit(*this, bbField, bbBit, rcx, rdx);
+        switch (op) {
+        case 0: a.or_(eax, ecx); a.xor_(eax, 1); break;   // crnor
+        case 1: a.xor_(ecx, 1); a.and_(eax, ecx); break;  // crandc
+        case 2: a.xor_(eax, ecx); break;                  // crxor
+        case 3: a.and_(eax, ecx); a.xor_(eax, 1); break;  // crnand
+        case 4: a.and_(eax, ecx); break;                  // crand
+        case 5: a.xor_(eax, ecx); a.xor_(eax, 1); break;  // creqv
+        case 6: a.xor_(ecx, 1); a.or_(eax, ecx); break;   // crorc
+        default: a.or_(eax, ecx); break;                  // cror
+        }
+    }
+    // Extract the 4-bit nibble of target field btField into edx (skipping the overwritten bit btBit), then OR in eax.
+    a.mov(rsi, Crv(btField));
+    const uint32_t shift = 3u - btBit;
+    if (shift != 0) a.shl(eax, static_cast<uint8_t>(shift));
+    if (btBit != 0) {  // LT -> bit 3
+        a.mov(rcx, rsi);
+        a.shr(rcx, 59);
+        a.and_(ecx, 8);
+        a.or_(eax, ecx);
+    }
+    if (btBit != 1) {  // GT -> bit 2
+        a.test(rsi, rsi);
+        a.setg(cl);
+        a.movzx(ecx, cl);
+        a.shl(ecx, 2);
+        a.or_(eax, ecx);
+    }
+    if (btBit != 2) {  // EQ -> bit 1
+        a.test(esi, esi);
+        a.sete(cl);
+        a.movzx(ecx, cl);
+        a.add(ecx, ecx);
+        a.or_(eax, ecx);
+    }
+    if (btBit != 3) {  // SO -> bit 0
+        a.mov(rcx, rsi);
+        a.mov(rdx, rsi);
+        a.shr(rdx, 3);
+        a.xor_(rcx, rdx);
+        a.shr(rcx, 59);
+        a.and_(ecx, 1);
+        a.or_(eax, ecx);
+    }
+    a.mov(rsi, reinterpret_cast<uintptr_t>(&kPpcCrvTable[0]));
+    a.mov(rax, a.qword[rsi + rax * 8]);
+    a.mov(Crv(btField), rax);
 }
 
 void BlockEmitter::CrFromGpr(uint32_t rs, uint32_t crm) {

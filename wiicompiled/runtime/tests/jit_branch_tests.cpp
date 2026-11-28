@@ -1547,6 +1547,59 @@ void HotLoopsStayCompiled() {
     }
 }
 
+// Regression tests for intra-block GPR caching (subf aliasing o.d == o.a; fused cmpw+bc with both useCtr and useCond
+// when the CR field is dead and the second compare operand is read later) and direct jmp rel32 link/retire.
+void GprCacheAndDirectLinkRegressions() {
+    Rng rng(1337);
+    {
+        Asm a;
+        Label skip = a.NewLabel();
+        // subf r3, r3, r4 -> r3 = r4 - r3 (d == a, both cached), followed by cmpw cr3, r5, r6 + bc 10, 14 (useCtr + useCond)
+        // with cr3 overwritten immediately after (dead) and r6 read afterwards.
+        a << addi(3, 3, 1) << addi(4, 4, 2) << X(3, 3, 4, 40) << addi(5, 5, 3) << cmpw(3, 5, 6);
+        a.Bc(10, 14, skip);
+        a << cmpwi(3, 7, 0) << add(3, 3, 6) << add(3, 3, 5) << blr();
+        a.Bind(skip);
+        a << add(3, 3, 6) << blr();
+        std::vector<CpuContext> states;
+        for (uint32_t ctr : {1u, 2u, 3u}) {
+            for (int eq = 0; eq < 2; ++eq) {
+                CpuContext c = BaseState(rng);
+                c.ctr = ctr;
+                c.gpr[5] = 10;
+                c.gpr[6] = eq ? 13u : 99u;  // after addi(5,5,3), r5 == 13
+                states.push_back(c);
+            }
+        }
+        AddProgram("subf d==a and fused cmpw+bc useCtr+useCond GPR cache", a, states);
+    }
+    {
+        // Direct jmp rel32 link and retire: run a linked jump, rewrite the target block to trigger Retire, run again.
+        const uint32_t base = kSlotBase + (kSlotCount + 8) * kSlotBytes;
+        const uint32_t targetPc = base + 0x40u;
+        Asm entryAsm;
+        entryAsm << addi(3, 3, 1);
+        entryAsm.BAbs(targetPc);
+        const std::vector<uint32_t> entryWords = entryAsm.Finish().Resolve(base);
+        for (size_t i = 0; i < entryWords.size(); ++i) Memory::Write32(base + 4u * static_cast<uint32_t>(i), entryWords[i]);
+        Memory::Write32(targetPc + 0, addi(3, 3, 10));
+        Memory::Write32(targetPc + 4, blr());
+        CpuContext ctx{};
+        ctx.lr = kReturn;
+        ctx.gpr[1] = kDataBase + 0x1800u;
+        ctx.gpr[3] = 5;
+        CHECK(RunJit(base, ctx) == 16);
+        ctx.gpr[3] = 5;
+        CHECK(RunJit(base, ctx) == 16);  // linked direct jmp rel32
+        // Rewrite targetPc so Retire() must unpatch the direct jmp rel32 back to its stub
+        Memory::Write32(targetPc + 0, addi(3, 3, 100));
+        ctx.gpr[3] = 5;
+        CHECK(RunJit(base, ctx) == 106);
+        ctx.gpr[3] = 5;
+        CHECK(RunJit(base, ctx) == 106);  // re-linked to rebuilt target
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1574,6 +1627,7 @@ int main() {
     Loops();
     NativeAndLinking();
     HotLoopsStayCompiled();
+    GprCacheAndDirectLinkRegressions();
     std::printf("jit branch: %u programs, %llu guest runs, %d checks, %u failures\n", g_cases, static_cast<unsigned long long>(g_runs),
                 g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

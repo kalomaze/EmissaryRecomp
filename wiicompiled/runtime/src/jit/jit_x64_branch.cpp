@@ -51,7 +51,10 @@ void EmitCompareFlags(BlockEmitter& e, const Compare& c) {
         if (c.imm == 0) e.a.test(eax, eax);  // the same flags as cmp eax, 0
         else e.a.cmp(eax, static_cast<uint32_t>(c.imm));
         break;
-    case Compare::Reg: e.a.cmp(eax, e.Gpr(c.reg)); break;
+    case Compare::Reg:
+        if (e.WantCacheGpr(c.reg)) e.a.cmp(eax, e.ReadGpr(c.reg));
+        else e.a.cmp(eax, e.Gpr(c.reg));
+        break;
     case Compare::Test: e.a.test(eax, eax); break;
     }
 }
@@ -126,7 +129,8 @@ void EmitJumpIfBit(BlockEmitter& e, const Compare& c, uint32_t bit, bool want, X
 // The taken path of a bc: leave for the target. When the bc's compare did not write its CR field (`cmp` and `dead`: nothing
 // in the block reads the field after it, BlockEmitter::CrDead), the field is written here, from the compare made again (eax still
 // holds its first operand), because the block is left with the condition register visible.
-void EmitTaken(BlockEmitter& e, uint32_t target, const Compare* cmp, bool dead) {
+void EmitTaken(BlockEmitter& e, uint32_t target, const Compare* cmp, bool dead, const BlockEmitter::GprSnapshot& snap) {
+    e.EmitFlushSnapshot(snap);
     if (dead) {
         EmitCompareValue(e, *cmp, false);
         e.CrStore(cmp->field);
@@ -146,10 +150,14 @@ void EmitBc(BlockEmitter& e, const Op& bc, const Compare* cmp, bool dead) {
     const bool onFlags = dead && useCond && (bi >> 2) == cmp->field && (bi & 3u) != 3u;
     const bool want = (bo & 0x08u) != 0;
     if (!useCtr && !useCond) {
-        EmitTaken(e, bc.imm, cmp, dead);
+        const BlockEmitter::GprSnapshot snap = e.SnapshotGprs();
+        EmitTaken(e, bc.imm, cmp, dead, snap);
         return;
     }
     if (dead) {
+        // Pre-warm the second compare operand before any conditional branch (useCtr) so the GPR cache state
+        // is identical on both the ctr-fail skip path and the compare fall-through path.
+        if (onFlags && cmp->source == Compare::Reg && e.WantCacheGpr(cmp->reg)) (void)e.ReadGpr(cmp->reg);
         Xbyak::Label& taken = e.NewLabel();
         Xbyak::Label skip;
         if (useCtr) {  // --ctr, always, even when the condition then fails; ZF is the new ctr == 0
@@ -172,14 +180,16 @@ void EmitBc(BlockEmitter& e, const Op& bc, const Compare* cmp, bool dead) {
             }
         }
         a.L(skip);
+        const BlockEmitter::GprSnapshot snap = e.SnapshotGprs();
         const Compare c = *cmp;
         const uint32_t target = bc.imm;
-        e.Cold([&taken, c, target](BlockEmitter& cold) {
+        e.Cold([&taken, c, target, snap](BlockEmitter& cold) {
             cold.a.L(taken);
-            EmitTaken(cold, target, &c, true);
+            EmitTaken(cold, target, &c, true, snap);
         });
         return;
     }
+    const BlockEmitter::GprSnapshot snap = e.SnapshotGprs();
     Xbyak::Label skip;
     if (useCtr) {  // --ctr, always, even when the condition then fails; ZF is the new ctr == 0
         a.sub(e.Ctr(), 1);
@@ -187,6 +197,7 @@ void EmitBc(BlockEmitter& e, const Op& bc, const Compare* cmp, bool dead) {
         else a.jz(skip, T);
     }
     if (useCond) EmitJumpIfCrBit(e, bi, !want, skip, T);
+    e.EmitFlushSnapshot(snap);
     e.ExitLinked(bc.imm);
     a.L(skip);
 }
@@ -208,6 +219,8 @@ void EmitBcLive(BlockEmitter& e, const Op& bc, const Compare& c) {
     const uint32_t bo = bc.d, bi = bc.a;
     const bool useCtr = (bo & 0x04u) == 0;
     const bool want = (bo & 0x08u) != 0;
+    if (useCtr && c.source == Compare::Reg) e.FlushGpr(c.reg);  // ctrFail cold path reads Gpr(c.reg) from memory
+    const BlockEmitter::GprSnapshot snap = e.SnapshotGprs();
     Xbyak::Label& taken = e.NewLabel();
     Xbyak::Label* ctrFail = nullptr;
     Xbyak::Label& join = e.NewLabel();
@@ -225,8 +238,9 @@ void EmitBcLive(BlockEmitter& e, const Op& bc, const Compare& c) {
     a.L(join);
     const Compare cmp = c;
     const uint32_t target = bc.imm;
-    e.Cold([&taken, cmp, target](BlockEmitter& cold) {
+    e.Cold([&taken, cmp, target, snap](BlockEmitter& cold) {
         cold.a.L(taken);
+        cold.EmitFlushSnapshot(snap);
         cold.CrStore(cmp.field);
         cold.ExitLinked(target);
     });
@@ -244,30 +258,39 @@ void EmitBcLive(BlockEmitter& e, const Op& bc, const Compare& c) {
 uint32_t EmitFusedCompare(BlockEmitter& e, uint32_t index) {
     const Op& o = e.block.ops[index];
     CodeGenerator& a = e.a;
+    const auto loadToEax = [&](uint32_t r) {
+        if (e.WantCacheGpr(r)) a.mov(eax, e.ReadGpr(r));
+        else a.mov(eax, e.Gpr(r));
+    };
     Compare c{};
     switch (o.kind) {
     case K::CmpwiBc:
         c = {Compare::Imm, true, static_cast<uint32_t>(o.d) >> 2u, static_cast<int32_t>(o.imm), 0};
-        a.mov(eax, e.Gpr(o.a));
+        loadToEax(o.a);
         break;
     case K::CmplwiBc:
         c = {Compare::Imm, false, static_cast<uint32_t>(o.d) >> 2u, static_cast<int32_t>(o.imm), 0};
-        a.mov(eax, e.Gpr(o.a));
+        loadToEax(o.a);
         break;
     case K::CmpwBc:
         c = {Compare::Reg, true, static_cast<uint32_t>(o.d) >> 2u, 0, o.b};
-        a.mov(eax, e.Gpr(o.a));
+        loadToEax(o.a);
         break;
     case K::CmplwBc:
         c = {Compare::Reg, false, static_cast<uint32_t>(o.d) >> 2u, 0, o.b};
-        a.mov(eax, e.Gpr(o.a));
+        loadToEax(o.a);
         break;
     default:  // RlwinmRcBc: r[a] = rotl(r[d], b) & mask; CR0 from it
         c = {Compare::Test, true, 0, 0, 0};
-        a.mov(eax, e.Gpr(o.d));
+        loadToEax(o.d);
         if (o.b != 0) a.rol(eax, static_cast<uint8_t>(o.b & 31u));
         a.and_(eax, o.imm);
-        a.mov(e.Gpr(o.a), eax);
+        if (e.GprReadLater(o.a)) {
+            a.mov(e.WriteGpr(o.a), eax);
+        } else {
+            e.DropGpr(o.a);
+            a.mov(e.Gpr(o.a), eax);
+        }
         break;
     }
     const Op& bc = e.block.ops[index + 1];
@@ -302,9 +325,8 @@ void EmitReturnOrJump(BlockEmitter& e) {
     a.and_(ecx, ~3u);
     a.cmp(eax, ecx);
     a.jne(notReturn, CodeGenerator::T_SHORT);
-    a.cmp(e.Form(1), static_cast<uint32_t>(Form::Paired));
-    a.je(paired);
-    a.mov(e.Form(1), static_cast<uint32_t>(Form::Scalar));
+    a.test(e.PairedMask(), 2u);  // bit 1: f1 is Paired
+    a.jnz(paired);
     e.ExitReturn();
     e.Cold([&paired](BlockEmitter& c) {
         c.a.L(paired);
@@ -367,29 +389,42 @@ void EmitCallThroughShim(BlockEmitter& e, uint32_t index, bool isBl, uint32_t ta
 
 // Jumps to `loop` when the frame is the rollback loop frame (BrawlRollback::LoopCall decides its calls).
 void EmitLoopFrameTest(BlockEmitter& e, Xbyak::Label& loop) {
-    e.a.mov(rax, reinterpret_cast<uint64_t>(JitRollbackLoopFrameCell()));
-    e.a.cmp(kFrame, e.a.qword[rax]);
-    e.a.je(loop, CodeGenerator::T_NEAR);
+    e.a.test(e.FrameFlags(), kFrameFlagLoopFrame);
+    e.a.jnz(loop, CodeGenerator::T_NEAR);
 }
 
-// The float arguments of the callee `t` as Call leaves them: each register of t's argument mask held in paired form becomes the
-// scalar it stands for (JitNormalizeArgs does all of them). Tested in line, a byte each, for the few registers a callee usually
-// names; true then, and the Prepared shims are the ones to call. False: not tested here (more registers than are worth a test
-// each), and the shim does it.
-bool EmitArgTests(BlockEmitter& e, const JitCallTarget& t) {
-    if (t.argCount == 0) return true;
-    if (t.argCount > 4) return false;
+// Tests whether any float argument register named in `t.argMask` is currently held in paired form; if so, calls
+// JitNormalizeArgs out of line and rejoins. Always leaves all of t's float arguments in scalar form.
+void EmitStaticArgTest(BlockEmitter& e, const JitCallTarget& t) {
+    if (t.argMask == 0) return;
+    Xbyak::Label& convert = e.NewLabel();
+    Xbyak::Label& done = e.NewLabel();
+    e.a.test(e.PairedMask(), t.argMask);
+    e.a.jnz(convert, CodeGenerator::T_NEAR);
+    e.a.L(done);
+    const JitCallTarget* const tp = &t;
+    e.Cold([&convert, &done, tp](BlockEmitter& c) {
+        c.a.L(convert);
+        c.CallHelper(&JitNormalizeArgs, kFrame, tp);
+        c.a.jmp(done, CodeGenerator::T_NEAR);
+    });
+}
+
+// Finishes a direct tail call whose saved return address (lr & ~3) sits in ebp: clears f1's paired bit, restores lr,
+// and either returns from the frame or continues at ebp through the inline cache.
+void EmitDirectTailFinish(BlockEmitter& e) {
     CodeGenerator& a = e.a;
-    Xbyak::Label convert, done;
-    for (uint32_t i = 0; i < t.argCount; ++i) {
-        a.cmp(e.Form(t.argRegs[i]), static_cast<uint32_t>(Form::Paired));
-        if (i + 1 < t.argCount) a.je(convert, CodeGenerator::T_SHORT);
-        else a.jne(done, CodeGenerator::T_SHORT);
-    }
-    a.L(convert);
-    e.CallHelper(&JitNormalizeArgs, kFrame, &t);
-    a.L(done);
-    return true;
+    Xbyak::Label returned;
+    a.and_(e.PairedMask(), ~2u);
+    a.mov(e.Lr(), ebp);
+    a.mov(ecx, a.dword[kFrame + static_cast<int>(offsetof(Frame, returnAddress))]);
+    a.and_(ecx, ~3u);
+    a.cmp(ebp, ecx);
+    a.je(returned, CodeGenerator::T_SHORT);
+    a.mov(eax, ebp);
+    e.ExitDynamicCached(0);
+    a.L(returned);
+    e.ExitReturn();
 }
 
 // A call to a translated function with a raw dispatch record (`t`), as thin as Call makes it. The caller has stored nothing yet.
@@ -400,13 +435,40 @@ void EmitThinBl(BlockEmitter& e, uint32_t index, const JitCallTarget& t) {
     const uint32_t target = t.target;
     Xbyak::Label& loopFrame = e.NewLabel();
     Xbyak::Label& resume = e.NewLabel();
-    Xbyak::Label& pending = e.NewLabel();
     a.mov(e.Pc(), pc);
     a.mov(e.Lr(), pc + 4);
     EmitLoopFrameTest(e, loopFrame);
-    const bool prepared = EmitArgTests(e, t);
-    if (prepared) e.CallHelper(&JitThinCallPrepared, kFrame, &t);
-    else e.CallHelper(&JitThinCall, kFrame, &t);
+    EmitStaticArgTest(e, t);
+    if (kDirectCalls && (t.fastDirect || (t.fprsOnly && !t.returnsPaired && !t.special))) {
+        if (t.fastDirect) {
+            if (t.patchedByte != nullptr && *t.patchedByte != 0) {
+                a.mov(eax, target);
+                a.mov(rdx, reinterpret_cast<uint64_t>(&t));
+                e.CallSubCall();
+            } else {
+                a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
+                e.CallRaw(reinterpret_cast<const void*>(t.entry));
+            }
+        } else {
+            a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
+            a.mov(ArgReg(1), reinterpret_cast<uint64_t>(&t));
+            e.CallRaw(reinterpret_cast<const void*>(&JitDirectFprsCall));
+        }
+        a.and_(e.PairedMask(), ~2u);
+        a.L(resume);
+        e.EmitRecheck(pc + 4);
+        e.Cold([&loopFrame, &resume, index, target](BlockEmitter& c) {
+            c.a.L(loopFrame);
+            c.CallHelper(&JitCallOp, kFrame, &c.block, index);
+            c.a.mov(rcx, rax);
+            c.a.shr(rcx, 32);
+            c.a.jz(resume, CodeGenerator::T_NEAR);
+            EmitNotMade(c, true, target);
+        });
+        return;
+    }
+    Xbyak::Label& pending = e.NewLabel();
+    e.CallHelper(&JitThinCallPrepared, kFrame, &t);
     a.test(rax, rax);
     a.jnz(pending, CodeGenerator::T_NEAR);
     a.L(resume);
@@ -451,9 +513,7 @@ uint32_t EmitBl(BlockEmitter& e, uint32_t index) {
     Xbyak::Label& cont = e.NewLabel();
     a.mov(e.Pc(), pc);
     a.mov(e.Lr(), pc + 4);
-    a.mov(rax, reinterpret_cast<uint64_t>(JitRollbackLoopFrameCell()));
-    a.cmp(kFrame, a.qword[rax]);
-    a.je(loopFrame, CodeGenerator::T_NEAR);
+    EmitLoopFrameTest(e, loopFrame);
     e.ExitLinked(target);
     // Reached only from the loop-frame path below, when BrawlRollback::LoopCall skipped the call
     a.L(cont);
@@ -480,14 +540,66 @@ uint32_t EmitBctrl(BlockEmitter& e, uint32_t index) {
     Xbyak::Label& cell = e.NewCell();
     Xbyak::Label& generic = e.NewLabel();
     Xbyak::Label& resume = e.NewLabel();
-    Xbyak::Label& pending = e.NewLabel();
     a.mov(e.Pc(), pc);
     a.mov(e.Lr(), pc + 4);
     EmitLoopFrameTest(e, generic);
-    // The cell holds the last translated target this site called and its record; the key is the ctr it was found for.
+    // The cell holds the last translated targets this site called and their records; the key is the ctr it was found for.
     a.mov(eax, e.Ctr());
     a.and_(eax, ~3u);
     e.CellProbe(cell, generic);
+    if (kDirectCalls) {
+        Xbyak::Label& guarded = e.NewLabel();
+        Xbyak::Label& norm = e.NewLabel();
+        Xbyak::Label& afterNorm = e.NewLabel();
+        Xbyak::Label& subCallPath = e.NewLabel();
+        Xbyak::Label& afterCall = e.NewLabel();
+        Xbyak::Label aotCall;
+        a.cmp(a.byte[rdx + static_cast<int>(offsetof(JitCallTarget, fastDirect))], 0);
+        a.je(guarded, CodeGenerator::T_NEAR);
+        a.mov(ecx, a.dword[rdx + static_cast<int>(offsetof(JitCallTarget, argMask))]);
+        a.test(e.PairedMask(), ecx);
+        a.jnz(norm, CodeGenerator::T_NEAR);
+        a.L(afterNorm);
+        a.mov(rcx, a.qword[rdx + static_cast<int>(offsetof(JitCallTarget, patchedByte))]);
+        a.test(rcx, rcx);
+        a.jz(aotCall, CodeGenerator::T_SHORT);
+        a.cmp(a.byte[rcx], 0);
+        a.jne(subCallPath, CodeGenerator::T_NEAR);
+        a.L(aotCall);
+        a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
+        a.call(a.qword[rdx + static_cast<int>(offsetof(JitCallTarget, entry))]);
+        a.L(afterCall);
+        a.and_(e.PairedMask(), ~2u);
+        a.L(resume);
+        e.EmitRecheck(pc + 4);
+        e.Cold([&subCallPath, &afterCall](BlockEmitter& c) {
+            c.a.L(subCallPath);
+            c.a.mov(eax, c.a.dword[rdx + static_cast<int>(offsetof(JitCallTarget, target))]);
+            c.CallSubCall();
+            c.a.jmp(afterCall, CodeGenerator::T_NEAR);
+        });
+        e.Cold([&norm, &afterNorm, &guarded, &generic, &resume, &cell, index](BlockEmitter& c) {
+            c.a.L(norm);
+            c.a.mov(rbp, rdx);
+            c.CallHelper(&JitNormalizeArgs, kFrame, rdx);
+            c.a.mov(rdx, rbp);
+            c.a.jmp(afterNorm, CodeGenerator::T_NEAR);
+            c.a.L(guarded);
+            c.CallHelper(&JitThinCall, kFrame, rdx);
+            c.a.test(rax, rax);
+            c.a.jz(resume, CodeGenerator::T_NEAR);
+            c.ExitPending();
+            c.a.L(generic);
+            c.a.lea(r10, c.a.ptr[c.a.rip + cell]);
+            c.CallHelper(&JitCallOpCached, kFrame, &c.block, index, r10);
+            c.a.mov(rcx, rax);
+            c.a.shr(rcx, 32);
+            c.a.jz(resume, CodeGenerator::T_NEAR);
+            EmitNotMade(c, false, 0);
+        });
+        return 1;
+    }
+    Xbyak::Label& pending = e.NewLabel();
     e.CallHelper(&JitThinCall, kFrame, rdx);
     a.test(rax, rax);
     a.jnz(pending, CodeGenerator::T_NEAR);
@@ -538,16 +650,23 @@ uint32_t EmitB(BlockEmitter& e, uint32_t index) {
         return 1;
     }
     // A tail call: the callee runs, then the frame returns, or goes on at lr (JitTailOp). When the callee has a raw dispatch
-    // record, JitThinTail: its facts were settled here; the loop frame, whose tail calls BrawlRollback::LoopCall decides,
-    // goes the general way.
+    // record, call directly when fastDirect, else JitThinTailPrepared; the loop frame goes the general way.
     const JitCallTarget* const t = JitCallTargetFor(o.imm);
     if (t != nullptr) {
         Xbyak::Label& loopFrame = e.NewLabel();
         a.mov(e.Pc(), e.PcOf(index));
         EmitLoopFrameTest(e, loopFrame);
-        if (EmitArgTests(e, *t)) e.CallHelper(&JitThinTailPrepared, kFrame, t);
-        else e.CallHelper(&JitThinTail, kFrame, t);
-        EmitTailResult(e);
+        EmitStaticArgTest(e, *t);
+        if (kDirectCalls && t->fastDirect) {
+            a.mov(ebp, e.Lr());
+            a.and_(ebp, ~3u);
+            a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
+            e.CallRaw(reinterpret_cast<const void*>(t->entry));
+            EmitDirectTailFinish(e);
+        } else {
+            e.CallHelper(&JitThinTailPrepared, kFrame, t);
+            EmitTailResult(e);
+        }
         e.Cold([&loopFrame, index](BlockEmitter& c) {
             c.a.L(loopFrame);
             c.CallHelper(&JitTailOp, kFrame, &c.block, index);
@@ -575,8 +694,35 @@ uint32_t EmitBctr(BlockEmitter& e, uint32_t index) {
     e.CellProbe(cell, generic);
     a.mov(e.Pc(), pc);
     EmitLoopFrameTest(e, generic);
-    e.CallHelper(&JitThinTail, kFrame, rdx);
-    EmitTailResult(e);
+    if (kDirectCalls) {
+        Xbyak::Label& guarded = e.NewLabel();
+        Xbyak::Label& norm = e.NewLabel();
+        Xbyak::Label& afterNorm = e.NewLabel();
+        a.cmp(a.byte[rdx + static_cast<int>(offsetof(JitCallTarget, fastDirect))], 0);
+        a.je(guarded, CodeGenerator::T_NEAR);
+        a.mov(ecx, a.dword[rdx + static_cast<int>(offsetof(JitCallTarget, argMask))]);
+        a.test(e.PairedMask(), ecx);
+        a.jnz(norm, CodeGenerator::T_NEAR);
+        a.L(afterNorm);
+        a.mov(ebp, e.Lr());
+        a.and_(ebp, ~3u);
+        a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
+        a.call(a.qword[rdx + static_cast<int>(offsetof(JitCallTarget, entry))]);
+        EmitDirectTailFinish(e);
+        e.Cold([&norm, &afterNorm, &guarded](BlockEmitter& c) {
+            c.a.L(norm);
+            c.a.mov(rbp, rdx);
+            c.CallHelper(&JitNormalizeArgs, kFrame, rdx);
+            c.a.mov(rdx, rbp);
+            c.a.jmp(afterNorm, CodeGenerator::T_NEAR);
+            c.a.L(guarded);
+            c.CallHelper(&JitThinTail, kFrame, rdx);
+            EmitTailResult(c);
+        });
+    } else {
+        e.CallHelper(&JitThinTail, kFrame, rdx);
+        EmitTailResult(e);
+    }
     a.L(generic);
     a.lea(r10, a.ptr[a.rip + cell]);
     e.CallHelper(&JitTailOpCached, kFrame, &e.block, index, r10);

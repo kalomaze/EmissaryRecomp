@@ -104,7 +104,9 @@ void Cr0FromGpr(BlockEmitter& e, uint32_t r) {
         BlockEmitter::NoteCr(BlockEmitter::CrEvent::WriteSkipped);
         return;
     }
-    e.a.movsxd(rax, e.Gpr(r));
+    const int hit = e.FindCachedGpr(r);
+    if (hit >= 0) e.a.movsxd(rax, BlockEmitter::GprCacheReg(static_cast<uint32_t>(hit)));
+    else e.a.movsxd(rax, e.Gpr(r));
     e.CrStore(0);
 }
 

@@ -32,6 +32,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -317,7 +318,7 @@ namespace {
 // posture-scale call, then consumes it with ps_muls0. Forgetting its scalar tag
 // interprets double 1.0 as packed float 1.875 and changes jump velocity.
 void NormalizeCallFloatReturn(Frame& f) {
-    f.form[1] = Form::Scalar;
+    f.pairedMask &= ~2u;
 }
 
 // The float ABI translated callers assume of a translated callee (guest_float_abi.h); null for anything without an
@@ -348,9 +349,12 @@ const MkwGuestFloatAbi* FloatAbiOf(uint32_t target) {
 // not read that way keep their paired form (P+ code keeps paired values in volatile FPRs across calls).
 void NormalizeCallFloatArguments(Frame& f, const MkwGuestFloatAbi* abi) {
     if (abi == nullptr) return;
-    uint32_t r = 1;
-    for (uint32_t mask = (abi->scalarFloatArgMask & 0x3FFEu) >> 1; mask != 0; mask >>= 1, ++r)  // up to its last f
-        if ((mask & 1u) != 0 && f.form[r] == Form::Paired) SetScalar(f, r, Scalar(f, r));
+    uint32_t m = f.pairedMask & (abi->scalarFloatArgMask & 0x3FFEu);
+    while (m != 0) {
+        const uint32_t r = static_cast<uint32_t>(__builtin_ctz(m));
+        m &= m - 1u;
+        SetScalar(f, r, Scalar(f, r));
+    }
 }
 
 // After it (EmitNormalizeGuestCallFloatReturn): a callee that returns a paired scalar leaves f1 in paired form.
@@ -456,16 +460,20 @@ bool TailCallEntry(Frame& f, void (*entry)(CpuContext*), uint32_t returnAddress)
 // A call from compiled code to a translated function does what Call and TryDispatchRawCpuTarget do, with everything they look
 // up decided once per target (JitCallTarget): the rest in this order, as they do it.
 
-static const JitCallTarget* JitCallTargetForSlow(uint32_t target) noexcept;
+static PatchedHooks g_patchedHooks;
 
+void RegisterPatchedHooks(const PatchedHooks& hooks) noexcept { g_patchedHooks = hooks; }
+const PatchedHooks& GetPatchedHooks() noexcept { return g_patchedHooks; }
+
+static const JitCallTarget* JitCallTargetForSlow(uint32_t target) noexcept;
 
 const JitCallTarget* JitCallTargetFor(uint32_t target) noexcept {
     // The records never change once the registry is published: the last answers are kept per thread (a null answer too).
     struct Memo { uint32_t target; bool valid; const JitCallTarget* record; };
-    constexpr uint32_t kMemo = 1024;
+    constexpr uint32_t kMemo = 2048;
     thread_local Memo memo[kMemo];
     if (!TranslatedFunctionRegistry::IsLookupPublished()) return nullptr;
-    Memo& m = memo[((target >> 2) ^ (target >> 12)) & (kMemo - 1u)];
+    Memo& m = memo[((target >> 2) * 0x9E3779B1u) >> 21];
     if (m.valid && m.target == target) return m.record;
     const JitCallTarget* const record = JitCallTargetForSlow(target);
     m = Memo{target, true, record};
@@ -487,6 +495,7 @@ static const JitCallTarget* JitCallTargetForSlow(uint32_t target) noexcept {
         record->target = target;
         record->address = raw->address;
         record->entry = raw->entry;
+        record->patchedByte = g_patchedHooks.patchedByteFor != nullptr ? g_patchedHooks.patchedByteFor(target) : nullptr;
         record->fprMask = raw->nonvolatileFprWriteMask & kPpcAllNonvolatileFprMask;
         record->preserveGprs = raw->preserveNonvolatileGprs;
         if (const uint32_t m = record->fprMask; m != 0) {
@@ -501,13 +510,10 @@ static const JitCallTarget* JitCallTargetForSlow(uint32_t target) noexcept {
         record->special = target == 0x80017618u || target == 0x8002A210u || target == 0x80029438u;
         const MkwGuestFloatAbi* const abi = FloatAbiSearch(target);
         record->returnsPaired = abi != nullptr && abi->returnsPairedScalarFloat != 0;
-        record->argMask = abi != nullptr ? (abi->scalarFloatArgMask & 0x3FFEu) >> 1 : 0u;
-        for (uint32_t m = record->argMask, r = 1; m != 0; m >>= 1, ++r)
-            if ((m & 1u) != 0) record->argRegs[record->argCount++] = static_cast<uint8_t>(r);
-        record->argRounded = record->argCount == 0 ? 0 : record->argCount <= 4 ? 4 : record->argCount <= 8 ? 8 : 16;
-        for (uint32_t i = record->argCount; i < 16; ++i) record->argRegs[i] = static_cast<uint8_t>(kFormZero);
+        record->argMask = abi != nullptr ? (abi->scalarFloatArgMask & 0x3FFEu) : 0u;
         record->lean = record->fprMask == 0 && !record->preserveGprs;
         record->fprsOnly = record->fprMask != 0 && !record->preserveGprs;
+        record->fastDirect = record->lean && !record->returnsPaired && !record->special;
     }
     (*table)[target] = record;
     return record;
@@ -515,33 +521,18 @@ static const JitCallTarget* JitCallTargetForSlow(uint32_t target) noexcept {
 
 namespace {
 
-// NormalizeCallFloatArguments for a mask worked out beforehand (JitCallTarget::argMask). The paired ones are rare: NormalizeArgs
-// looks at the form bytes first.
+// NormalizeCallFloatArguments for a mask worked out beforehand (JitCallTarget::argMask, bit r for f1..f13).
 inline void NormalizeArgMask(Frame& f, uint32_t mask) {
-    uint32_t r = 1;
-    for (; mask != 0; mask >>= 1, ++r)
-        if ((mask & 1u) != 0 && f.form[r] == Form::Paired) SetScalar(f, r, Scalar(f, r));
+    uint32_t m = f.pairedMask & mask;
+    while (m != 0) {
+        const uint32_t r = static_cast<uint32_t>(__builtin_ctz(m));
+        m &= m - 1u;
+        SetScalar(f, r, Scalar(f, r));
+    }
 }
 
-// NormalizeArgMask for a target's argument registers, by their form bytes. The paired ones are rare, so the bytes are read (one at a
-// time, which the byte stores compiled code made to them a moment ago forward; one wide read of them would not) and combined
-// without a branch each: Paired is the only form with bit 1 set. Padding entries read Frame::formZero.
 inline void NormalizeArgs(Frame& f, const JitCallTarget& t) {
-    const uint8_t* const forms = reinterpret_cast<const uint8_t*>(f.form);
-    uint32_t any = 0;
-    switch (t.argRounded) {
-    case 16:
-        for (uint32_t i = 8; i < 16; ++i) any |= forms[t.argRegs[i]];
-        [[fallthrough]];
-    case 8:
-        for (uint32_t i = 4; i < 8; ++i) any |= forms[t.argRegs[i]];
-        [[fallthrough]];
-    case 4:
-        for (uint32_t i = 0; i < 4; ++i) any |= forms[t.argRegs[i]];
-        break;
-    default: break;
-    }
-    if ((any & 2u) != 0) NormalizeArgMask(f, t.argMask);
+    if ((f.pairedMask & t.argMask) != 0) NormalizeArgMask(f, t.argMask);
 }
 
 // The FPRs of `mask` (bits 14-31 as PpcNonvolatileFprGuard keeps them) to and from the record's slots.
@@ -600,10 +591,10 @@ MKW_PPC_NO_INLINE void EnterUnderContext(CpuContext* cpu, void (*entry)(CpuConte
     entry(cpu);
 }
 
-// ThinDispatch for a target with no guard to keep (JitCallTarget::lean): the execution address scope and the context test, in
-// the caller's frame (the guarded path below has a large frame of its own that this one must not pay for).
+// ThinDispatch for a target with no guard to keep (JitCallTarget::lean): sets the diagnostic address without restoring
+// (same as MkwInvokeIndirectCpuSite) and invokes the entry.
 inline void ThinLean(CpuContext* cpu, const JitCallTarget& t) {
-    RecompMod::ScopedTranslatedExecutionAddress translatedExecution(t.address);
+    if (t.address != 0) RecompMod::g_currentTranslatedExecutionAddress = t.address;
     if (TryGetCpuContext() != cpu) EnterUnderContext(cpu, t.entry);
     else t.entry(cpu);
 }
@@ -630,9 +621,10 @@ MKW_PPC_NO_INLINE void ThinGuarded(CpuContext* cpu, const JitCallTarget& t) {
     }
 }
 
-// ThinDispatch for a target with FPRs to keep and no GPR guard: the execution address scope, the FPR guard, the context test.
+// ThinDispatch for a target with FPRs to keep and no GPR guard: sets diagnostic address without restoring,
+// builds the FPR guard, and invokes the entry.
 MKW_PPC_NO_INLINE void ThinFprs(CpuContext* cpu, const JitCallTarget& t) {
-    RecompMod::ScopedTranslatedExecutionAddress translatedExecution(t.address);
+    if (t.address != 0) RecompMod::g_currentTranslatedExecutionAddress = t.address;
     ThinFprGuard fprGuard(cpu, t);
     if (TryGetCpuContext() != cpu) EnterUnderContext(cpu, t.entry);
     else t.entry(cpu);
@@ -644,11 +636,9 @@ inline void ThinDispatch(CpuContext* cpu, const JitCallTarget& t) {
     else ThinGuarded(cpu, t);
 }
 
-// What Call does after the callee returns. The form byte is written only when it changes (the value is the same): a byte store
-// that follows every call would keep the next wide read of the forms from being forwarded from the store buffer.
 inline void ThinAfterCall(Frame& f, const JitCallTarget& t) {
     if (t.returnsPaired) f.ctx->fpr[1].d = PPC_PsToScalarInline(f.ctx->fpr[1].d);  // NormalizeCalleeFloatReturn
-    if (f.form[1] != Form::Scalar) f.form[1] = Form::Scalar;                      // NormalizeCallFloatReturn
+    f.pairedMask &= ~2u;                                                          // NormalizeCallFloatReturn
 }
 
 template <bool Normalize>
@@ -700,15 +690,35 @@ inline void RememberTarget(JitTargetCell* cell, uint32_t target, const JitCallTa
 }
 }  // namespace
 
+void JitDirectFprsCall(CpuContext* cpu, const JitCallTarget* t) {
+    if (t->address != 0) RecompMod::g_currentTranslatedExecutionAddress = t->address;
+    ThinFprGuard fprGuard(cpu, *t);
+    if (__builtin_expect(TryGetCpuContext() != cpu, 0)) EnterUnderContext(cpu, t->entry);
+    else t->entry(cpu);
+}
+
 uint64_t JitCallOpCached(Frame* f, const Block* b, uint32_t index, JitTargetCell* cell) noexcept {
     const uint32_t target = f->ctx->ctr & ~3u;
-    if (const JitCallTarget* t = JitCallTargetFor(target); t != nullptr && !t->special) RememberTarget(cell, target, t);
+    const JitCallTarget* const t = JitCallTargetFor(target);
+    if (t != nullptr && !t->special) {
+        RememberTarget(cell, target, t);
+        if (__builtin_expect((f->flags & kFrameFlagLoopFrame) == 0, 1)) {
+            return ThinCallImpl<true>(f, t);
+        }
+    }
     return JitCallOp(f, b, index);
 }
 
 uint64_t JitTailOpCached(Frame* f, const Block* b, uint32_t index, JitTargetCell* cell) noexcept {
     const uint32_t target = f->ctx->ctr & ~3u;
-    if (const JitCallTarget* t = JitCallTargetFor(target)) RememberTarget(cell, target, t);
+    const JitCallTarget* const t = JitCallTargetFor(target);
+    if (t != nullptr) {
+        RememberTarget(cell, target, t);
+        if (__builtin_expect(!t->special && (f->flags & kFrameFlagLoopFrame) == 0, 1)) {
+            f->ctx->pc = b->pcs[index];
+            return ThinTailImpl<true>(f, t);
+        }
+    }
     return JitTailOp(f, b, index);
 }
 
@@ -742,7 +752,7 @@ Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddr
             break;
         }
         case 40: SetPaired(f, d, PPC_PsNegInline(Paired(f, b))); break;
-        case 72: if (f.form[b] == Form::Scalar) SetScalar(f, d, c->fpr[b].d); else SetPaired(f, d, c->fpr[b].d); break;
+        case 72: c->fpr[d] = c->fpr[b]; CopyForm(f, d, b); break;
         case 136: SetPaired(f, d, PPC_PsNegInline(PPC_PsAbsInline(Paired(f, b)))); break;
         case 264: SetPaired(f, d, PPC_PsAbsInline(Paired(f, b))); break;
         case 528: SetPaired(f, d, PPC_PsMerge00Inline(Paired(f, a), Paired(f, b))); break;
@@ -1147,12 +1157,12 @@ Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddr
         case 64: PPC_Mcrfs(d >> 2, a >> 2); break;  // writes the field itself
         case 72:  // fmr: copies whichever form the source holds
             c->fpr[d] = c->fpr[b];
-            f.form[d] = f.form[b];
+            CopyForm(f, d, b);
             break;
         case 134: PPC_Mtfsfi(d >> 2, Bits(w, 12, 4)); break;
         case 136: SetScalar(f, d, -std::fabs(Scalar(f, b))); break;  // fnabs
         case 264: SetScalar(f, d, std::fabs(Scalar(f, b))); break;   // fabs
-        case 583: c->fpr[d].raw = c->fpscr; f.form[d] = Form::Scalar; break;  // mffs
+        case 583: c->fpr[d].raw = c->fpscr; f.pairedMask &= ~(1u << (d & 31u)); break;  // mffs
         case 711: PPC_Mtfsf(Bits(w, 17, 8), c->fpr[b].d); break;
         default: Undefined(c, pc, w, "interpreter: opcode 63");
         }
@@ -1457,6 +1467,7 @@ struct BlockCache {
     static constexpr uint32_t kSlots = 16384;
     static uint32_t SlotOf(uint32_t pc) { return ((pc >> 2) ^ (pc >> 16)) & (kSlots - 1u); }
     Slot slots[kSlots] = {};
+    FastEntrySlot fastEntries[kFastEntrySlots] = {};  // L1 cache of compiled, logged, non-hook entries -> jitChecked
     std::unordered_map<uint32_t, Block*> blocks;
     // Blocks are packed into chunks in the order they are built, so code that runs together sits together.
     static constexpr size_t kChunkBytes = 256 * 1024;
@@ -1465,6 +1476,7 @@ struct BlockCache {
     size_t chunkLeft = 0;
     size_t bytes = 0;
     unsigned depth = 0;  // Runs active on this thread: blocks they may still hold must stay
+    bool overLimit = false;  // bytes > kMaxCacheBytes || JitBytes() > MaxJitCodeBytes() (updated only on Build/Compile)
     JitCodeCache* jit = nullptr;  // the backend's code for the blocks, made when the first one is compiled
 
     uint64_t built = 0, rebuilt = 0, clears = 0, runs = 0, blocksRun = 0, opsRun = 0, genericRun = 0, slotMisses = 0, current = 0;
@@ -1537,14 +1549,16 @@ struct BlockCache {
                 }
                 c->codeMarksSorted = true;
             }
+            const uint32_t curEpoch = BrawlDirtyMemory::markEpoch.load(std::memory_order_acquire);
             for (const MarkCheck& k : c->codeWindows) {
-                // only the tracked pages' marks are consumed (a window may end in the next page)
-                if (!BrawlDirtyMemory::trackedPages[(k.at >> 10) & 0x3FFFu].load(std::memory_order_relaxed) &&
-                    !BrawlDirtyMemory::trackedPages[((k.at + 7u) >> 10) & 0x3FFFu].load(std::memory_order_relaxed))
-                    continue;
                 uint64_t v;
                 std::memcpy(&v, marks + k.at, 8);
-                if ((v & k.mask) == 0) continue;
+                if (__builtin_expect((v & k.mask) == 0, 1)) continue;
+                // only the tracked pages' marks are consumed (a window may end in the next page)
+                if (!BrawlDirtyMemory::trackedPages[(k.at >> 10) & 0x3FFFu].load(std::memory_order_relaxed) &&
+                    ((k.at & 1023u) <= 1016u ||
+                     !BrawlDirtyMemory::trackedPages[((k.at + 7u) >> 10) & 0x3FFFu].load(std::memory_order_relaxed)))
+                    continue;
                 uint8_t bytes[8];
                 std::memcpy(bytes, &k.mask, 8);
                 for (uint32_t j = 0; j < 8; ++j) {
@@ -1552,7 +1566,14 @@ struct BlockCache {
                     if (bytes[j] == 0 || marks[m] == 0 ||
                         !BrawlDirtyMemory::trackedPages[(m >> 10) & 0x3FFFu].load(std::memory_order_relaxed))
                         continue;
-                    c->RetireAll(m);
+                    const auto it = c->owners.find(m);
+                    if (it != c->owners.end()) {
+                        for (Block* o : it->second)
+                            if (o->epoch != 0 && (o->epoch != curEpoch || !HoldsUnder(*o, m))) {
+                                o->epoch = 0;
+                                ++c->retired;
+                            }
+                    }
                     c->writtenAt[m] = seq;
                 }
             }
@@ -1718,6 +1739,7 @@ struct BlockCache {
         ++clears;
         Report();
         for (Slot& s : slots) s = Slot{};
+        std::memset(fastEntries, 0, sizeof(fastEntries));
         for (const auto& [pc, b] : blocks) Retire(*b);
         blocks.clear();
 #if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
@@ -1736,13 +1758,19 @@ struct BlockCache {
         chunkAt = nullptr;
         chunkLeft = 0;
         bytes = 0;
+        overLimit = false;
     }
 
     // A block that is being replaced or dropped, before its replacement is published: the backend resets the link slots
-    // aimed at it. Its own code stays (a block revalidated by Refresh runs it again) until the cache's goes.
-    static void Retire(Block& b) {
+    // aimed at it and drops its fast-entry slot. Its own code stays until the cache's goes.
+    void Retire(Block& b) {
+        FastEntrySlot& fe = fastEntries[FastEntryIdx(b.start)];
+        if (fe.pc == b.start) fe = FastEntrySlot{};
         if (b.jitEntry == nullptr && b.jitIncoming == nullptr) return;
         if (const JitBackend* const backend = Backend()) backend->retire(b);
+    }
+    void UpdateOverLimit() {
+        overLimit = bytes > kMaxCacheBytes || JitBytes() > MaxJitCodeBytes();
     }
     size_t JitBytes() const {
         if (jit == nullptr) return 0;
@@ -1754,11 +1782,17 @@ struct BlockCache {
         Backend()->destroyCache(jit);
         jit = nullptr;
     }
-    // The block's words are still the ones in guest memory. Lean memory compares the bytes in place (the block was
-    // decoded from one contiguous host range); other memory models read word by word.
-    // The block matched guest memory in the current mark epoch and nothing has written its code since: every guest
-    // store and every native write marks the 64-byte blocks it touches, and marks are only cleared after an epoch bump
-    // (brawl_dirty_memory.h). Builds without marks compare the code every time.
+    // Out-of-line tail for blocks spanning > 2 mark checks (rare: kMaxSegments <= 6), keeping Current tiny and
+    // preventing Clang from emitting a massive AVX2 vectorization epilogue in callers.
+    static MKW_PPC_NO_INLINE bool CurrentExtraChecks(const Block& b, const uint8_t* marks) {
+        uint64_t any = 0;
+        for (uint32_t k = 2; k < b.checks; ++k) {
+            uint64_t v;
+            std::memcpy(&v, marks + b.check[k].at, 8);
+            any |= v & b.check[k].mask;
+        }
+        return any == 0;
+    }
     static bool Current(const Block& b, uint32_t epoch) {
 #if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
         if (b.epoch != epoch) return false;
@@ -1766,14 +1800,9 @@ struct BlockCache {
         uint64_t v0, v1;
         std::memcpy(&v0, marks + b.check[0].at, 8);
         std::memcpy(&v1, marks + b.check[1].at, 8);
-        uint64_t any = (v0 & b.check[0].mask) | (v1 & b.check[1].mask);
-        if (b.checks > 2) {
-            for (uint32_t k = 2; k < b.checks; ++k) {
-                std::memcpy(&v0, marks + b.check[k].at, 8);
-                any |= v0 & b.check[k].mask;
-            }
-        }
-        return any == 0;
+        if (((v0 & b.check[0].mask) | (v1 & b.check[1].mask)) != 0) return false;
+        if (__builtin_expect(b.checks > 2, 0)) return CurrentExtraChecks(b, marks);
+        return true;
 #else
         (void)b;
         (void)epoch;
@@ -2062,6 +2091,7 @@ struct BlockCache {
         b->pcs = opPcs;
         b->calls = sites;
         bytes += size;
+        if (bytes > kMaxCacheBytes) overLimit = true;
         if (Stats() && ((built + rebuilt) & 0xFFFFu) == 0) Report();
         blocks[pc] = b;
         return b;
@@ -2364,7 +2394,7 @@ MKW_PPC_FORCE_INLINE Act RunOp(Frame& f, CpuContext* const c, Cursor& at) {
     case K::Fmsub: SetScalar(f, o.d, PpcFmsubInline(Scalar(f, o.a), Scalar(f, o.imm), Scalar(f, o.b))); break;
     case K::Fneg: SetScalar(f, o.d, -Scalar(f, o.b)); break;
     case K::Fabs: SetScalar(f, o.d, std::fabs(Scalar(f, o.b))); break;
-    case K::Fmr: c->fpr[o.d] = c->fpr[o.b]; f.form[o.d] = f.form[o.b]; break;
+    case K::Fmr: c->fpr[o.d] = c->fpr[o.b]; CopyForm(f, o.d, o.b); break;
     case K::Frsp: SetScalar(f, o.d, PpcForceSingleValueInline(Scalar(f, o.b))); break;
     case K::Fcmpu: c->crv[(static_cast<int>(o.d >> 2)) & 7] = PpcCrvCompareFloat(Scalar(f, o.a), Scalar(f, o.b)); break;
     case K::PsAdd: SetPaired(f, o.d, PPC_PsAddInline(Paired(f, o.a), Paired(f, o.b))); break;
@@ -2384,7 +2414,7 @@ MKW_PPC_FORCE_INLINE Act RunOp(Frame& f, CpuContext* const c, Cursor& at) {
     case K::PsMerge01: SetPaired(f, o.d, PPC_PsMerge01Inline(Paired(f, o.a), Paired(f, o.b))); break;
     case K::PsMerge10: SetPaired(f, o.d, PPC_PsMerge10Inline(Paired(f, o.a), Paired(f, o.b))); break;
     case K::PsMerge11: SetPaired(f, o.d, PPC_PsMerge11Inline(Paired(f, o.a), Paired(f, o.b))); break;
-    case K::PsMr: if (f.form[o.b] == Form::Scalar) SetScalar(f, o.d, c->fpr[o.b].d); else SetPaired(f, o.d, c->fpr[o.b].d); break;
+    case K::PsMr: c->fpr[o.d] = c->fpr[o.b]; CopyForm(f, o.d, o.b); break;
     case K::PsNeg: SetPaired(f, o.d, PPC_PsNegInline(Paired(f, o.b))); break;
     case K::PsAbs: SetPaired(f, o.d, PPC_PsAbsInline(Paired(f, o.b))); break;
     default: MKW_INTERP_UNREACHABLE();  // Build makes every op: no range check in the dispatch
@@ -2404,13 +2434,13 @@ void VerifyOp(Frame& f, const Op& o, uint32_t pc, uint32_t w) {
     if (IsStore(o.kind)) { RunPlain(f, o, pc); return; }
     CpuContext shadow = *f.ctx;
     Frame g(&shadow, pc);
-    std::memcpy(g.form, f.form, sizeof(g.form));
+    g.pairedMask = f.pairedMask;
     uint32_t next = pc + 4;
     (void)Exec(g, pc, w, next, 0);
     RunPlain(f, o, pc);
     const CpuContext& c = *f.ctx;
     bool same = std::memcmp(c.gpr, shadow.gpr, sizeof(c.gpr)) == 0 && PpcGetCr(&c) == PpcGetCr(&shadow) && c.lr == shadow.lr &&
-                c.ctr == shadow.ctr && c.xer == shadow.xer && std::memcmp(f.form, g.form, sizeof(g.form)) == 0;
+                c.ctr == shadow.ctr && c.xer == shadow.xer && f.pairedMask == g.pairedMask;
     for (int r = 0; same && r < 32; ++r) same = c.fpr[r].raw == shadow.fpr[r].raw;
     if (!same) {
         static std::mutex mutex;
@@ -2568,6 +2598,8 @@ enum class Mode : uint8_t { Cached, Classic, Verify, Jit };
 // SetEngineOverride's engine (an Engine), or -1 for the environment's choice; SetJitThreshold's count.
 std::atomic<int> g_engineOverride{-1};
 std::atomic<uint32_t> g_jitThreshold{2};
+std::atomic<bool> g_fastJitReady{false};
+EnterDirectFn g_enterDirect = nullptr;
 
 // The JIT's engine when this build has a backend, the cached interpreter otherwise.
 Mode JitOrCached() {
@@ -2604,19 +2636,30 @@ Mode InterpreterMode() {
 MKW_PPC_NO_INLINE void CompileBlock(BlockCache& cache, const JitBackend& backend, Block& b) {
     if (cache.jit == nullptr) cache.jit = backend.createCache();
     b.jitState = (cache.jit != nullptr && backend.compile(*cache.jit, b) && b.jitEntry != nullptr) ? 1 : 2;
+    cache.UpdateOverLimit();
 }
 
 // Everything Run keeps per thread, behind one plain thread_local pointer. A thread_local with a constructor or
 // destructor is reached through a wrapper call on every access (and emulated TLS makes any access a call), and Run is
 // entered millions of times a second from translated code. Allocated on a thread's first Run, kept for its life.
 struct ThreadState {
+    DirectEnterState directState{};
     std::unordered_set<uint32_t> seen;  // entries logged
     uint32_t recentEntries[1024] = {};
     BlockCache cache;
 };
 thread_local ThreadState* t_state = nullptr;
 
-MKW_PPC_NO_INLINE ThreadState* NewState() { return t_state = new ThreadState; }
+MKW_PPC_NO_INLINE ThreadState* NewState() {
+    InstructionCounter* c = t_counter;
+    if (c == nullptr) c = NewCounter();
+    static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t) && alignof(std::atomic<uint64_t>) == alignof(uint64_t));
+    ThreadState* const s = t_state = new ThreadState;
+    s->directState.insnCount = reinterpret_cast<uint64_t*>(&c->count);
+    s->directState.threadState = s;
+    s->directState.fastEntries = s->cache.fastEntries;
+    return s;
+}
 
 MKW_PPC_FORCE_INLINE ThreadState& State() {
     ThreadState* s = t_state;
@@ -2639,8 +2682,14 @@ void DumpRecentBranches() {
 
 bool Enabled() { return g_enabled.load(std::memory_order_relaxed); }
 bool JitAvailable() { return Backend() != nullptr; }
-void SetEngineOverride(Engine engine) { g_engineOverride.store(static_cast<int>(engine), std::memory_order_relaxed); }
-void ClearEngineOverride() { g_engineOverride.store(-1, std::memory_order_relaxed); }
+void SetEngineOverride(Engine engine) {
+    g_engineOverride.store(static_cast<int>(engine), std::memory_order_relaxed);
+    g_fastJitReady.store(false, std::memory_order_release);
+}
+void ClearEngineOverride() {
+    g_engineOverride.store(-1, std::memory_order_relaxed);
+    g_fastJitReady.store(false, std::memory_order_release);
+}
 void SetJitThreshold(uint32_t entries) { g_jitThreshold.store(entries, std::memory_order_relaxed); }
 void SetEnabled(bool enabled) { g_enabled.store(enabled, std::memory_order_relaxed); }
 uint64_t InstructionCount() {
@@ -2697,7 +2746,7 @@ MKW_PPC_FORCE_INLINE void NoteEntry(ThreadState& state, CpuContext* ctx, uint32_
 // The frame a Run starts with. Callers hand FPRs over in the scalar CpuContext form (the translator's entry contract), so a float
 // argument consumed by a paired op is splatted to both lanes, as lfs/fadds leave it on the hardware.
 MKW_PPC_FORCE_INLINE void StartFrame(Frame& f, CpuContext* ctx) {
-    for (auto& form : f.form) form = Form::Scalar;
+    f.pairedMask = 0;
     f.returnAddress = ctx->lr;
 }
 
@@ -2790,16 +2839,16 @@ MKW_PPC_NO_INLINE void RunLoop(const LoopEnv& env) {
             BrawlRollback::RunLoop(ctx,[](CpuContext* c) {
                 ++t_rollbackLoopDepth;Run(c,0x800171B4u);--t_rollbackLoopDepth;
             });
-            for(auto& form:f.form) form=Form::Scalar;
+            f.pairedMask = 0;
             continue;
         }
         // Brawl Online's core (Dolphin's Brawlback hooks): the frame end inside the pass.
         if(coreEnabled && loopDepth && pc==0x80017504u) {
-            for(unsigned i=0;i<32;++i) SetScalar(f,i,Scalar(f,i));
+            for(uint32_t m=f.pairedMask; m!=0; m&=m-1u) { unsigned i=__builtin_ctz(m); SetScalar(f,i,Scalar(f,i)); }
             if(BrawlOnlineCore::FrameEnd(ctx)) {f.pc=0x80017508u;continue;}
         }
         if(loopDepth && pc==0x80017508u) {
-            for(unsigned i=0;i<32;++i) SetScalar(f,i,Scalar(f,i));
+            for(uint32_t m=f.pairedMask; m!=0; m&=m-1u) { unsigned i=__builtin_ctz(m); SetScalar(f,i,Scalar(f,i)); }
             if(coreEnabled) BrawlOnlineCore::LoopEnd(ctx);
             CountInstructions(executed);return;
         }
@@ -2898,10 +2947,13 @@ void Run(CpuContext* ctx, uint32_t entry) {
     NoteEntry(state, ctx, entry);
     Frame f(ctx, entry);
     StartFrame(f, ctx);
+    std::optional<CpuContextScope> cpuContextScope;
+    if (__builtin_expect(TryGetCpuContext() != ctx, 0)) cpuContextScope.emplace(ctx);
     uint64_t executed = 0;
     const auto& tracePcs = TracePcs();
     unsigned& loopDepth = t_rollbackLoopDepth;  // only on the game thread
     const bool rollbackLoopFrame = loopDepth && entry == 0x800171B4u;
+    if (rollbackLoopFrame) f.flags |= kFrameFlagLoopFrame;
     struct LoopFrameScope {
         bool owner;
         const Frame* saved;
@@ -2926,7 +2978,7 @@ void Run(CpuContext* ctx, uint32_t entry) {
     const uint32_t jitThreshold = jitBackend != nullptr ? g_jitThreshold.load(std::memory_order_relaxed) : 0;
     if (mode != Mode::Classic) {
         cache = &state.cache;
-        if (cache->depth == 0 && (cache->bytes > kMaxCacheBytes || cache->JitBytes() > MaxJitCodeBytes())) cache->Clear();
+        if (cache->depth == 0 && cache->overLimit) cache->Clear();
         ++cache->depth;
         if (stats && (++cache->runs & 0xFFFFFu) == 0) cache->Report();
     }
@@ -2942,45 +2994,82 @@ void Run(CpuContext* ctx, uint32_t entry) {
     RunLoop(env);
 }
 
-// The entry for the common call from translated code (GuestCodePatch::RunPatched's last step): Run(ctx, entry) when `entry` is
-// the start of a block that has compiled code and is current, which is all the general entry does besides tests that cannot
-// apply then. True when it ran (and returned, or threw, as Run does). False when it did nothing, and the caller makes the
-// general call: the engine is not the JIT, tracing or statistics are on, the cache is over a limit (the outermost Run drops it),
-// `entry` has no compiled block yet (the dispatcher counts and compiles it), or it is a hook pc (the loop's tests are for it).
-// Everything the two entries share is one function (NoteEntry, StartFrame, EnterCompiled, FollowExit, RunLoop): a block that
-// leaves for the dispatcher continues in the general loop with the next block already found and linked.
-bool detail::RunCompiledEntry(CpuContext* ctx, uint32_t entry) {
 #if MKW_JIT && !MKW_INTERP_PROFILE
-    // What settles it for the process (the engine the environment chooses, the backend, no tracing, no statistics, no
-    // BRAWL_INTERP_CHECK); the flags Run reads are made here as its first call would make them.
+void detail::JitDirectContinue(DirectEnterState* ds, Frame* f, uint64_t statusAndNext, JitLink* link) {
+    // Clear direct/subcall flags before any RunLoop -> jit_enter call reuses this Frame, so its exits return to Enter().
+    const bool wasSubCall = (f->flags & kFrameFlagSubCall) != 0;
+    f->flags &= ~(kFrameFlagDirectEnter | kFrameFlagSubCall);
+    ThreadState& state = *static_cast<ThreadState*>(ds->threadState);
+    BlockCache& cache = state.cache;
+    const JitBackend& backend = *Backend();
+    uint64_t executed = f->executed;
+    const JitExit exit{static_cast<JitStatus>(statusAndNext >> 32), static_cast<uint32_t>(statusAndNext), link};
+    if (exit.status == JitStatus::Pending) {
+        std::exception_ptr pending = std::move(f->pending);
+        f->pending = nullptr;
+        CountInstructions(executed);
+        std::rethrow_exception(pending);
+    }
+    if (exit.status == JitStatus::Return) {
+        CountInstructions(executed);
+    } else {
+        Block* const following = FollowExit(cache, backend, *f, exit);
+        const LoopEnv env{f->ctx, *f, executed, &cache, false, Mode::Jit, &backend, g_jitThreshold.load(std::memory_order_relaxed), following};
+        RunLoop(env);
+    }
+    if (wasSubCall) {
+        const PatchedHooks& h = GetPatchedHooks();
+        if (h.sync != nullptr &&
+            (h.pendingFast->load(std::memory_order_acquire) != 0 || h.anyDirty->load(std::memory_order_acquire))) {
+            h.sync();
+        }
+    }
+}
+
+MKW_PPC_NO_INLINE bool RunCompiledEntrySlow(CpuContext* ctx, uint32_t entry) {
     struct Once {
         const JitBackend* backend;
         bool defaultJit;
+        bool jitStats;
     };
     static const Once once = [] {
         RunFlagsOnce();
         const bool on = Backend() != nullptr && TracePcs().empty() && !BlockCache::Stats() && !BlockCache::CheckMarks();
-        return Once{on ? Backend() : nullptr, on && DefaultMode() == Mode::Jit};
+        const char* s = std::getenv("BRAWL_JIT_STATS");
+        const bool jitStats = s != nullptr && *s != '\0' && *s != '0';
+        return Once{on ? Backend() : nullptr, on && DefaultMode() == Mode::Jit, jitStats};
     }();
     if (once.backend == nullptr) return false;
     const int engineOverride = g_engineOverride.load(std::memory_order_relaxed);
     if (engineOverride == -1 ? !once.defaultJit : engineOverride != static_cast<int>(Engine::Jit)) return false;
     const JitBackend& backend = *once.backend;
+    if (!once.jitStats && backend.enterDirect != nullptr) {
+        g_enterDirect = backend.enterDirect;
+        g_fastJitReady.store(true, std::memory_order_release);
+    }
     ThreadState& state = State();
     BlockCache& cache = state.cache;
-    if (cache.depth == 0 && (cache.bytes > kMaxCacheBytes || cache.JitBytes() > MaxJitCodeBytes())) return false;
+    if (cache.depth == 0 && cache.overLimit) return false;
     Block* const b = cache.FindCurrent(entry);
     if (b->hook || b->jitEntry == nullptr) return false;
     NoteEntry(state, ctx, entry);
-    Frame f(ctx, entry);
-    StartFrame(f, ctx);
-    uint64_t executed = 0;
-    // (no rollback loop frame: its entry is a hook pc)
+    if (b->jitChecked != nullptr) {
+        cache.fastEntries[FastEntryIdx(entry)] = FastEntrySlot{entry, 0, b->jitChecked};
+    }
+    std::optional<CpuContextScope> cpuContextScope;
+    if (__builtin_expect(TryGetCpuContext() != ctx, 0)) cpuContextScope.emplace(ctx);
     ++cache.depth;
     struct DepthScope {
         BlockCache* cache;
         ~DepthScope() { --cache->depth; }
     } depthScope{&cache};
+    if (!once.jitStats && backend.enterDirect != nullptr && b->jitChecked != nullptr) {
+        backend.enterDirect(ctx, entry, b->jitChecked, &state.directState);
+        return true;
+    }
+    Frame f(ctx, entry);
+    StartFrame(f, ctx);
+    uint64_t executed = 0;
     const Trail trail;
     const JitExit exit = EnterCompiled(backend, ctx, f, *b, executed, trail);
     if (exit.status == JitStatus::Return) {
@@ -2991,6 +3080,33 @@ bool detail::RunCompiledEntry(CpuContext* ctx, uint32_t entry) {
     const LoopEnv env{ctx, f, executed, &cache, false, Mode::Jit, &backend, g_jitThreshold.load(std::memory_order_relaxed), following};
     RunLoop(env);
     return true;
+}
+#else
+void detail::JitDirectContinue(DirectEnterState*, Frame*, uint64_t, JitLink*) {}
+#endif
+
+// The entry for the common call from translated code (GuestCodePatch::RunPatched's last step): Run(ctx, entry) when `entry` is
+// the start of a block that has compiled code and is current, which is all the general entry does besides tests that cannot
+// apply then. True when it ran (and returned, or threw, as Run does). False when it did nothing, and the caller makes the
+// general call.
+bool detail::RunCompiledEntry(CpuContext* ctx, uint32_t entry) {
+#if MKW_JIT && !MKW_INTERP_PROFILE
+    ThreadState* const state = t_state;
+    if (__builtin_expect(state != nullptr && g_fastJitReady.load(std::memory_order_acquire) &&
+                             TryGetCpuContext() == ctx &&
+                             (!state->cache.overLimit || state->cache.depth != 0), 1)) {
+        const FastEntrySlot& fe = state->cache.fastEntries[FastEntryIdx(entry)];
+        if (__builtin_expect(fe.pc == entry && fe.jitChecked != nullptr, 1)) {
+            ++state->cache.depth;
+            struct DepthScope {
+                BlockCache* cache;
+                ~DepthScope() { --cache->depth; }
+            } depthScope{&state->cache};
+            g_enterDirect(ctx, entry, fe.jitChecked, &state->directState);
+            return true;
+        }
+    }
+    return RunCompiledEntrySlow(ctx, entry);
 #else
     (void)ctx;
     (void)entry;
