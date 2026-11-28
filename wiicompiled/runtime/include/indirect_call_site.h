@@ -1,15 +1,14 @@
 #pragma once
-// Per-call-site monomorphic inline caches for translated bctrl/blrl and tail bctr. Included at the end of
-// abi_bridge.h.
+// Per-call-site inline caches for translated bctrl/blrl and tail bctr. Included at the end of abi_bridge.h.
 //
 // The translator emits MKW_INDIRECT_CALL(target, ctx) for every indirect call (IrIndirectCall) and
 // MKW_INDIRECT_JUMP(target, ctx) for every indirect tail jump (IrIndirectJump, a jump table's default arm) where it
-// used to emit InvokeIndirectCpu / InvokeIndirectJump. Each expansion owns one static MkwIndirectSite: the
-// RawDispatchRecord the site's last target resolved to. A hit skips the thread-local memo probe (and, on a memo miss,
-// the generated table's segment/page/binary search), the out-of-line TryDispatchRawCpuTarget and its guard
-// constructor/destructor calls.
+// used to emit InvokeIndirectCpu / InvokeIndirectJump. Each expansion owns one static MkwIndirectSite: the entries of
+// the last targets the site resolved to. A hit skips the thread-local memo probe (and, on a memo miss, the generated
+// table's segment/page/binary search), the out-of-line TryDispatchRawCpuTarget and its guard constructor/destructor
+// calls.
 //
-// A cached record never goes stale. TranslatedFunctionRegistry::Finalize publishes the lookup once, before guest code
+// A cached entry never goes stale. TranslatedFunctionRegistry::Finalize publishes the lookup once, before guest code
 // runs (main.cpp, ahead of Aurora and the guest boot), and Register aborts after it; the generated table is constant
 // data and the dynamic (native) records are never rebuilt after publication. So FindRawByAddressPtr is a pure function
 // of the address for the rest of the process (the thread-local memo in front of it already relies on this and is never
@@ -20,27 +19,48 @@
 // translation (a mod's replacement module, Gecko code) has no record, so its calls always take the slow path and run
 // in the interpreter as before.
 //
-// Threads: each of a site's two slots is one atomic pointer. A slot holds nullptr or a published record, and every
-// use compares that record's own immutable address with the target, so a stale or racing read can only miss, never
-// call the wrong function. Fills store with release; the hit path loads relaxed (its reads of the record depend on
-// the loaded pointer, the records are constant data or were written before publication, and every host thread that
-// runs guest code is started after Finalize).
+// Layout: one 32-byte, 32-aligned object (one cache line) per site.
+//   ways[3]  unguarded records (nonvolatile FPR write mask 0, no GPR preservation: 98% of the generated table), each
+//            packed into one 64-bit word: the guest address in the low half, the entry's displacement from an anchor
+//            in the executable's text (MkwIndirectEntryAnchor) as a nonzero int32 in the high half. A hit is one load
+//            and a compare; it never reads the record, whose line in the 2 MB generated table was the second
+//            dependent load (often a cache miss) before the jump. An empty way is 0 and never matches (its high half
+//            is zero, so not even target 0). A record whose entry is not within +-2 GiB of the anchor is not packed
+//            (it goes to `guarded`); in practice every entry is in the executable.
+//   guarded  one record that needs its registers guarded (or could not be packed). Its call is the out-of-line
+//            MkwIndirectSiteGuardedCall: the guards and the entry, without the slow path's lookup and refill.
+// The slow path fills a way by shifting the ways down (the oldest drops out) and putting the new target first; a hit
+// in any way moves nothing (no stores on hits). Three ways cover Brawl's common 2-3-target vtable sites (fighter /
+// item / gfTask methods).
 //
-// The hit path's slot only ever holds a record that needs no register guard (nonvolatile FPR write mask 0, no GPR
-// preservation: 98% of the generated table) and has a nonzero address. For such a record, when the call stays in the
-// current CpuContext, TryDispatchRawCpuTarget does exactly two things (PpcNonvolatileFprGuard and
-// PpcNonvolatileGprGuard do nothing, no CpuContextScope is built): the execution-address scope and
-// record->entry(ctx). The hit does the same, except that it sets the execution address without restoring it (see
-// the note above the hit functions: diagnostics only), which makes the call a tail jump. A guarded record is only kept in the site's second slot,
-// which the out-of-line slow path reads; that path also takes a call that switches CpuContext, a miss, or an
-// untranslated target, runs the old dispatch for it, and refills the site.
+// Behind the ways, one table shared by every site (g_mkwIndirectSharedWays, indirect_call_site_hit.h: 4096 ways
+// keyed by target, direct-mapped, 32 KiB) catches what a site's ways miss: a megamorphic site (one vtable slot over
+// many object classes, e.g. a per-object update loop: one such site was 40% of all slow-path calls in a P+ replay)
+// otherwise took the slow path's frame, lookup and refill on most calls. Every way the slow path packs is stored
+// there too, and a hit in it is shifted into the site's way 0 like a fill (or a site whose targets changed after its
+// ways were filled would scan them stale on every call). Measured on P+ ranked replays (d4): calls answered without
+// the slow path 89% -> 94% with three ways; with the table the slow paths fell from 0.76% to 0.15% of cycles (what is
+// left: untranslated targets, guarded churn), the whole indirect machinery 2.91% -> 2.20%, updates -1.6%.
 //
-// The hit path is one shared out-of-line function by default: a site is its argument moves and a call, as before.
-// -DMKW_INDIRECT_IC_INLINE=1 inlines it at every site instead (each site gets its own indirect branch), which measured
-// no faster on Zen 5 (deterministic Training replay: game-thread cycles per frame 10.69 M inlined vs
-// 10.57 M out of line, base 11.19 M) and costs ~20 host instructions per site: +2.6M over 125k sites, enough to push a
-// build at 3.93:1 (lean memory, outlined guest ops) past the 4:1 expansion gate. The out-of-line default adds ~1
-// instruction per site.
+// Threads: each way, shared way and the guarded slot is one atomic word. A way holds 0 or a packed (address, entry) pair written
+// in one store, so a racing read sees a whole pair or nothing; the guarded slot holds nullptr or a published record
+// whose immutable address is compared with the target. A stale or racing read can only miss, never call the wrong
+// function. Fills store with release; the hit path loads relaxed.
+//
+// The hit does what TryDispatchRawCpuTarget does for an unguarded record when the call stays in the current
+// CpuContext (PpcNonvolatileFprGuard and PpcNonvolatileGprGuard do nothing, no CpuContextScope is built): the
+// execution-address store and the entry, except that it sets the execution address without restoring it (diagnostics
+// only: every reader of RecompMod::g_currentTranslatedExecutionAddress is crash/access-violation reporting, which
+// then names the last indirect target this thread entered instead of the outer scope's; direct calls never set it
+// at all), which makes the call a tail jump. A call from another CpuContext goes to the out-of-line slow path, which
+// runs the old dispatch for it, as does a miss or an untranslated target.
+//
+// The hit path is one shared out-of-line function per kind (call, jump) by default, defined in abi_bridge.cpp from
+// indirect_call_site_hit.h: a site is its argument moves and a call, and changing the hit path rebuilds one file, not
+// every translated one. -DMKW_INDIRECT_IC_INLINE=1 inlines it at every site instead (each site gets its own indirect
+// branch), which measured no faster (deterministic Training replay: game-thread cycles per frame 10.69 M
+// inlined vs 10.57 M out of line, base 11.19 M) and costs ~20 host instructions per site: +2.6M over 125k sites,
+// enough to push a build at 3.93:1 (lean memory, outlined guest ops) past the 4:1 expansion gate.
 //
 // Switches: -DMKW_INDIRECT_IC=0 makes both macros the plain InvokeIndirectCpu / InvokeIndirectJump calls (the old
 // generated code, token for token). MKW_INDIRECT_IC=0 in the environment keeps the caches compiled in but never fills
@@ -60,13 +80,12 @@
 
 #if MKW_INDIRECT_IC
 
-struct MkwIndirectSite {
+inline constexpr unsigned kMkwIndirectSiteWays = 3;
+
+struct alignas(32) MkwIndirectSite {
     // Static storage, so zero-initialized (empty) at load time: no constructor, no guard variable.
-    // record: the hit path's, always unguarded. other: read only by the slow path, a guarded record (which the hit
-    // path must not call) or the unguarded record a refill displaced, so a site with a guarded target or two
-    // alternating targets skips the lookup. Each slot is validated on its own, like record.
-    std::atomic<const RawDispatchRecord*> record;
-    std::atomic<const RawDispatchRecord*> other;
+    std::atomic<uint64_t> ways[kMkwIndirectSiteWays];
+    std::atomic<const RawDispatchRecord*> guarded;
 #if MKW_INDIRECT_IC_STATS
     std::atomic<uint64_t> hits;
     std::atomic<uint64_t> slow;
@@ -77,88 +96,17 @@ struct MkwIndirectSite {
 
 void MkwInvokeIndirectCpuSiteSlow(uint32_t target, CpuContext* ctx, MkwIndirectSite& site);
 void MkwInvokeIndirectJumpSiteSlow(uint32_t target, CpuContext* ctx, MkwIndirectSite& site);
-
-// The site's record is the target's (so it is unguarded and its address, the target, is nonzero) and the call stays
-// in the current CpuContext. ctx is never null here: the macros are emitted only into translated bodies, which read
-// and write through ctx throughout (a null one would fault long before an indirect call); the slow path keeps its
-// own null-ctx fallback for every other caller. So the old `ctx != nullptr` term (a test and a branch per call) is
-// dropped; TryGetCpuContext() == ctx still sends a call from another context to the slow path.
-MKW_PPC_FORCE_INLINE bool MkwIndirectSiteFastHit(const RawDispatchRecord* record, uint32_t target,
-                                                 CpuContext* ctx) noexcept {
-    return record != nullptr && record->address == target && TryGetCpuContext() == ctx;
-}
-
-// The hit records its target in RecompMod::g_currentTranslatedExecutionAddress and does not restore the previous value
-// on return: every reader of it is crash/access-violation diagnostics ("active function"), which then name the last
-// indirect target this thread entered instead of the outer scope's. Without the restore the hit is a tail jump: no
-// saved registers, no call/return pair, no landing pad (~15 of its ~25 ops per call IBS profile).
-// Direct calls never set the value at all, so it was already "last scope that set it", not the current function.
-
-#if MKW_INDIRECT_IC_STATS
-#define MKW_INDIRECT_IC_COUNT_HIT(site) \
-    (site).hits.store((site).hits.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed)
-#else
-#define MKW_INDIRECT_IC_COUNT_HIT(site) ((void)0)
-#endif
+// The guarded slot's call: its record matched the target and the call stays in the current CpuContext.
+void MkwIndirectSiteGuardedCall(const RawDispatchRecord* record, CpuContext* ctx);
+// The text address the ways' entry displacements are relative to (a function in abi_bridge.cpp; never called).
+void MkwIndirectEntryAnchor();
 
 #if MKW_INDIRECT_IC_INLINE
-#define MKW_INDIRECT_IC_HIT_FUNCTION MKW_PPC_FORCE_INLINE
+#include "indirect_call_site_hit.h"
 #else
-#define MKW_INDIRECT_IC_HIT_FUNCTION MKW_PPC_NO_INLINE inline
+void MkwInvokeIndirectCpuSite(uint32_t target, CpuContext* ctx, MkwIndirectSite& site);
+void MkwInvokeIndirectJumpSite(uint32_t target, CpuContext* ctx, MkwIndirectSite& site);
 #endif
-
-// The site's other slot, when it holds this target's record and that record is unguarded (as the hit path's slot
-// always is: no non-volatile FPR write mask, no GPR preservation) and the call stays in the current CpuContext: the
-// same two things as the hit. A site alternating between two targets otherwise took the out-of-line slow path, which
-// also swapped the two slots (two stores), on every other call. A guarded record in that slot still goes to the slow
-// path, which builds its guards.
-MKW_PPC_FORCE_INLINE const RawDispatchRecord* MkwIndirectSiteOtherHit(MkwIndirectSite& site, uint32_t target,
-                                                                       CpuContext* ctx) noexcept {
-    const RawDispatchRecord* other = site.other.load(std::memory_order_relaxed);
-    if (other != nullptr && other->address == target && other->nonvolatileFprWriteMask == 0 &&
-        !other->preserveNonvolatileGprs && TryGetCpuContext() == ctx)
-        return other;
-    return nullptr;
-}
-
-// bctrl: InvokeIndirectCpu.
-MKW_INDIRECT_IC_HIT_FUNCTION void MkwInvokeIndirectCpuSite(uint32_t target, CpuContext* ctx, MkwIndirectSite& site) {
-    const RawDispatchRecord* record = site.record.load(std::memory_order_relaxed);
-    if (__builtin_expect(MkwIndirectSiteFastHit(record, target, ctx), 1)) {
-        MKW_INDIRECT_IC_COUNT_HIT(site);
-        HZ_EXCLUSIVE_PAUSE_IF_ACTIVE();
-        RecompMod::g_currentTranslatedExecutionAddress = target;
-        record->entry(ctx);
-        return;
-    }
-    if (const RawDispatchRecord* other = MkwIndirectSiteOtherHit(site, target, ctx)) {
-        MKW_INDIRECT_IC_COUNT_HIT(site);
-        HZ_EXCLUSIVE_PAUSE_IF_ACTIVE();
-        RecompMod::g_currentTranslatedExecutionAddress = target;
-        other->entry(ctx);
-        return;
-    }
-    MkwInvokeIndirectCpuSiteSlow(target, ctx, site);
-}
-
-// Tail bctr: InvokeIndirectJump (which has no HZ pause and no target-0 check of its own: a filled site never matches
-// target 0, and the slow path hands an unregistered target to InvokeIndirectJump itself).
-MKW_INDIRECT_IC_HIT_FUNCTION void MkwInvokeIndirectJumpSite(uint32_t target, CpuContext* ctx, MkwIndirectSite& site) {
-    const RawDispatchRecord* record = site.record.load(std::memory_order_relaxed);
-    if (__builtin_expect(MkwIndirectSiteFastHit(record, target, ctx), 1)) {
-        MKW_INDIRECT_IC_COUNT_HIT(site);
-        RecompMod::g_currentTranslatedExecutionAddress = target;
-        record->entry(ctx);
-        return;
-    }
-    if (const RawDispatchRecord* other = MkwIndirectSiteOtherHit(site, target, ctx)) {
-        MKW_INDIRECT_IC_COUNT_HIT(site);
-        RecompMod::g_currentTranslatedExecutionAddress = target;
-        other->entry(ctx);
-        return;
-    }
-    MkwInvokeIndirectJumpSiteSlow(target, ctx, site);
-}
 
 // One static site per expansion (a block-scope static: each macro use is its own object).
 #define MKW_INDIRECT_CALL(target, ctx)                              \

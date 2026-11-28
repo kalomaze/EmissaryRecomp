@@ -62,6 +62,7 @@
 // The vanilla translation only: a translation without EABI entries (P+) runs the originals.
 
 #include "abi_bridge.h"
+#include "indirect_call_site_hit.h"
 #include "audio/ax_dsp.h"
 #include "brawl_dirty_memory.h"
 #include "insn_count.h"
@@ -1842,36 +1843,33 @@ template <bool kProbe = false>
     ctx->ctr = target;
     if constexpr (kProbe) return true;
 #if MKW_INDIRECT_IC
-    // MkwInvokeIndirectJumpSite's hit, inlined (indirect_call_site.h), from a per-type cache of 32 records keyed by
-    // target in front of the type's site. One type dispatches round-robin to every task class's method, so the site's
-    // two slots missed on 47% of calls (480 of 1,022 a frame in Training). The cache holds only records
-    // the site's own slow path put in its hit slot for that target (unguarded, entry and address set: a pure function
-    // of the address after TranslatedFunctionRegistry::Finalize), and a hit is the site's hit: same test, same
+    // MkwInvokeIndirectJumpSite's hit, inlined (indirect_call_site_hit.h), from a per-type cache of 32 ways keyed by
+    // target in front of the type's site. One type dispatches round-robin to every task class's method, so even the
+    // site's three ways miss often (two ways missed on 47% of calls: 480 of 1,022 a frame in Training). The cache
+    // holds only ways the site's own slow path put in the site for that target (unguarded, packed: a pure function of
+    // the address after TranslatedFunctionRegistry::Finalize), and a hit is the site's hit: same test, same
     // execution-address store, same entry. GFTASK_CACHE=0 leaves only the site.
     static MkwIndirectSite sites[16];
-    static std::atomic<const RawDispatchRecord*> cache[16][32];
+    static std::atomic<uint64_t> cache[16][32];
     MkwIndirectSite& site = sites[type];
-    std::atomic<const RawDispatchRecord*>& slot = cache[type][(target * 0x9E3779B1u) >> 27];
-    const RawDispatchRecord* record = slot.load(std::memory_order_relaxed);
-    if (__builtin_expect(MkwIndirectSiteFastHit(record, target, ctx), 1)) {
+    std::atomic<uint64_t>& slot = cache[type][(target * 0x9E3779B1u) >> 27];
+    const uint64_t way = slot.load(std::memory_order_relaxed);
+    if (__builtin_expect(MkwIndirectWayMatches(way, target) && TryGetCpuContext() == ctx, 1)) {
         MKW_INDIRECT_IC_COUNT_HIT(site);
         RecompMod::g_currentTranslatedExecutionAddress = target;
-        record->entry(ctx);
-        return true;
-    }
-    record = site.record.load(std::memory_order_relaxed);
-    if (MkwIndirectSiteFastHit(record, target, ctx)) {
-        MKW_INDIRECT_IC_COUNT_HIT(site);
-        RecompMod::g_currentTranslatedExecutionAddress = target;
-        if (g_gfTaskCache) slot.store(record, std::memory_order_relaxed);
-        record->entry(ctx);
+        MkwIndirectWayEntry(way)(ctx);
         return true;
     }
     MkwInvokeIndirectJumpSite(target, ctx, site);
     if (g_gfTaskCache) {
-        // The slow path's refill (the callee may have reused the site since: the address test keeps only this target).
-        record = site.record.load(std::memory_order_relaxed);
-        if (record != nullptr && record->address == target) slot.store(record, std::memory_order_relaxed);
+        // The site's ways after the call (the callee may have reused the site since: the test keeps only this target).
+        for (const auto& w : site.ways) {
+            const uint64_t held = w.load(std::memory_order_relaxed);
+            if (MkwIndirectWayMatches(held, target)) {
+                slot.store(held, std::memory_order_relaxed);
+                break;
+            }
+        }
     }
 #else
     InvokeIndirectJump(target, ctx);
