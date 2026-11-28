@@ -30,6 +30,7 @@ extern "C" uint32_t HorizonLeanWindowBack(uint8_t* target, uint64_t size);
 namespace LeanWindow {
 
 bool g_aliased = false;
+bool g_storeView = false;
 
 #if defined(_WIN32)
 namespace {
@@ -101,6 +102,8 @@ bool MapSharedViews(uint64_t size, const View* views, int count, std::string* er
     return true;
 }
 
+uint32_t Protect(uint8_t*, uint64_t, bool) { return 1; }
+
 #elif defined(__SWITCH__)
 
 uint8_t* Reserve(uint64_t size) { return static_cast<uint8_t*>(HorizonLeanWindowReserve(size)); }
@@ -111,6 +114,8 @@ bool MapSharedViews(uint64_t, const View*, int, std::string* error) {
     *error = "Horizon cannot map one memory object twice";
     return false;
 }
+
+uint32_t Protect(uint8_t*, uint64_t, bool) { return 1; }
 
 #else
 
@@ -161,6 +166,10 @@ bool MapSharedViews(uint64_t size, const View* views, int count, std::string* er
     }
     close(fd);  // the mappings keep the object
     return true;
+}
+
+uint32_t Protect(uint8_t* at, uint64_t size, bool writable) {
+    return mprotect(at, size, writable ? PROT_READ | PROT_WRITE : PROT_READ) == 0 ? 0u : static_cast<uint32_t>(errno);
 }
 
 #endif

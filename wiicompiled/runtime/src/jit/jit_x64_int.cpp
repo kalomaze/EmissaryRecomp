@@ -104,8 +104,11 @@ void EmitCompare(BlockEmitter& e, const Op& o, bool isSigned, bool withReg) {
     const uint32_t field = static_cast<uint32_t>(o.d) >> 2;
     const int hit = e.WantCacheGpr(o.a) ? static_cast<int>(e.ReadGpr(o.a).getIdx()) : -1;
     if (!isSigned && !withReg && hit >= 0 && o.imm <= 0x7FFFFFFFu) {
-        if (o.imm == 0) c.mov(eax, Xbyak::Reg32(hit));
-        else c.lea(rax, c.ptr[Xbyak::Reg64(hit) - static_cast<int32_t>(o.imm)]);
+        if (o.imm == 0) {  // the zero-extended register is the difference itself
+            e.CrStore(field, Xbyak::Reg64(hit));
+            return;
+        }
+        c.lea(rax, c.ptr[Xbyak::Reg64(hit) - static_cast<int32_t>(o.imm)]);
     } else {
         WithGpr(e, o.a, [&](const Xbyak::Operand& op) {
             if (isSigned) c.movsxd(rax, op);

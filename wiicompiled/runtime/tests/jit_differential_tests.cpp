@@ -18,9 +18,12 @@
 #include "brawl_dirty_memory.h"
 #include "isa/ppc_isa_fpenv.h"
 #include "jit_test_cr.h"
+#include "lean_window.h"
 #include "memory.h"
 #include "ppc_interpreter.h"
 #include "../src/ppc_interpreter_internal.h"
+#include "../src/jit/jit_x64.h"
+#include "recomp_mod_loader.h"
 
 #include <algorithm>
 #include <chrono>
@@ -3261,12 +3264,139 @@ namespace {
 using Clock = std::chrono::steady_clock;
 double Since(Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); }
 
+// === Guarded code ==================================================================================================
+//
+// The program slots and the support code registered as executable pages (their 64 KiB chunks flagged in the store policy), as
+// the game's own code is: the JIT then compiles their blocks as guarded code (BlockEmitter::Guarded: no dirty-mark test on a
+// linked entry, the epoch alone after a call), which relies on every write under them dropping them at once
+// (BrawlDirtyMemory::guardedWritten). Run after everything else: the pages stay registered (executable ranges are only ever
+// added), as the guarded blocks compiled while they are require.
+void SetGuardedCode() {
+    using namespace RecompMod;
+    g_executableWriteGuardEnabled.store(true);
+    const auto add = [](uint32_t start, uint32_t end) {
+        for (uint32_t a = start; a < end; a += 1u << kExecutableWriteGuardPageShift) {
+            g_executableWriteGuardPages[a >> kExecutableWriteGuardPageShift].store(1);
+            g_executableWriteGuardMidPages[a >> kExecutableWriteGuardMidPageShift].store(1);
+            g_executableWriteGuardCoarsePages[a >> kExecutableWriteGuardCoarsePageShift].store(1);
+        }
+    };
+    add(kSlotBase, kSlotBase + kSlotCount * kSlotBytes);
+    add(kSupportPlain & ~0xFFFu, (kSupportThrow & ~0xFFFu) + 0x1000u);
+    Memory::RefreshWritableFastPathsForExecutableRanges();
+}
+
+uint64_t GuardedCompiles() { return PpcInterpreter::detail::JitX64GetStats().guarded; }
+// BRAWL_JIT_GUARD=0: no block is compiled as guarded code (every line tested); the stages that expect guarded blocks expect none.
+bool GuardOff() {
+    const char* v = std::getenv("BRAWL_JIT_GUARD");
+    return v != nullptr && *v == '0';
+}
+
+void GuardedStages(unsigned randomCount, uint64_t firstSeed);
+
+// The guarded programs with the guard made wrong on purpose (g_jitEpochFault 5: a write under guarded code drops nothing): the
+// stale-code programs must notice.
+void GuardFault() {
+    if (!PpcInterpreter::JitAvailable() || GuardOff()) return;
+    const unsigned failures = g_failures, reported = g_reported;
+    PpcInterpreter::detail::g_jitEpochFault = 5;
+    g_reported = kMaxReports;
+    AddStaleCode();
+    const unsigned noticed = g_failures - failures;
+    PpcInterpreter::detail::g_jitEpochFault = 0;
+    g_failures = failures;
+    g_reported = reported;
+    std::printf("  guard fault: %u failed\n", noticed);
+    if (noticed == 0) {
+        std::fprintf(stderr, "FAIL: the deliberate guard fault (writes under guarded code drop nothing) was not noticed\n");
+        ++g_failures;
+    }
+}
+
+// Guarded code under the store view (lean_window.h): a compiled store has no policy test of its own, and a store into a guarded
+// line reaches the checked path, whose mark drops the guarded blocks there, only because the store view's copy of a policy-flagged
+// chunk is read-only (the store faults: jit_x64_mem.cpp). The stale-code programs store into guarded lines of other blocks and of
+// their callers: they must take that fault path, and with the copy of the guarded chunks made writable on purpose (the protection
+// lagging behind the store policy) they must notice.
+uint64_t StoreFaults() { return PpcInterpreter::detail::JitX64GetFaultStats().faults; }
+void GuardedStaleCode() {
+    const uint64_t faults = StoreFaults();
+    AddStaleCode();
+    const uint64_t took = StoreFaults() - faults;
+    std::printf("  guarded stores that faulted: %llu (store view %s)\n", static_cast<unsigned long long>(took),
+                LeanWindow::g_storeView ? "on" : "off");
+    if (PpcInterpreter::JitAvailable() && LeanWindow::g_storeView && took == 0) {
+        std::fprintf(stderr, "FAIL: no store into guarded code took the store view's fault path\n");
+        ++g_failures;
+    }
+}
+void StoreViewLag() {
+    if (!PpcInterpreter::JitAvailable() || !LeanWindow::g_storeView || GuardOff()) return;
+    // the cached copy of the store view (one GiB up from the aliased view's +2 GiB: lean_window.h) over the guarded chunks
+    const auto protect = [](bool writable) {
+        const auto range = [&](uint32_t start, uint32_t end) {
+            constexpr uint32_t kChunk = 1u << MemoryInline::kLeanPolicyShift;
+            const uint32_t first = start & ~(kChunk - 1u), last = (end + kChunk - 1u) & ~(kChunk - 1u);
+            uint8_t* const copy = MemoryInline::g_leanBase + LeanWindow::kStoreViewOffset + 0x80000000ull + (first & MemoryInline::kLeanMask);
+            if (LeanWindow::Protect(copy, last - first, writable) != 0) {
+                std::fprintf(stderr, "FAIL: could not change the store view's protection\n");
+                ++g_failures;
+            }
+        };
+        range(kSlotBase, kSlotBase + kSlotCount * kSlotBytes);
+        range(kSupportPlain, kSupportThrow + 0x100u);
+    };
+    const unsigned failures = g_failures, reported = g_reported;
+    g_reported = kMaxReports;
+    protect(true);
+    AddStaleCode();
+    protect(false);  // as StoreViewSync left it (the policy flags these chunks)
+    const unsigned noticed = g_failures - failures;
+    g_failures = failures;
+    g_reported = reported;
+    std::printf("  store view lag: %u failed\n", noticed);
+    if (noticed == 0) {
+        std::fprintf(stderr, "FAIL: guarded code under a store view writable over it on purpose was not noticed\n");
+        ++g_failures;
+    }
+}
+
 void Stage(const char* name, void (*fn)()) {
     const auto start = Clock::now();
     const unsigned failuresBefore = g_failures;
     fn();
     std::printf("  %-34s %6.2f s%s\n", name, Since(start), g_failures != failuresBefore ? "  FAILED" : "");
     std::fflush(stdout);
+}
+void GuardedStages(unsigned randomCount, uint64_t firstSeed) {
+    SetGuardedCode();
+    const uint64_t before = GuardedCompiles();
+    Stage("guarded: branch forms", AddBranchForms);
+    Stage("guarded: loops and block lengths", AddLoops);
+    Stage("guarded: b chains", AddChains);
+    Stage("guarded: local calls and jumps", AddLocalCalls);
+    Stage("guarded: registered functions", AddRegisteredCalls);
+    Stage("guarded: stale code", GuardedStaleCode);
+    Stage("guarded: guard fault", GuardFault);
+    Stage("guarded: store view lag", StoreViewLag);
+    // Last of the stages that place the stale-code programs: link epoch fault 3 is compiled into the blocks made while it is on
+    // (their continuations after a call left without the epoch guard), and a later stage that placed the same program in the same
+    // slot would find those blocks matching its words and run them (a failure that is the fault's, not the code's).
+    Stage("guarded: link epoch faults", LinkEpochFaults);
+    {
+        const auto t = Clock::now();
+        const unsigned failed = g_failures;
+        AddRandomPrograms(randomCount / 4 + 1, firstSeed + randomCount);
+        std::printf("  %-34s %6.2f s%s\n", "guarded: random programs", Since(t), g_failures != failed ? "  FAILED" : "");
+    }
+    const uint64_t guarded = GuardedCompiles() - before;
+    std::printf("  guarded blocks compiled: %llu\n", static_cast<unsigned long long>(guarded));
+    if (PpcInterpreter::JitAvailable() && (guarded == 0) != GuardOff()) {
+        std::fprintf(stderr, "FAIL: %s\n", GuardOff() ? "blocks were compiled as guarded code with BRAWL_JIT_GUARD=0"
+                                                      : "no block was compiled as guarded code in the guarded stages");
+        ++g_failures;
+    }
 }
 }  // namespace
 
@@ -3332,6 +3462,7 @@ int main() {
         AddRandomPrograms(randomCount, firstSeed);
         std::printf("  %-34s %6.2f s%s\n", "random programs", Since(t), g_failures != before ? "  FAILED" : "");
     }
+    GuardedStages(randomCount, firstSeed);
     MkwRestoreHostMxcsr(savedControl);
     PpcInterpreter::ClearEngineOverride();
 

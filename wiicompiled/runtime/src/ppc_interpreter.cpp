@@ -46,6 +46,7 @@
 #include "memory.h"
 #include "memory_access.h"
 #include "ppc_runtime.h"
+#include "recomp_mod_loader.h"
 #include "runtime_log.h"
 #include "system_bridge.h"
 
@@ -550,33 +551,72 @@ inline void RestoreFprs(CpuContext* c, uint32_t mask, const PPC_FPR* saved) {
     }
 }
 
-// A run of registers copied: two at a time in one 16-byte move, then the rest one by one. The barrier keeps the compiler from
-// turning the loops into a call of memcpy, which costs more than the copy for a few registers.
 static_assert(sizeof(PPC_FPR) == 8);
-inline void CopyFprs(PPC_FPR* to, const PPC_FPR* from, unsigned count) noexcept {
-    unsigned i = 0;
-    for (; i + 2 <= count; i += 2) {
-        std::memcpy(to + i, from + i, 16);
-        __asm__ volatile("" ::: "memory");
+
+// Registers first..31 (first 14-31) to and from a guard's slots (slot r - 14): a jump into a straight run of 8-byte moves. The
+// translator measures most masks to such a run (f31 alone the most common, every non-volatile FPR for a callee it knows nothing
+// better of and the natives). Eight-byte moves, as compiled and translated code store these registers: each load is forwarded
+// from a store still in flight, which a wider load spanning two of them is not.
+inline void SaveTopFprs(const CpuContext* c, unsigned first, PPC_FPR* saved) {
+    switch (first) {
+    case 14: saved[0] = c->fpr[14]; [[fallthrough]];
+    case 15: saved[1] = c->fpr[15]; [[fallthrough]];
+    case 16: saved[2] = c->fpr[16]; [[fallthrough]];
+    case 17: saved[3] = c->fpr[17]; [[fallthrough]];
+    case 18: saved[4] = c->fpr[18]; [[fallthrough]];
+    case 19: saved[5] = c->fpr[19]; [[fallthrough]];
+    case 20: saved[6] = c->fpr[20]; [[fallthrough]];
+    case 21: saved[7] = c->fpr[21]; [[fallthrough]];
+    case 22: saved[8] = c->fpr[22]; [[fallthrough]];
+    case 23: saved[9] = c->fpr[23]; [[fallthrough]];
+    case 24: saved[10] = c->fpr[24]; [[fallthrough]];
+    case 25: saved[11] = c->fpr[25]; [[fallthrough]];
+    case 26: saved[12] = c->fpr[26]; [[fallthrough]];
+    case 27: saved[13] = c->fpr[27]; [[fallthrough]];
+    case 28: saved[14] = c->fpr[28]; [[fallthrough]];
+    case 29: saved[15] = c->fpr[29]; [[fallthrough]];
+    case 30: saved[16] = c->fpr[30]; [[fallthrough]];
+    case 31: saved[17] = c->fpr[31]; [[fallthrough]];
+    default: break;
     }
-    for (; i < count; ++i) {
-        to[i] = from[i];
-        __asm__ volatile("" ::: "memory");
+}
+inline void RestoreTopFprs(CpuContext* c, unsigned first, const PPC_FPR* saved) {
+    switch (first) {
+    case 14: c->fpr[14] = saved[0]; [[fallthrough]];
+    case 15: c->fpr[15] = saved[1]; [[fallthrough]];
+    case 16: c->fpr[16] = saved[2]; [[fallthrough]];
+    case 17: c->fpr[17] = saved[3]; [[fallthrough]];
+    case 18: c->fpr[18] = saved[4]; [[fallthrough]];
+    case 19: c->fpr[19] = saved[5]; [[fallthrough]];
+    case 20: c->fpr[20] = saved[6]; [[fallthrough]];
+    case 21: c->fpr[21] = saved[7]; [[fallthrough]];
+    case 22: c->fpr[22] = saved[8]; [[fallthrough]];
+    case 23: c->fpr[23] = saved[9]; [[fallthrough]];
+    case 24: c->fpr[24] = saved[10]; [[fallthrough]];
+    case 25: c->fpr[25] = saved[11]; [[fallthrough]];
+    case 26: c->fpr[26] = saved[12]; [[fallthrough]];
+    case 27: c->fpr[27] = saved[13]; [[fallthrough]];
+    case 28: c->fpr[28] = saved[14]; [[fallthrough]];
+    case 29: c->fpr[29] = saved[15]; [[fallthrough]];
+    case 30: c->fpr[30] = saved[16]; [[fallthrough]];
+    case 31: c->fpr[31] = saved[17]; [[fallthrough]];
+    default: break;
     }
 }
 
 // PpcNonvolatileFprGuard's work for the record `t` stands for, inline: the registers of its mask saved on construction and put
-// back on destruction (also when the callee throws), nothing else touched.
+// back on destruction (also when the callee throws), nothing else touched. A run ending at f31 is a straight run of moves
+// (SaveTopFprs), any other mask a loop over its registers.
 struct ThinFprGuard {
     CpuContext* const cpu;
     const JitCallTarget& t;
     PPC_FPR saved[18];
     ThinFprGuard(CpuContext* c, const JitCallTarget& target) noexcept : cpu(c), t(target) {
-        if (t.fprCount != 0) CopyFprs(saved + t.fprFirst, cpu->fpr + 14u + t.fprFirst, t.fprCount);
+        if (t.fprCount != 0 && t.fprFirst + t.fprCount == 18) SaveTopFprs(cpu, 14u + t.fprFirst, saved);
         else SaveFprs(cpu, t.fprMask, saved);
     }
     ~ThinFprGuard() {
-        if (t.fprCount != 0) CopyFprs(cpu->fpr + 14u + t.fprFirst, saved + t.fprFirst, t.fprCount);
+        if (t.fprCount != 0 && t.fprFirst + t.fprCount == 18) RestoreTopFprs(cpu, 14u + t.fprFirst, saved);
         else RestoreFprs(cpu, t.fprMask, saved);
     }
     ThinFprGuard(const ThinFprGuard&) = delete;
@@ -1495,13 +1535,57 @@ struct BlockCache {
     uint32_t lastEpoch = 0;
 
 #if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
-    // The blocks whose code lies under each mark (replaced ones too: their epoch stays 0); those marks, ascending
-    // once sorted; for the marks of rollback's tracked pages that a consume found set, the last such consume (see
+    // The blocks whose code lies under each mark (replaced ones too: their epoch stays 0); those marks as the lines of the
+    // mark map they fall in; for the marks of rollback's tracked pages that a consume found set, the last such consume (see
     // BrawlDirtyMemory::consumeSeq); and the blocks in the order built, with the consume count when built.
     std::unordered_map<uint32_t, std::vector<Block*>> owners;
-    std::vector<uint32_t> codeMarks;
-    bool codeMarksSorted = true;
-    std::vector<MarkCheck> codeWindows;  // codeMarks as 8-mark loads, rebuilt when it changes
+    // A line is 64 marks (one cache line of the mark map, 4 KiB of guest memory, inside one tracked page): its number
+    // (mark >> 6) and which of its marks lie under code (a byte of 0xFF each). Ascending; the marks that got their first
+    // owner since the last consume wait in newMarks and are merged in by the next one (CodeLinesMerge).
+    struct CodeLine {
+        uint32_t line;
+        uint32_t reserved;
+        uint64_t mask[8];
+    };
+    std::vector<CodeLine> codeLines;
+    // codeLines by tracked page (BrawlDirtyMemory::trackedPages: 16 lines a page): a page's number and its lines [begin, end)
+    struct CodePage {
+        uint32_t page, begin, end;
+    };
+    std::vector<CodePage> codePages;
+    std::vector<uint32_t> newMarks;
+    void CodeLinesMerge() {  // with CachesMutex held
+        std::sort(newMarks.begin(), newMarks.end());
+        std::vector<CodeLine> added;
+        for (const uint32_t m : newMarks) {
+            if (added.empty() || added.back().line != (m >> 6)) added.push_back(CodeLine{m >> 6, 0, {}});
+            uint8_t* const bytes = reinterpret_cast<uint8_t*>(added.back().mask);
+            bytes[m & 63u] = 0xFF;  // the marks are bytes: the line's loads are little or big endian alike
+        }
+        newMarks.clear();
+        std::vector<CodeLine> merged;
+        merged.reserve(codeLines.size() + added.size());
+        size_t i = 0, j = 0;
+        while (i < codeLines.size() || j < added.size()) {
+            if (j == added.size() || (i < codeLines.size() && codeLines[i].line < added[j].line)) {
+                merged.push_back(codeLines[i++]);
+            } else if (i == codeLines.size() || added[j].line < codeLines[i].line) {
+                merged.push_back(added[j++]);
+            } else {
+                CodeLine k = codeLines[i++];
+                for (uint32_t w = 0; w < 8; ++w) k.mask[w] |= added[j].mask[w];
+                ++j;
+                merged.push_back(k);
+            }
+        }
+        codeLines.swap(merged);
+        codePages.clear();
+        for (uint32_t i = 0; i < codeLines.size(); ++i) {
+            const uint32_t page = codeLines[i].line >> 4;
+            if (codePages.empty() || codePages.back().page != page) codePages.push_back(CodePage{page, i, i});
+            codePages.back().end = i + 1;
+        }
+    }
     // (consume count, mark) in count order: each time a consume found a code mark set (the newest entry of a mark is
     // its last such consume). A restore reads it back from the end, only as far as its snapshot's count.
     std::vector<std::pair<uint32_t, uint32_t>> writtenAt;
@@ -1530,6 +1614,7 @@ struct BlockCache {
         Caches().push_back(this);
         BrawlDirtyMemory::consumingMarks = &ConsumingMarks;
         BrawlDirtyMemory::restoredMarks = &RestoredMarks;
+        BrawlDirtyMemory::guardedWritten = &GuardedWritten;
     }
     ~BlockCache() {
         {
@@ -1542,10 +1627,7 @@ struct BlockCache {
     BlockCache& operator=(const BlockCache&) = delete;
     void Own(Block* b, uint32_t mark) {  // with CachesMutex held
         std::vector<Block*>& v = owners[mark];
-        if (v.empty()) {
-            codeMarksSorted = false;
-            codeMarks.push_back(mark);
-        }
+        if (v.empty()) newMarks.push_back(mark);
         v.push_back(b);
     }
     void RetireAll(uint32_t mark) {  // with CachesMutex held
@@ -1593,54 +1675,43 @@ struct BlockCache {
         g_jitLinkEpoch = epoch;
     }
     // BrawlDirtyMemory::consumingMarks: rollback's WriteWatch is about to clear its pages' marks, after which a
-    // write they show would no longer show; retire the code under the set ones now. The marks are scanned in
-    // ascending order, a few bytes per code block.
+    // write they show would no longer show; retire the code under the set ones now. The marks are read a line of the
+    // mark map at a time (CodeLine: one cache line, two vector loads), only the lines that hold code.
     static void ConsumingMarks(uint32_t seq) {
         diag::Add(diag::kConsumes);
         std::lock_guard<std::mutex> lock(CachesMutex());
         const uint8_t* const marks = BrawlDirtyMemory::leanBlocks;
-        constexpr uint32_t kLast = static_cast<uint32_t>(BrawlDirtyMemory::kLeanDirtyBlocks) - 7u;
         for (BlockCache* c : Caches()) {
-            if (!c->codeMarksSorted) {
-                std::sort(c->codeMarks.begin(), c->codeMarks.end());
-                c->codeWindows.clear();
-                for (const uint32_t m : c->codeMarks) {
-                    if (c->codeWindows.empty() || m - c->codeWindows.back().at > 7u)
-                        c->codeWindows.push_back(MarkCheck{0, m < kLast ? m : kLast});
-                    MarkCheck& k = c->codeWindows.back();
-                    uint8_t bytes[8];
-                    std::memcpy(bytes, &k.mask, 8);
-                    bytes[m - k.at] = 0xFF;
-                    std::memcpy(&k.mask, bytes, 8);
-                }
-                c->codeMarksSorted = true;
-            }
+            if (!c->newMarks.empty()) c->CodeLinesMerge();
             const uint32_t curEpoch = BrawlDirtyMemory::markEpoch.load(std::memory_order_acquire);
-            for (const MarkCheck& k : c->codeWindows) {
-                uint64_t v;
-                std::memcpy(&v, marks + k.at, 8);
-                if (__builtin_expect((v & k.mask) == 0, 1)) continue;
-                // only the tracked pages' marks are consumed (a window may end in the next page)
-                if (!BrawlDirtyMemory::trackedPages[(k.at >> 10) & 0x3FFFu].load(std::memory_order_relaxed) &&
-                    ((k.at & 1023u) <= 1016u ||
-                     !BrawlDirtyMemory::trackedPages[((k.at + 7u) >> 10) & 0x3FFFu].load(std::memory_order_relaxed)))
-                    continue;
-                uint8_t bytes[8];
-                std::memcpy(bytes, &k.mask, 8);
-                for (uint32_t j = 0; j < 8; ++j) {
-                    const uint32_t m = k.at + j;
-                    if (bytes[j] == 0 || marks[m] == 0 ||
-                        !BrawlDirtyMemory::trackedPages[(m >> 10) & 0x3FFFu].load(std::memory_order_relaxed))
-                        continue;
-                    const auto it = c->owners.find(m);
-                    if (it != c->owners.end()) {
-                        for (Block* o : it->second)
-                            if (o->epoch != 0 && (o->epoch != curEpoch || !HoldsUnder(*o, m))) {
-                                c->DropCounted(*o);
-                                diag::Add(diag::kConsumeRetired);
-                            }
+            const CodeLine* const lines = c->codeLines.data();
+            for (const CodePage& g : c->codePages) {
+                // only the tracked pages' marks are consumed
+                if (!BrawlDirtyMemory::trackedPages[g.page & 0x3FFFu].load(std::memory_order_relaxed)) continue;
+                for (uint32_t i = g.begin; i < g.end; ++i) {
+                    const CodeLine& k = lines[i];
+                    const uint8_t* const at = marks + (size_t{k.line} << 6);
+                    uint64_t any = 0;
+                    for (uint32_t w = 0; w < 8; ++w) {
+                        uint64_t v;
+                        std::memcpy(&v, at + 8u * w, 8);
+                        any |= v & k.mask[w];
                     }
-                    c->NoteWritten(m, seq);
+                    if (__builtin_expect(any == 0, 1)) continue;
+                    const uint8_t* const code = reinterpret_cast<const uint8_t*>(k.mask);
+                    for (uint32_t j = 0; j < 64; ++j) {
+                        if (code[j] == 0 || at[j] == 0) continue;
+                        const uint32_t m = (k.line << 6) + j;
+                        const auto it = c->owners.find(m);
+                        if (it != c->owners.end()) {
+                            for (Block* o : it->second)
+                                if (o->epoch != 0 && (o->epoch != curEpoch || !HoldsUnder(*o, m))) {
+                                    c->DropCounted(*o);
+                                    diag::Add(diag::kConsumeRetired);
+                                }
+                        }
+                        c->NoteWritten(m, seq);
+                    }
                 }
             }
         }
@@ -1678,6 +1749,60 @@ struct BlockCache {
             for (auto it = c->builtAt.rbegin(); it != c->builtAt.rend() && it->first >= snapshotSeq; ++it)
                 if (it->second->epoch != 0) c->DropCounted(*it->second);
         }
+    }
+    // Guarded code (BrawlDirtyMemory::guardedWritten, Block::jitGuarded): the start pcs whose blocks must keep their tests (they
+    // were dropped by writes kGuardDemote times), and the hook. A write that marks a block under guarded code drops every
+    // guarded block with code there in every cache, as a mark its test would see: before compiled code can follow a slot
+    // aimed at it (the slots are suspended; the next refresh compares its words and aims them again). Blocks that test
+    // their marks need nothing here.
+    std::unordered_set<uint32_t> unguarded;  // with CachesMutex held
+    static constexpr uint8_t kGuardDemote = 4;
+    static void GuardedWritten(uint32_t canonical, size_t size) {
+        if (g_jitEpochFault == 5) return;  // a test aid (g_jitEpochFault)
+        std::lock_guard<std::mutex> lock(CachesMutex());
+        uint64_t* const lines = BrawlDirtyMemory::guardLines;
+        const uint32_t first = canonical >> 6;
+        const uint32_t last = static_cast<uint32_t>((uint64_t{canonical} + size - 1) >> 6);
+        for (uint32_t m = first; m <= last && m < BrawlDirtyMemory::kLeanDirtyBlocks; ++m) {
+            const uint64_t bit = uint64_t{1} << (m & 63u);
+            if ((lines[m >> 6] & bit) == 0) continue;
+            // The line's bit stays while a guarded block that may run again has code there (a dropped one may be refreshed);
+            // with none left (demoted, or replaced: never refreshed) later writes there skip the lookup.
+            bool needed = false;
+            for (BlockCache* c : Caches()) {
+                const auto it = c->owners.find(m);
+                if (it == c->owners.end()) continue;
+                for (Block* o : it->second) {
+                    if (!o->jitGuarded || o->jitDemote) continue;
+                    if (o->epoch != 0) {
+                        c->DropCounted(*o);
+                        diag::Add(diag::kGuardDrops);
+                        if (++o->guardDrops >= kGuardDemote) {
+                            o->jitDemote = true;
+                            c->unguarded.insert(o->start);
+                            continue;
+                        }
+                    }
+                    needed = true;
+                }
+            }
+            if (!needed) lines[m >> 6] &= ~bit;
+        }
+    }
+    // A block just compiled as guarded: its marks go into the guard tables (never taken out: a mark there with no guarded
+    // block under it only costs the hook a lookup).
+    static void NoteGuardedBlock(const Block& b) {
+        static uint8_t chunks[1u << 14];
+        static uint64_t lines[BrawlDirtyMemory::kLeanDirtyBlocks / 64];
+        std::lock_guard<std::mutex> lock(CachesMutex());
+        for (uint32_t s = 0; s < b.segments; ++s)
+            for (uint32_t m = b.segment[s].firstMark; m <= b.segment[s].lastMark; ++m) {
+                if (!JitGuardedLine(b.segment[s].start, m)) continue;  // its mark is tested
+                lines[m >> 6] |= uint64_t{1} << (m & 63u);
+                chunks[m >> 10] = 1;
+            }
+        BrawlDirtyMemory::guardLines = lines;
+        BrawlDirtyMemory::guardChunks = chunks;
     }
     static uint64_t RetiredTotal() {  // BRAWL_JIT_CHURN: every cache's retired count (takes CachesMutex)
         std::lock_guard<std::mutex> lock(CachesMutex());
@@ -1836,9 +1961,9 @@ struct BlockCache {
         {
             std::lock_guard<std::mutex> lock(CachesMutex());
             owners.clear();
-            codeMarks.clear();
-            codeWindows.clear();
-            codeMarksSorted = true;
+            codeLines.clear();
+            codePages.clear();
+            newMarks.clear();
             writtenAt.clear();
             builtAt.clear();
         }
@@ -1909,6 +2034,10 @@ struct BlockCache {
     MKW_PPC_NO_INLINE bool Refresh(Block& b, uint32_t epoch) {
 #if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
         NoteEpoch(epoch);  // before b can be taken in this epoch: no slot aimed in an older one may stay
+        if (b.jitDemote) {  // guarded code written too often: built again, compiled with its tests (GuardedWritten)
+            SetEpoch(b, 0);
+            return false;
+        }
         const bool whole = b.epoch != epoch;
         bool tracked = false;
         for (uint32_t s = 0; s < b.segments && !tracked; ++s) {
@@ -2147,6 +2276,14 @@ struct BlockCache {
         b->jitLinked = nullptr;
         b->jitIncoming = nullptr;
         b->jitEpoch = nullptr;
+        b->jitGuarded = false;
+        b->jitDemote = false;
+        b->guardDrops = 0;
+#if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
+        b->jitNoGuard = unguarded.count(pc) != 0;
+#else
+        b->jitNoGuard = true;
+#endif
 #if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
         NoteEpoch(epoch);  // the block is taken as matching in this epoch: no slot aimed in an older one may stay
         {
@@ -2213,6 +2350,7 @@ struct BlockCache {
                 if (logged.fetch_add(1, std::memory_order_relaxed) < 64) LogChange(*b, epoch);
                 SetEpoch(*b, 0);
                 Retire(*b);
+                b->jitDemote = true;
                 b = Build(pc);
                 ++rebuilt;
             }
@@ -2228,6 +2366,7 @@ struct BlockCache {
                 NoteStale(*b);
                 SetEpoch(*b, 0);
                 Retire(*b);
+                b->jitDemote = true;  // replaced: never refreshed again (and its guarded lines need no hook: GuardedWritten)
                 b = Build(pc);
                 ++rebuilt;
                 if (diag::ChurnOn()) diag::AddKey(diag::kTRebuild, pc);
@@ -2591,6 +2730,21 @@ MKW_PPC_NO_INLINE Step RunBlockVerify(Frame& f, const Block& b, uint32_t& next, 
 
 namespace detail {
 
+bool JitGuardedLine(uint32_t segmentStart, uint32_t mark) noexcept {
+#if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
+    if (BrawlDirtyMemory::guardedWritten == nullptr) return false;
+    // the line's address in the segment's own view (its top bits), as the write guard pages are registered
+    const uint32_t address = (segmentStart & ~MemoryInline::kLeanMask) | (mark << 6);
+    if (RecompMod::g_executableWriteGuardPages[address >> RecompMod::kExecutableWriteGuardPageShift].load(std::memory_order_relaxed) == 0)
+        return false;
+    return MemoryInline::LeanStoreNeedsPolicy(address);
+#else
+    (void)segmentStart;
+    (void)mark;
+    return false;
+#endif
+}
+
 void JitSweepLinks() noexcept {
 #if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
     if (__builtin_expect(g_jitEpochFault == 2, 0)) return;
@@ -2757,6 +2911,9 @@ MKW_PPC_NO_INLINE void CompileBlock(BlockCache& cache, const JitBackend& backend
     }
     if (cache.jit == nullptr) cache.jit = backend.createCache();
     b.jitState = (cache.jit != nullptr && backend.compile(*cache.jit, b) && b.jitEntry != nullptr) ? 1 : 2;
+#if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
+    if (b.jitState == 1 && b.jitGuarded) BlockCache::NoteGuardedBlock(b);
+#endif
     cache.UpdateOverLimit();
 }
 
@@ -3082,7 +3239,15 @@ MKW_PPC_NO_INLINE void RunLoop(const LoopEnv& env) {
 
 }  // namespace
 
+// Every entry first tries what GuestCodePatch::RunPatched does for a patched function (RunCompiledEntry: compiled code entered
+// through jit_enter_direct when the entry's first block has code, is current and is no hook pc); the general entry otherwise.
+// Translated code's calls of untranslated code (a mod's module, through RunUntranslatedOrFail) come here.
 void Run(CpuContext* ctx, uint32_t entry) {
+    if (detail::RunCompiledEntry(ctx, entry)) return;
+    detail::RunGeneral(ctx, entry);
+}
+
+void detail::RunGeneral(CpuContext* ctx, uint32_t entry) {
     HZ_EXCLUSIVE(kHzInterpTicks);
     if (diag::ChurnOn()) {
         diag::Add(diag::kRuns);
@@ -3267,6 +3432,38 @@ bool detail::RunCompiledEntry(CpuContext* ctx, uint32_t entry) {
     (void)entry;
     return false;
 #endif
+}
+
+void detail::RunPatchedJit(CpuContext* ctx, uint32_t address) {
+    const PatchedHooks& h = g_patchedHooks;
+#if MKW_JIT && !MKW_INTERP_PROFILE
+    // RunCompiledEntry's fast path, behind RunPatched's redirect test (a call at or above the lowest redirect goes the general
+    // way, which resolves it)
+    ThreadState* const state = t_state;
+    if (__builtin_expect(state != nullptr && address < h.lowestRedirect->load(std::memory_order_acquire) &&
+                             g_fastJitReady.load(std::memory_order_acquire) && TryGetCpuContext() == ctx &&
+                             (!state->cache.overLimit || state->cache.depth != 0), 1)) {
+        const FastEntrySlot& fe = state->cache.fastEntries[FastEntryIdx(address)];
+        if (__builtin_expect(fe.pc == address && fe.jitChecked != nullptr && JitBlocksMayRun(ctx), 1)) {
+            diag::Add(diag::kFastEntries);
+            {
+                ++state->cache.depth;
+                struct DepthScope {
+                    BlockCache* cache;
+                    ~DepthScope() { --cache->depth; }
+                } depthScope{&state->cache};
+                g_enterDirect(ctx, address, fe.jitChecked, &state->directState);
+            }
+            // RunPatched's Sync test: what the function called may have patched more code (GuestCodePatch::RunPatched)
+            if (__builtin_expect(h.pendingFast->load(std::memory_order_acquire) != 0 ||
+                                     h.anyDirty->load(std::memory_order_acquire) ||
+                                     h.openEdgeCount->load(std::memory_order_acquire) != 0, 0))
+                h.sync();
+            return;
+        }
+    }
+#endif
+    h.runPatched(ctx, address);
 }
 
 #if MKW_INTERP_PROFILE

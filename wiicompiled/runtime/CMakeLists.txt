@@ -625,6 +625,9 @@ if(MKW_BUILD_INTERPRETER_TESTS)
         add_test(NAME mkw_jit_differential_interp_tests COMMAND mkw_jit_differential_tests)
         set_tests_properties(mkw_jit_differential_interp_tests PROPERTIES ENVIRONMENT "BRAWL_JIT=0")
         add_test(NAME mkw_jit_differential_jit_tests COMMAND mkw_jit_differential_tests)
+        # guarded code (and everything else) with the stores' policy test in line, not the store view's faults
+        add_test(NAME mkw_jit_differential_policy_tests COMMAND mkw_jit_differential_tests)
+        set_tests_properties(mkw_jit_differential_policy_tests PROPERTIES ENVIRONMENT "BRAWL_LEAN_STORE_VIEW=0")
     endif()
 
     # The floating point group of the run-time compiler against the classic interpreter, over edge values, forms, aliases and
@@ -647,6 +650,9 @@ if(MKW_BUILD_INTERPRETER_TESTS)
         add_executable(mkw_jit_mem_tests tests/jit_mem_tests.cpp)
         mkw_configure_interpreter_test(mkw_jit_mem_tests)
         add_test(NAME mkw_jit_mem_tests COMMAND mkw_jit_mem_tests)
+        # the stores without the store view (as on hosts without it): the policy tested in line, groups' range tests
+        add_test(NAME mkw_jit_mem_policy_tests COMMAND mkw_jit_mem_tests)
+        set_tests_properties(mkw_jit_mem_policy_tests PROPERTIES ENVIRONMENT "BRAWL_LEAN_STORE_VIEW=0")
     endif()
     if(MKW_JIT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/jit_branch_tests.cpp")
         add_executable(mkw_jit_branch_tests tests/jit_branch_tests.cpp)

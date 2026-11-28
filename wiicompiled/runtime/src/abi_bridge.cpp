@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <cstddef>
 #include <iomanip>
 #include <iostream>
@@ -681,8 +682,95 @@ MKW_PPC_FORCE_INLINE const RawDispatchRecord* ResolveIndirectSite(uint32_t targe
     return record;
 }
 
+// PpcNonvolatileFprGuard's work for the FPR mask of a record, the registers saved on construction and put back on destruction
+// (also when the callee throws), without its run analysis and generic copy loop. The translator measures most masks to a run
+// ending at f31 (f31 alone the most common, every non-volatile FPR for a callee it knows nothing better of): a jump into a
+// straight run of 8-byte moves, as translated code stores these registers (each load is forwarded from a store still in flight,
+// which a wider load spanning two of them is not). Any other mask: a loop over its registers.
+struct FprMaskGuard {
+    CpuContext* const cpu;
+    const uint32_t mask;
+    unsigned first;  // the run's first register, or 32: not a run ending at f31
+    PPC_FPR saved[18];
+    FprMaskGuard(CpuContext* c, uint32_t m) noexcept : cpu(c), mask(m), first(32) {
+        if (mask != 0 && mask == ~0u << __builtin_ctz(mask)) first = static_cast<unsigned>(__builtin_ctz(mask));
+        switch (first) {
+        case 14: saved[0] = cpu->fpr[14]; [[fallthrough]];
+        case 15: saved[1] = cpu->fpr[15]; [[fallthrough]];
+        case 16: saved[2] = cpu->fpr[16]; [[fallthrough]];
+        case 17: saved[3] = cpu->fpr[17]; [[fallthrough]];
+        case 18: saved[4] = cpu->fpr[18]; [[fallthrough]];
+        case 19: saved[5] = cpu->fpr[19]; [[fallthrough]];
+        case 20: saved[6] = cpu->fpr[20]; [[fallthrough]];
+        case 21: saved[7] = cpu->fpr[21]; [[fallthrough]];
+        case 22: saved[8] = cpu->fpr[22]; [[fallthrough]];
+        case 23: saved[9] = cpu->fpr[23]; [[fallthrough]];
+        case 24: saved[10] = cpu->fpr[24]; [[fallthrough]];
+        case 25: saved[11] = cpu->fpr[25]; [[fallthrough]];
+        case 26: saved[12] = cpu->fpr[26]; [[fallthrough]];
+        case 27: saved[13] = cpu->fpr[27]; [[fallthrough]];
+        case 28: saved[14] = cpu->fpr[28]; [[fallthrough]];
+        case 29: saved[15] = cpu->fpr[29]; [[fallthrough]];
+        case 30: saved[16] = cpu->fpr[30]; [[fallthrough]];
+        case 31: saved[17] = cpu->fpr[31]; break;
+        case 32:
+            for (uint32_t b = mask; b != 0; b &= b - 1u) {
+                const unsigned r = static_cast<unsigned>(__builtin_ctz(b));
+                saved[r - 14u] = cpu->fpr[r];
+            }
+            break;
+        default: break;
+        }
+    }
+    ~FprMaskGuard() {
+        switch (first) {
+        case 14: cpu->fpr[14] = saved[0]; [[fallthrough]];
+        case 15: cpu->fpr[15] = saved[1]; [[fallthrough]];
+        case 16: cpu->fpr[16] = saved[2]; [[fallthrough]];
+        case 17: cpu->fpr[17] = saved[3]; [[fallthrough]];
+        case 18: cpu->fpr[18] = saved[4]; [[fallthrough]];
+        case 19: cpu->fpr[19] = saved[5]; [[fallthrough]];
+        case 20: cpu->fpr[20] = saved[6]; [[fallthrough]];
+        case 21: cpu->fpr[21] = saved[7]; [[fallthrough]];
+        case 22: cpu->fpr[22] = saved[8]; [[fallthrough]];
+        case 23: cpu->fpr[23] = saved[9]; [[fallthrough]];
+        case 24: cpu->fpr[24] = saved[10]; [[fallthrough]];
+        case 25: cpu->fpr[25] = saved[11]; [[fallthrough]];
+        case 26: cpu->fpr[26] = saved[12]; [[fallthrough]];
+        case 27: cpu->fpr[27] = saved[13]; [[fallthrough]];
+        case 28: cpu->fpr[28] = saved[14]; [[fallthrough]];
+        case 29: cpu->fpr[29] = saved[15]; [[fallthrough]];
+        case 30: cpu->fpr[30] = saved[16]; [[fallthrough]];
+        case 31: cpu->fpr[31] = saved[17]; break;
+        case 32:
+            for (uint32_t b = mask; b != 0; b &= b - 1u) {
+                const unsigned r = static_cast<unsigned>(__builtin_ctz(b));
+                cpu->fpr[r] = saved[r - 14u];
+            }
+            break;
+        default: break;
+        }
+    }
+    FprMaskGuard(const FprMaskGuard&) = delete;
+    FprMaskGuard& operator=(const FprMaskGuard&) = delete;
+};
+static_assert(sizeof(PPC_FPR) == 8 && kPpcAllNonvolatileFprMask == 0xffffc000u);
+
+// TryDispatchRawCpuTarget for a record with an FPR guard and no GPR guard (every guarded record of the generated table): the
+// same scopes and guard, in the same order.
+MKW_PPC_NO_INLINE void DispatchFprsRecord(const RawDispatchRecord* record, CpuContext* cpu) {
+    RecompMod::ScopedTranslatedExecutionAddress translatedExecution(record->address);
+    FprMaskGuard fprGuard(cpu, record->nonvolatileFprWriteMask & kPpcAllNonvolatileFprMask);
+    if (TryGetCpuContext() != cpu) {
+        CpuContextScope scope(cpu);
+        record->entry(cpu);
+    } else {
+        record->entry(cpu);
+    }
+}
+
 // TryDispatchRawCpuTarget, with its unguarded case spelled out: for such a record the FPR and GPR guards do nothing,
-// and constructing them is two out-of-line calls in the old path.
+// and constructing them is two out-of-line calls in the old path. A guarded record without a GPR guard is DispatchFprsRecord.
 MKW_PPC_FORCE_INLINE bool DispatchIndirectSiteRecord(const RawDispatchRecord* record, CpuContext* cpu) {
     if (record != nullptr && record->entry != nullptr && IsUnguardedRecord(record)) {
         RecompMod::ScopedTranslatedExecutionAddress translatedExecution(record->address);
@@ -692,6 +780,10 @@ MKW_PPC_FORCE_INLINE bool DispatchIndirectSiteRecord(const RawDispatchRecord* re
         } else {
             record->entry(cpu);
         }
+        return true;
+    }
+    if (record != nullptr && record->entry != nullptr && !record->preserveNonvolatileGprs) {
+        DispatchFprsRecord(record, cpu);  // a nonzero FPR mask (else the record is unguarded)
         return true;
     }
     return TryDispatchRawCpuTarget(record, cpu);

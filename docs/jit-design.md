@@ -44,8 +44,9 @@ PpcInterpreter::Run (dispatcher, C++)
 ```
 
 A compiled block is entered by `jmp` and leaves by `jmp`: to a linked block, or to a common exit stub that returns
-from the enter trampoline. Blocks share one host frame, made by the trampoline. A block is compiled once it has been
-entered `SetJitThreshold` times (two by default).
+from the enter trampoline. Blocks share one host frame, made by the trampoline, except that a block may call a patched
+function's block with a host `call` (below, "Calls from compiled code"). A block is compiled once it has been entered
+`SetJitThreshold` times (two by default).
 
 ### Registers (x86-64)
 
@@ -60,7 +61,11 @@ entered `SetJitThreshold` times (two by default).
 | `xmm6`-`xmm15` (SysV), `xmm4`-`xmm5` (Win64) | the FPR cache within a block (a guest FPR's 64 raw bits) |
 | `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `xmm0`-`xmm3` | scratch (emitted code leaves `xmm4`-`xmm5` alone on both ABIs) |
 
-`rsp` is 16-byte aligned inside blocks; on Windows the trampoline's frame holds the 32-byte shadow space. Helper calls
+`rsp` is 16-byte aligned inside blocks. On Linux blocks run at *block level*, 16 bytes below the trampoline's frame:
+`[rsp]` is a return address into whatever entered that level (the trampoline enters the first block with `push; call`, a
+calling block with `push; call`) and `[rsp+8]` the return slot (a calling block's saved Frame word); one DWARF FDE per code
+chunk describes every block (CFA = rsp + 16, return address at CFA - 16), so C++ exceptions unwind through blocks and host
+calls between them. On Windows the trampoline's frame holds the 32-byte shadow space and blocks run at its level. Helper calls
 go through one emitter routine that hides the SysV / Win64 argument registers. Guest registers live in memory between
 blocks; within a block the two caches may hold them (stored before anything that calls or leaves the block, `jit_x64.h`).
 
@@ -68,7 +73,7 @@ blocks; within a block the two caches may hold them (stored before anything that
 
 ```
 hot code (one part of each code chunk, blocks one after another):
-linked:    the block's dirty marks clear                              else -> stale (far)
+linked:    the block's dirty marks clear (but its guarded lines')      else -> stale (far)
 entry:     r15 += count
            op 0 ... op n-1           native, or a call to the fallback; slow paths jump to far code
 exits:     static target -> jmp rel32, patched to the target's `linked` (or its unlinked stub)
@@ -92,8 +97,18 @@ data (a third part): link slots, the stale cell, inline caches, call cells (writ
   interpreter does it when it first validates a block in the new epoch, and every way compiled code goes on after C++ ran
   either tests its block's epoch (`EmitRecheck`, after a call), compares the link epoch (`ExitDynamicAfterCall`, after a tail
   call), or calls `JitNoteEpoch` before returning (the fallback, the store shims).
-- After a call that returns into the block, the block's own check (epoch and marks) runs again; failing it exits with the
-  next pc.
+- After a call that returns into the block, the block's own check (epoch and marks) runs again; failing it goes on at the
+  next pc through a link slot to the block there while the link epoch is the current one, else through the dispatcher.
+- Guarded lines: a block's 64-byte lines that lie in 4 KiB pages registered as executable (RecompMod's write guard; the store
+  policy flags their 64 KiB chunks, so every guest store there takes the checked path) are not tested, neither on the linked
+  entry nor after a call (`JitGuardedLine`). The block cache puts them in two tables (`BrawlDirtyMemory::guardChunks`, a byte per
+  64 KiB chunk, and `guardLines`, a bit per mark), and `BrawlDirtyMemory::Mark` and `LeanMarkRange`, which every write that marks
+  such a line goes through (the checked store path, the natives that mark; the natives that write marks themselves test the
+  store policy first, a translated stack store is never in an executable page), call its hook for a marked guarded line: it
+  drops every guarded block with code there (`BlockCache::GuardedWritten`: epoch 0, slots suspended) before compiled code goes
+  on. A block whose lines are all guarded (most of the game's own patched functions) has no test on its linked entry and only
+  the epoch after a call. A start dropped that way four times is built again with every line tested (`BlockCache::unguarded`).
+  Executable ranges are only ever added, so a line stays guarded. `BRAWL_JIT_GUARD=0` tests every line.
 - A link is a data slot (`jmp [slot]`), first aimed at its own unlinked stub, which exits with the slot's address. The
   dispatcher finds the target block and stores its `linked` address in the slot. A block that is replaced resets its
   incoming slots. A target that is a hook pc is never linked.
@@ -156,8 +171,15 @@ code; what is left (rare instruction forms, overflow-enable forms) takes this pa
   forms) with no call between them share one store-policy test and one set of dirty marks, made by the first of them for
   the bytes all of them write (at most 129); the others are the bare byte-swapped store. A leader whose range needs the
   checked path stores through it and either goes on (the range is plain RAM) or leaves the block before the others.
-- Loads (and grouped stores) on Linux use the aliased 4 GiB view of the lean window (`lean_window.h`): `[r12 + base +
-  disp]` with no mask, the window being mapped four times plus its first 64 KiB once more past 4 GiB.
+- Loads (and grouped stores) on Linux use the aliased view of the lean window (`lean_window.h`): `[r12 + base +
+  disp]` with no mask, the window being mapped five times plus its first 64 KiB once more past 5 GiB.
+- Stores on Linux go through the store view (`lean_window.h`, `g_storeView`): `[r12 + 1 GiB + base + disp]`, whose copy for
+  the cached view is writable exactly where the store policy is clear (`memory.cpp` keeps the protection in step with the
+  policy) and whose other copies are read-only. A store has no policy test: where the policy would send it to the checked
+  path it faults, and the fault handler (`jit_x64_mem.cpp`) resumes it at its slow entry in the op's cold code (the policy
+  test, then the store through the window or the checked path's routine) and patches the store into a jump there. Loads use
+  the same copies. A group's leader tests no range: its members fault for themselves. Marks of a store that went through are
+  made from its unmasked address. `BRAWL_LEAN_STORE_VIEW=0` (and every other host) keeps the policy test in line.
 
 ## Calls from compiled code
 
@@ -168,13 +190,26 @@ code; what is left (rare instruction forms, overflow-enable forms) takes this pa
   for it (`JitFastCallFor`: the entry, or a shared routine); an entry hit often moves to the front. Untranslated targets of
   either go through the block's inline cache 1. The rollback loop frame always takes the general path (`Call`).
 - A call to a patched function (a translated function whose guard byte is set, which `GuestCodePatch::RunPatched` runs in
-  the interpreter) from a `bl` is a call in a *subcall frame*: while the guard byte stays set and no redirect applies, the
-  site builds the callee's `Frame` in a trampoline-shaped host frame (`BlockEmitter::CallSubFrame`) and jumps to the
-  callee's block through a link slot; the callee's return comes back with a host `ret`, after `RunPatched`'s `Sync` test.
-  Exits of the callee that are not linked continue it in the dispatcher (`JitDirectContinue`) and come back the same way.
-  A `bctrl` does the same through `jit_subcall` (fast-entry table). Otherwise the wrapper runs `RunPatched`.
+  a `Run` of its own) from a `bl`, while the guard byte stays set and no redirect applies (Linux), is a host `call` of the
+  callee's block in the caller's `Frame`. The nested `Run`'s per-call state is only `pairedMask` (0) and `returnAddress`
+  (pc + 4), side by side in `Frame`: the caller pushes its pair (the return slot), stores the callee's with bit 0 of
+  `returnAddress` set (the tag; every reader masks the field with ~3), and calls through a *call link* (`CallLinked`: a
+  `call rel32` patched like a jump link to the callee block's linked entry). The callee's `blr` compares lr & ~3 with the
+  field: 0 is the frame's own function's return (the exit), 1 the tagged return, which puts the caller's pair back and
+  returns with `ret` (predicted by the return stack; the caller then drops the slot: `ret 8` measured slower); anything else is a jump. Then the caller makes `RunPatched`'s `Sync`
+  test and its validity test. A callee whose code jumps away from its return address keeps running with its own pair, as in
+  the nested `Run`, until a `blr` to that address. An exit to the dispatcher from inside such a callee (a stale block, an
+  unlinked call link, a cache miss, an exception) goes through `lift` (`JitLiftContinue`): the callee gets a `Frame` of its
+  own from the shared state and the dispatcher runs it (`JitDirectContinue`) until it returns; then the tagged return. A
+  `bctrl` does the same through `jit_subcall` (fast-entry table). Otherwise the wrapper runs `RunPatched`.
+- `bctrl` and `bctr` sites whose cells miss look in the code cache's table of translated targets (`TargetTable`, one for
+  calls and one for tail calls, filled from the cells) before their shims. A `bctr` after `lwzx; mtctr` (a switch's table)
+  probes the inline cache first. `ctx->pc` (a diagnostic) is not stored before direct calls of translated code.
 - `GuestCodePatch::RunPatched` enters compiled code through `RunCompiledEntry`, which does what `Run` does for a first
-  block that has code, is current and is no hook pc, and hands anything else to the general entry.
+  block that has code, is current and is no hook pc, and hands anything else to the general entry. With code variants off
+  it tail-calls `RunPatchedJit`, which makes the redirect test, `RunCompiledEntry`'s fast path and the `Sync` test in one
+  function. `Run` itself tries `RunCompiledEntry` first, so translated code's calls of untranslated code (a mod's module,
+  through `RunUntranslatedOrFail`) enter through `jit_enter_direct` too.
 - Linux x86-64: code space is mapped within a rel32 displacement of the executable's text (a reservation at the top of the
   reachable window), so calls of translated functions and runtime helpers are `call rel32`.
 
@@ -201,12 +236,14 @@ Read once, at first use.
 | `BRAWL_JIT_NO_FUSED_FLAGS=1` | fused compare and bc write the field and branch on it (`mkw_jit_quality_bookkeeping_tests`) |
 | `BRAWL_JIT_NO_FUSED_FCMP=1` | an `fcmpu` always writes its field and the `bc` after it reads the field in memory |
 | `BRAWL_JIT_NO_FPR_CACHE=1` | no FPR cache: every float op loads and stores its registers (the pending forms stay) |
-| `BRAWL_LEAN_ALIAS=0` | the lean window without its aliased 4 GiB view (Linux): loads and grouped stores mask their address |
+| `BRAWL_LEAN_ALIAS=0` | the lean window without its aliased view (Linux): loads and grouped stores mask their address |
+| `BRAWL_LEAN_STORE_VIEW=0` | no store view (Linux): stores test the store policy in line (`mkw_jit_mem_policy_tests`) |
 | `BRAWL_JIT_CHURN=<file>`, `BRAWL_JIT_PROBE=<pc,...>` | block cache and JIT churn counters (only in a build with `MKW_JIT_CHURN=1`); the registers logged before the op at each pc (`ppc_interpreter_diag.h`) |
 | `BRAWL_JIT_FORMS_FAULT=<1-4>`, `BRAWL_JIT_STALE_FAULT=<n>` | make the form analysis or the stale stub wrong on purpose, to show the tests notice |
 | `BRAWL_JIT_STALE_STUB=<n>` | stale paths of a block before it gets a stub; 0 never (`jit_stale_tests` sets 8) |
 | `BRAWL_JIT_FAR_JUMPS=1` | jumps to the shared routines always take the long form (`mkw_jit_quality_far_tests`) |
 | `BRAWL_JIT_FAR_MEMORY=1` | code space mapped anywhere, not near the executable (`mkw_jit_branch_direct_far_tests`) |
+| `BRAWL_JIT_GUARD=0` | every line of a block tested, guarded ones too (see "Guarded lines") |
 | `BRAWL_JIT_EXEC_MEM=1`, `BRAWL_JIT_BLOCK_PC=1` | blocks add their count to `frame.executed` in memory; blocks store `ctx->pc` at entry |
 
 ## Files
@@ -234,7 +271,8 @@ Built with `-DMKW_BUILD_INTERPRETER_TESTS=ON`; `ctest -R "jit|interpreter|guest_
   registered functions, exceptions through a call.
 - Per group: `jit_int`, `jit_mem` (also compares dirty marks and exceptions from stores), `jit_fp` (every float kind
   over NaN, denormal and rounding operand tables, both forms), `jit_forms`, `jit_generic`, `jit_branch` (every branch
-  form, calls of every guard class, patched callees, subcall frames; `mkw_jit_branch_direct_tests` runs them entered through
+  form, calls of every guard class, patched callees, host calls between them (longjmp-like returns, exits from inside
+  them); `mkw_jit_branch_direct_tests` runs them entered through
   `jit_enter_direct`), `jit_quality` (condition-register liveness, the entry check),
   `jit_stale`, `jit_core` (links, retire, the code limit), `jit_exec_memory`.
 - The existing interpreter tests, run with the JIT as the engine.

@@ -15,6 +15,7 @@
 #include "brawl_dirty_memory.h"
 #include "jit_test_cr.h"
 #include "isa/ppc_isa_fpenv.h"
+#include "lean_window.h"
 #include "memory.h"
 #include "ppc_interpreter.h"
 #include "../src/jit/jit_x64.h"
@@ -788,13 +789,120 @@ void WrappingAddresses() {
     }
 }
 
-void SetCodeChunk(bool on) {
-    RecompMod::g_executableWriteGuardEnabled.store(on);
-    const uint32_t page = kFlaggedChunk + 0x800u;  // a 4 KiB guard page inside the chunk, at its start
+void SetGuardPage(uint32_t page, bool on) {
     RecompMod::g_executableWriteGuardCoarsePages[page >> RecompMod::kExecutableWriteGuardCoarsePageShift].store(on);
     RecompMod::g_executableWriteGuardMidPages[page >> RecompMod::kExecutableWriteGuardMidPageShift].store(on);
     RecompMod::g_executableWriteGuardPages[page >> RecompMod::kExecutableWriteGuardPageShift].store(on);
     Memory::RefreshWritableFastPathsForExecutableRanges();
+}
+
+void SetCodeChunk(bool on) {
+    RecompMod::g_executableWriteGuardEnabled.store(on);
+    SetGuardPage(kFlaggedChunk + 0x800u, on);  // a 4 KiB guard page inside the chunk, at its start
+}
+
+// --- stores that fault (the store view, lean_window.h; jit_x64_mem.cpp) ----------------------------------------------------
+// A store's site faults where the policy flags its chunk, then is a jump to its slow entry. Loops run a block's sites again
+// after they were patched, into the flagged chunk from below and out of it from inside; the policy of a chunk changes under a
+// compiled block (the store view follows the policy, memory.cpp), which then goes on storing as the interpreter does.
+constexpr uint32_t kToggleChunk = 0x80600000u;
+
+// Both engines from the same state, the program at `entry` already written (the JIT's block, compiled by an earlier run, stays).
+void RunAt(const Case& c, uint32_t entry) {
+    const Snap classic = RunOne(Engine::Classic, c, entry);
+    const Snap jit = RunOne(Engine::Jit, c, entry);
+    ++g_cases;
+    g_threw += classic.threw;
+    g_observedCodeWrite += classic.lastExecutableWrite != 0;
+    const std::string diff = Diff(classic, jit, c.exactMarks);
+    if (!diff.empty() && ++g_failures <= 12) std::printf("FAIL %s\n%s", c.name.c_str(), diff.c_str());
+}
+
+void FaultingStores() {
+    const auto mtctr = [](uint32_t r) { return 0x7C0903A6u | (r << 21); };
+    const auto bdnz = [](int32_t back) { return 0x42000000u | (static_cast<uint32_t>(back) & 0xFFFCu); };
+    // stwu / stbu / stfsu / psq_stu in a loop of `n` stores 4 (1) bytes apart, from below the flagged chunk into it, and from
+    // inside it out
+    struct LoopStore {
+        const char* name;
+        uint32_t word;  // the store, rS / frS 5, rA 3
+        uint32_t step;
+    };
+    const LoopStore stores[] = {
+        {"stwu", D(37, 5, 3, 4), 4}, {"stbu", D(39, 5, 3, 1), 1}, {"sthu", D(45, 5, 3, 2), 2},
+        {"stfsu", D(53, 5, 3, 4), 4}, {"stfdu", D(55, 5, 3, 8), 8}, {"psq_stu w0", Psq(61, 5, 3, 0, 0, 8), 8},
+    };
+    for (const LoopStore& s : stores) {
+        for (const uint32_t start : {kFlaggedChunk - 3 * s.step, kFlaggedChunk + 0x10000u - 3 * s.step, kFlaggedChunk + 0x400u}) {
+            for (const uint32_t n : {2u, 6u}) {
+                Case c;
+                c.name = std::string("loop ") + s.name + " from " + std::to_string(start) + " x" + std::to_string(n);
+                c.init = BaseContext(12000 + start + n);
+                c.init.xer &= ~0x80000000u;  // compiled code runs only while XER[SO] is clear
+                c.init.gpr[3] = start - s.step;
+                c.init.gpr[7] = n;
+                c.init.fpr[5].raw = 0x3FF8000000000000ull;
+                // li r7 is in the context; mtctr r7; loop: store; addi r5, r5, 1; bdnz loop; blr
+                c.words = {mtctr(7), s.word, 0x38A50001u, bdnz(-8), kBlr};
+                c.windows = {start, start + n * s.step};
+                c.exactMarks = false;
+                c.prepare = [w = c.windows] {
+                    for (uint32_t at : w) Fill(at, 88 + at, 0x5A5A5A5Au)();
+                };
+                Run(c);
+            }
+        }
+    }
+    // A compiled block's store into a chunk whose policy changes between its runs: clear (it stores), flagged (it faults and
+    // takes the checked path; its site becomes a jump), clear (the slow entry stores through the window), flagged again.
+    struct Kind {
+        const char* name;
+        uint32_t word;
+    };
+    const Kind kinds[] = {
+        {"stw", D(36, 5, 3, kDisp)}, {"sthu", D(45, 5, 3, kDisp)}, {"stbx", X(5, 3, 4, 215)}, {"stfs", D(52, 5, 3, kDisp)},
+        {"stfdu", D(55, 5, 3, kDisp)}, {"psq_st w0", Psq(60, 5, 3, 0, 0, kDisp)}, {"psq_st w1", Psq(60, 5, 3, 1, 0, kDisp)},
+        {"group", D(36, 5, 3, kDisp)},  // with a member: stw r6, kDisp + 4(r3)
+    };
+    RecompMod::g_executableWriteGuardEnabled.store(true);
+    for (const Kind& k : kinds) {
+        for (const int delta : {0, 60, 0x1000}) {
+            const bool group = std::string(k.name) == "group";
+            const uint32_t ea = kToggleChunk + 0x2000u + static_cast<uint32_t>(delta);
+            if (g_codeNext + 32 >= kCodeLimit) g_codeNext = kCodeBase;
+            const uint32_t entry = g_codeNext;
+            g_codeNext += 64;
+            std::vector<uint32_t> words = {k.word};
+            if (group) words.push_back(D(36, 6, 3, kDisp + 4));
+            words.push_back(kBlr);
+            for (size_t i = 0; i < words.size(); ++i) Memory::Write32(entry + 4u * static_cast<uint32_t>(i), words[i]);
+            uint64_t compiled = 0, faults = 0;
+            for (int phase = 0; phase < 4; ++phase) {
+                SetGuardPage(kToggleChunk + 0x8000u, (phase & 1) != 0);
+                if (phase == 1) {  // the block of phase 0 runs on, and its site faults now (with the store view)
+                    compiled = PpcInterpreter::detail::JitX64GetStats().compiled;
+                    faults = PpcInterpreter::detail::JitX64GetFaultStats().faults;
+                }
+                Case c;
+                c.name = std::string("policy change ") + k.name + " " + std::to_string(delta) + " phase " + std::to_string(phase);
+                c.init = BaseContext(13000 + static_cast<uint64_t>(delta));
+                c.init.xer &= ~0x80000000u;  // compiled code runs only while XER[SO] is clear
+                c.init.gpr[3] = ea - kDisp;
+                c.init.fpr[5].raw = 0x400C000000000000ull;
+                c.words = words;
+                c.windows = {ea};
+                c.exactMarks = false;
+                c.prepare = Fill(ea, 90 + phase, 0x0, 0x0);
+                RunAt(c, entry);
+            }
+            const bool recompiled = PpcInterpreter::detail::JitX64GetStats().compiled != compiled;
+            const bool faulted = PpcInterpreter::detail::JitX64GetFaultStats().faults > faults;
+            if (std::getenv("BRAWL_JIT_FALLBACK") == nullptr && (recompiled || faulted != LeanWindow::g_storeView) &&
+                ++g_failures <= 12)
+                std::printf("FAIL policy change %s %d: recompiled %d, faulted %d\n", k.name, delta, recompiled, faulted);
+        }
+    }
+    SetGuardPage(kToggleChunk + 0x8000u, false);
 }
 
 }  // namespace
@@ -828,6 +936,7 @@ int main() {
     stage("frames", Frames);
     stage("store groups", StoreGroups);
     stage("wrapping addresses", WrappingAddresses);
+    stage("faulting stores", FaultingStores);
     PpcInterpreter::ClearEngineOverride();
     SetCodeChunk(false);
     std::printf("  reached: %llu cases ended in an exception, %llu with a store into guarded code, %llu with dirty marks set\n",
@@ -843,10 +952,21 @@ int main() {
                 static_cast<unsigned long long>(groups.leaders), static_cast<unsigned long long>(groups.members),
                 static_cast<unsigned long long>(groups.rangeBack), static_cast<unsigned long long>(groups.slowGoOn),
                 static_cast<unsigned long long>(groups.slowLeave), static_cast<unsigned long long>(g_groupedMarks));
+    // With the store view a leader tests no range (its members fault for themselves): no range test comes back.
+    const bool storeView = LeanWindow::g_storeView;
     if (std::getenv("BRAWL_JIT_FALLBACK") == nullptr &&
-        (groups.leaders == 0 || groups.members == 0 || groups.rangeBack == 0 || groups.slowGoOn == 0 ||
+        (groups.leaders == 0 || groups.members == 0 || (groups.rangeBack == 0) != storeView || groups.slowGoOn == 0 ||
          groups.slowLeave == 0 || g_groupedMarks == 0)) {
         std::printf("jit mem tests: a store group path was never reached\n");
+        ++g_failures;
+    }
+    const PpcInterpreter::detail::JitX64FaultStats faults = PpcInterpreter::detail::JitX64GetFaultStats();
+    std::printf("  fault stores %s: %llu sites, %llu faults handled, %llu at a site already patched\n", storeView ? "on" : "off",
+                static_cast<unsigned long long>(faults.sites), static_cast<unsigned long long>(faults.faults),
+                static_cast<unsigned long long>(faults.repeated));
+    if (std::getenv("BRAWL_JIT_FALLBACK") == nullptr &&
+        (storeView ? faults.sites == 0 || faults.faults == 0 || faults.repeated != 0 : faults.sites != 0)) {
+        std::printf("jit mem tests: the stores' faults are not what the store view says\n");
         ++g_failures;
     }
     // The Generic forms in the tables (indexed update, byte-reversed, algebraic, rA = 0, float indexed, stwcx., stfiwx) must have

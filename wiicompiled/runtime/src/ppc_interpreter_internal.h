@@ -44,15 +44,18 @@ struct JitCallTarget {
 // members are kept in memory because compiled code reads and writes them.
 constexpr uint32_t kFrameFlagLoopFrame = 1u << 0;   // this frame is BrawlRollback::RunLoop's frame
 constexpr uint32_t kFrameFlagDirectEnter = 1u << 1; // entered via jit_enter_direct (in-trampoline Frame)
-constexpr uint32_t kFrameFlagSubCall = 1u << 2;     // a subcall frame (JIT->patched-JIT call: BlockEmitter::CallSubFrame, jit_subcall)
+constexpr uint32_t kFrameFlagSubCall = 1u << 2;     // a frame the JIT made for a function it called (its continuation: JitLiftContinue)
 
 struct Frame {
     Frame(CpuContext* c, uint32_t at) : ctx(c), pc(at), entry(at) {}
     CpuContext* ctx;
     uint32_t pairedMask = 0;          // bit r is 1 when fpr[r] holds a paired value, 0 when it holds a scalar double
+    // The lr the function running was entered with, & ~3 (compiled code compares lr & ~3 with it). Every reader masks it with ~3:
+    // compiled code sets bit 0 while a function it called with a host call runs in this frame (src/jit/jit_x64_branch.cpp), and
+    // keeps this field and pairedMask (one 8-byte word) on the host stack across that call.
+    uint32_t returnAddress = 0;
     uint32_t flags = 0;               // kFrameFlag*
     uint32_t pc;
-    uint32_t returnAddress = 0;       // the lr the frame was entered with, & ~3 (compiled code compares lr & ~3 with it as it is)
     uint32_t entry;                   // the address the function running was entered at
     uint32_t reserved = 0;
     uint64_t executed = 0;            // guest instructions compiled code ran since the dispatcher last collected them
@@ -216,6 +219,15 @@ struct Block {
     // The JIT's (docs/jit-design.md); Build clears them. The backend owns what they point to.
     uint32_t entries;       // times the dispatcher entered it while it had no code
     uint8_t jitState;       // 0: not tried, 1: compiled, 2: not compilable (the interpreter runs it)
+    // Guarded code (BrawlDirtyMemory::guardedWritten, JitGuardedLine): the backend compiled the block without the dirty-mark
+    // tests of its guarded lines (on its linked entry and after its calls), as a mark of one of them drops it
+    // (BlockCache::GuardedWritten). jitNoGuard: the backend must not (its start was dropped that way too often:
+    // BlockCache::unguarded); guardDrops counts those drops, and jitDemote asks the block cache to build the block again
+    // (with all its tests) instead of refreshing it.
+    bool jitGuarded;
+    bool jitNoGuard;
+    bool jitDemote;
+    uint8_t guardDrops;
     const void* jitEntry;   // compiled code's entry that skips the validity check; null when not compiled
     const void* jitChecked; // the entry that performs all of it (epoch and marks): entries from outside compiled code
     // The entry that tests only the dirty marks, which link slots and inline caches aim at. A slot is aimed at a block only
@@ -253,16 +265,27 @@ struct DirectEnterState {
 };
 
 // Hooks registered once by GuestCodePatch::Protect (when code variants are off) so JIT-to-patched-JIT calls can
-// bypass RunPatched/RunCompiledEntry/jit_enter_direct while preserving redirect/unpatch/Sync checks.
+// bypass RunPatched/RunCompiledEntry/jit_enter_direct while preserving redirect/unpatch/Sync checks. GuestCodePatch calls
+// BrawlDirtyMemory::MarksCleared whenever a guard byte drops to 0 or lowestRedirect moves: a linked call of a patched function's
+// block tests neither (its link's stub does), and that suspends every link before compiled code follows one.
 struct PatchedHooks {
     const uint8_t* (*patchedByteFor)(uint32_t address) = nullptr;
     const std::atomic<uint64_t>* pendingFast = nullptr;
     const std::atomic<bool>* anyDirty = nullptr;
     const std::atomic<uint32_t>* lowestRedirect = nullptr;
     void (*sync)() = nullptr;
+    // For RunPatchedJit (GuestCodePatch::RunPatched with code variants off): the third flag of RunPatched's Sync test (open
+    // edge pages), and RunPatched's own path for a call RunPatchedJit does not make. Both null: RunPatched never hands calls
+    // to RunPatchedJit.
+    const std::atomic<uint32_t>* openEdgeCount = nullptr;
+    void (*runPatched)(CpuContext* ctx, uint32_t address) = nullptr;
 };
 void RegisterPatchedHooks(const PatchedHooks& hooks) noexcept;
 const PatchedHooks& GetPatchedHooks() noexcept;
+// GuestCodePatch::RunPatched for a patched function while code variants are off (with the hooks above registered): below the
+// redirect bound, an entry the thread's fast-entry table holds is entered as RunCompiledEntry enters it, then RunPatched's Sync
+// test; any other call is hooks.runPatched's. RunPatched tail-calls it, so the common call is one C++ function, not three.
+void RunPatchedJit(CpuContext* ctx, uint32_t address);
 
 // Direct call to a non-throwing-guard fprsOnly target (no try/catch: unwinds directly through chunk .eh_frame).
 void JitDirectFprsCall(CpuContext* cpu, const JitCallTarget* t);
@@ -288,6 +311,13 @@ struct JitBackend {
     void (*setEpoch)(Block& b);
 };
 
+// Guarded code: whether the dirty mark `mark` (one per 64 guest bytes of the canonical window) of a block's segment starting at
+// segmentStart covers a guarded line: its 4 KiB page is registered as executable (RecompMod's write guard) and the store policy
+// flags its 64 KiB chunk. Every write that marks such a line marks through BrawlDirtyMemory::Mark or LeanMarkRange (guest stores
+// there take the checked path), so a compiled block may leave the line's mark untested once the line is in the guard tables
+// (BlockCache::NoteGuardedBlock), whose hook then drops it. Executable ranges are only ever added, so the answer stays true.
+bool JitGuardedLine(uint32_t segmentStart, uint32_t mark) noexcept;
+
 // Whether compiled code may run now: not while XER[SO] is set. The JIT's compares store the field value without the SO copy
 // PpcCrvCompare makes (BlockEmitter::CrStore), which is exact only while SO is clear; nothing the game runs sets it, so while
 // it is set the dispatcher interprets (every entry into compiled code tests this first: RunLoop, RunCompiledEntry), and
@@ -295,7 +325,8 @@ struct JitBackend {
 inline bool JitBlocksMayRun(const CpuContext* c) noexcept { return MKW_LEAN_FLAGS || (c->xer & 0x80000000u) == 0; }
 
 // Called from jit_enter_direct's slow exit when a compiled block leaves without returning (stale, unlinked, hook, or
-// pending exception), and a subcall frame's (state null: the thread's). May throw (unwinds through the trampoline frame's FDE).
+// pending exception), and for the frame the JIT makes for a function it called with a host call (JitLiftContinue; state null: the
+// thread's). May throw (unwinds through the blocks' FDE).
 void JitDirectContinue(DirectEnterState* state, Frame* f, uint64_t statusAndNext, JitLink* link);
 // The calling thread's fast-entry table (BlockCache::fastEntries), for jit_subcall.
 const FastEntrySlot* JitThreadFastEntries() noexcept;
@@ -318,7 +349,8 @@ inline uint32_t g_jitLinkEpoch = 0;
 inline const uint32_t* JitLinkEpochCell() noexcept { return &g_jitLinkEpoch; }
 // A test aid (jit_differential_tests): the link epoch made wrong on purpose so that the tests can show they notice. 1: a new
 // epoch suspends no slot; 2: JitNoteEpoch does nothing; 3: ExitDynamicAfterCall takes the inline cache unguarded (read when a
-// block is compiled); 4: a block's epoch is not copied into its code (JitBackend::setEpoch). 0 in a real run.
+// block is compiled); 4: a block's epoch is not copied into its code (JitBackend::setEpoch); 5: a write under guarded code drops
+// nothing (BlockCache::GuardedWritten). 0 in a real run.
 inline int g_jitEpochFault = 0;
 // JitNoteEpoch's work when the epochs differ: every slot suspended (JitBackend::suspend), the cell set to markEpoch.
 void JitSweepLinks() noexcept;
@@ -414,7 +446,9 @@ bool IsHookPc(uint32_t pc);
 
 // Run(ctx, entry) for an entry whose first block has compiled code, current, and is no hook pc, without the general entry's
 // setup: true when it ran, false when it did nothing and the caller makes the general call.
-// Defined in ppc_interpreter.cpp; GuestCodePatch::RunPatched's last step is its caller.
+// Defined in ppc_interpreter.cpp; GuestCodePatch::RunPatched's last step is its caller, and Run's first.
 bool RunCompiledEntry(CpuContext* ctx, uint32_t entry);
+// Run without its RunCompiledEntry attempt: for a caller that has just made it.
+void RunGeneral(CpuContext* ctx, uint32_t entry);
 
 }  // namespace PpcInterpreter::detail

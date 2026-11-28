@@ -55,13 +55,14 @@ enum Counter : uint32_t {
     kJitStubLeaves,     // ... that left for the dispatcher (a word differed or the epoch is old)
     kJitCacheMisses,    // inline-cache misses (left for the dispatcher with a cache slot)
     kJitProbeHits,      // BRAWL_JIT_PROBE calls
+    kGuardDrops,        // guarded blocks dropped by a write under them (BlockCache::GuardedWritten)
     kCounters
 };
 inline constexpr const char* kCounterNames[kCounters] = {
     "finds", "interp_blocks", "interp_ops", "compile_calls", "enters", "follow_links", "fast_entries", "slow_entries",
     "slow_entries_ran", "direct_continues", "runs", "consumes", "restores", "restore_retired", "consume_retired",
     "fallback_ops", "jit_compiled", "jit_compile_failed", "jit_links", "jit_retires", "jit_retire_slots", "jit_stale_paths",
-    "jit_stale_stubs", "jit_stub_runs", "jit_stub_leaves", "jit_cache_misses", "jit_probe_hits",
+    "jit_stale_stubs", "jit_stub_runs", "jit_stub_leaves", "jit_cache_misses", "jit_probe_hits", "guard_drops",
 };
 // The counters as a block of memory compiled code can increment (`inc qword [abs]`): CounterCell(c).
 uint64_t* CounterCell(Counter c);

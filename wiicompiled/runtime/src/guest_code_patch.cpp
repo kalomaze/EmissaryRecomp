@@ -107,6 +107,11 @@ void BumpVariantCallEpoch() {
     g_variantCallEpoch.store(next, std::memory_order_release);
 }
 
+// A guard byte went back to 0 or the redirect bound moved: the JIT's calls of patched functions' blocks (call links, which test
+// neither once linked: src/jit/jit_x64_branch.cpp) are suspended before compiled code can follow one, as for memory rewritten
+// without marks; a call link is aimed again only by its own stub, which tests both.
+void NotePatchedCallsChanged() { BrawlDirtyMemory::MarksCleared(); }
+
 void UpdateLowestRedirectLocked() {
     uint32_t lowest = UINT32_MAX;
     for (const Redirect& r : g_redirects) {
@@ -545,25 +550,14 @@ bool TrapStats() {
     return on;
 }
 
+// Code variants off: what the JIT calls patched functions and RunPatched with (PpcInterpreter::detail::PatchedHooks).
+void RegisterJitHooks();
+
 void Protect(uint32_t start, uint32_t end, const char* name) {
     std::call_once(g_variantsOnce, [] {
         InitVariants();
         ProtectVariantRegions();
-        if (!g_variantsEnabled) {
-            PpcInterpreter::detail::PatchedHooks hooks;
-            hooks.patchedByteFor = [](uint32_t address) -> const uint8_t* {
-                const uint32_t* begin = g_mkwGuardedFunctionStarts;
-                const uint32_t* end = begin + g_mkwGuardedFunctionCount;
-                const uint32_t* it = std::lower_bound(begin, end, address);
-                if (it == end || *it != address) return nullptr;
-                return &g_mkwGuestCodePatched[static_cast<size_t>(it - begin)];
-            };
-            hooks.pendingFast = &g_pendingFast;
-            hooks.anyDirty = &g_anyDirty;
-            hooks.lowestRedirect = &g_lowestRedirect;
-            hooks.sync = &Sync;
-            PpcInterpreter::detail::RegisterPatchedHooks(hooks);
-        }
+        if (!g_variantsEnabled) RegisterJitHooks();
     });
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -918,6 +912,7 @@ void ReleaseBaked() {
         g_mkwGuestCodePatched[index] = 0;
         ++released;
     }
+    if (released != 0) NotePatchedCallsChanged();
     for (const uint32_t index : differing) MarkInliningCallers(index);  // their inlining callers stay with them
     RT_LOGF(RT_TAG_MOD, "[mods] baked code: %u function(s) run translated, %zu differ from the bake and stay in the "
             "interpreter\n", released, differing.size());
@@ -1008,6 +1003,7 @@ void ResetPristine(uint32_t start, uint32_t end) {
             if (function >= start && function < end) g_mkwGuestCodePatched[index] = 1;
         }
         RemarkInliningCallersIn(start, end);
+        NotePatchedCallsChanged();
         for (uint32_t page = start & ~(kPage - 1); page < end; page += kPage) {
             g_dirty.erase(std::remove(g_dirty.begin(), g_dirty.end(), page), g_dirty.end());
             ForgetOpenEdgeLocked(page);
@@ -1067,6 +1063,7 @@ void RedirectModule(uint32_t homeStart, uint32_t homeEnd, uint32_t target, const
     slot->start.store(homeStart, std::memory_order_release);
     UpdateLowestRedirectLocked();
     BumpVariantCallEpoch();
+    NotePatchedCallsChanged();
     uint32_t count = 0;
     for (int64_t index = std::max<int64_t>(FunctionIndex(homeStart), 0);
          index < static_cast<int64_t>(g_mkwGuardedFunctionCount); ++index) {
@@ -1101,6 +1098,7 @@ void ClearRedirect(uint32_t homeStart) {
     }
     UpdateLowestRedirectLocked();  // raised only once the slot is off
     BumpVariantCallEpoch();
+    NotePatchedCallsChanged();
 }
 
 void (*ContinuationAt(uint32_t address))(CpuContext*) { return MatchingVariant(address); }
@@ -1151,7 +1149,7 @@ MKW_PPC_NO_INLINE void RunPatchedWithVariantsSlow(CpuContext* ctx, uint32_t addr
     HZ_PHASE(kHzPatchedTopTicks);
     {
         HZ_PERF_T0();
-        if (!PpcInterpreter::detail::RunCompiledEntry(ctx, address)) PpcInterpreter::Run(ctx, address);
+        if (!PpcInterpreter::detail::RunCompiledEntry(ctx, address)) PpcInterpreter::detail::RunGeneral(ctx, address);
         HZ_PERF_SINCE(kHzPatchedTicks);
         HZ_PERF_SET(kHzInterpInstructions, PpcInterpreter::InstructionCount());
     }
@@ -1159,24 +1157,68 @@ MKW_PPC_NO_INLINE void RunPatchedWithVariantsSlow(CpuContext* ctx, uint32_t addr
 }
 
 MKW_PPC_NO_INLINE void RunPatchedFallback(CpuContext* ctx, uint32_t address) {
-    PpcInterpreter::Run(ctx, address);
+    PpcInterpreter::detail::RunGeneral(ctx, address);
 }
+
+// RunPatched hands every call without code variants to PpcInterpreter::detail::RunPatchedJit (which makes the common one itself
+// and gives the rest back to RunPatchedGeneral): set once the JIT hooks are registered (only with variants off), with nothing
+// counted per call.
+bool g_jitRunsPatched = false;
+
+void RunPatchedGeneral(CpuContext* ctx, uint32_t address);
+void RunPatchedVariants(CpuContext* ctx, uint32_t address);
 
 }  // namespace
 
+void RegisterJitHooks() {
+    PpcInterpreter::detail::PatchedHooks hooks;
+    hooks.patchedByteFor = [](uint32_t address) -> const uint8_t* {
+        const uint32_t* begin = g_mkwGuardedFunctionStarts;
+        const uint32_t* end = begin + g_mkwGuardedFunctionCount;
+        const uint32_t* it = std::lower_bound(begin, end, address);
+        if (it == end || *it != address) return nullptr;
+        return &g_mkwGuestCodePatched[static_cast<size_t>(it - begin)];
+    };
+    hooks.pendingFast = &g_pendingFast;
+    hooks.anyDirty = &g_anyDirty;
+    hooks.lowestRedirect = &g_lowestRedirect;
+    hooks.sync = &Sync;
+    hooks.openEdgeCount = &g_openEdgeCount;
+    hooks.runPatched = &RunPatchedGeneral;
+    PpcInterpreter::detail::RegisterPatchedHooks(hooks);
+    g_jitRunsPatched = !PatchStatsEnabled() && !MKW_HZ_PERF;
+}
+
+// Each path a tail call of its own, so that none pays for another's frame: with code variants off RunPatchedJit, with them the
+// variant cache, else (before the first Protect, or the statistics on) the general path.
 void RunPatched(CpuContext* ctx, uint32_t address) {
-    if (g_variantsEnabled) {
-        VariantCallCacheSlot& cached = t_variantCallCache[(address >> 2) & (kVariantCallCacheSlots - 1)];
-        const uint32_t epoch = g_variantCallEpoch.load(std::memory_order_acquire);
-        if (__builtin_expect(cached.address == address && cached.epoch == epoch, 1)) {
-            Bump(g_stats.variantCalls);
-            cached.entry(ctx);
-            if (__builtin_expect(SyncNeeded(), 0)) Sync();
-            return;
-        }
-        RunPatchedWithVariantsSlow(ctx, address, cached, epoch);
+    if (__builtin_expect(g_jitRunsPatched, 1)) {
+        PpcInterpreter::detail::RunPatchedJit(ctx, address);
         return;
     }
+    if (g_variantsEnabled) {
+        RunPatchedVariants(ctx, address);
+        return;
+    }
+    RunPatchedGeneral(ctx, address);
+}
+
+namespace {
+
+MKW_PPC_NO_INLINE void RunPatchedVariants(CpuContext* ctx, uint32_t address) {
+    VariantCallCacheSlot& cached = t_variantCallCache[(address >> 2) & (kVariantCallCacheSlots - 1)];
+    const uint32_t epoch = g_variantCallEpoch.load(std::memory_order_acquire);
+    if (__builtin_expect(cached.address == address && cached.epoch == epoch, 1)) {
+        Bump(g_stats.variantCalls);
+        cached.entry(ctx);
+        if (__builtin_expect(SyncNeeded(), 0)) Sync();
+        return;
+    }
+    RunPatchedWithVariantsSlow(ctx, address, cached, epoch);
+}
+
+// RunPatched with code variants off: the redirect, the compiled entry or the general one, the Sync test.
+void RunPatchedGeneral(CpuContext* ctx, uint32_t address) {
     if (__builtin_expect(address >= g_lowestRedirect.load(std::memory_order_acquire), 0)) {
         address = ResolveRedirect(address);
     }
@@ -1195,5 +1237,7 @@ void RunPatched(CpuContext* ctx, uint32_t address) {
     // the code handler): that takes effect now, as the handler's isync makes it on a Wii.
     if (__builtin_expect(SyncNeeded(), 0)) Sync();
 }
+
+}  // namespace
 
 } // namespace GuestCodePatch

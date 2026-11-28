@@ -11,13 +11,15 @@
 //      to a translated function is JitThinTail (JitTailOp in the rollback loop frame); with code variants possible, or the
 //      registry not yet published, the fallback (RunOp asks ContinuationAt on every execution, which a block cannot settle).
 //  Bl: native when the site was resolved at decode, the target is untranslated and runnable: lr and the loop-frame test
-//      inline, then ExitLinked. A translated target with a raw dispatch record: lr, pc and the loop-frame test inline (the
-//      loop frame goes the general way), the callee's float arguments tested in line, then a direct call of the entry when it
-//      needs no guard, else JitThinCall with the target's JitCallTarget (everything Call and TryDispatchRawCpuTarget look up,
-//      settled at compile time), and a validity test. A patched target (guard byte set at compile time) is called in a subcall
-//      frame linked to its block while it stays patched (EmitSubFrameBl). Otherwise JitCallOp (Call) and a validity test when the
-//      call was made.
-//  Blr, Bclr: native; the frame's return normalises f1, anything else leaves through an inline cache.
+//      inline, then ExitLinked. A translated target with a raw dispatch record: lr and the loop-frame test inline (the loop
+//      frame goes the general way; ctx->pc, a diagnostic, is stored by the shims that run Call, not before direct calls), the
+//      callee's float arguments tested in line, then a direct call of the entry when it needs no guard, else JitThinCall with the
+//      target's JitCallTarget (everything Call and TryDispatchRawCpuTarget look up, settled at compile time), and a validity test.
+//      A patched target (guard byte set at compile time) has its block called with a host call while it stays patched
+//      (EmitSubFrameBl). Otherwise JitCallOp (Call) and a validity test when the call was made.
+//  Blr, Bclr: native; the return of the frame's own function normalises f1 and leaves, that of a function called with a host call
+//      normalises f1 and returns with `ret` (the caller drops the return slot), anything else leaves through an inline cache. A compare and the bclr after it
+//      branch on the compare's flags (EmitCompareReturn).
 //  Bctr: the newest target of its cell, an inline cache probe (untranslated targets only ever get in it), the cell's other targets
 //      (translated targets: each with what JitFastCallFor says to call for it, as a tail call), a miss JitTailOpCached, which fills
 //      the cell; the fallback until the registry is published.
@@ -159,6 +161,9 @@ void EmitCondBranch(BlockEmitter& e, uint32_t bci, const Compare* cmp, const Xby
         if (cmp->source == Compare::Test && cmp->nonNegative && result != nullptr) {
             value = result->cvt64();  // zero-extended: the field value itself
             if (flags) a.test(*result, *result);
+        } else if (cmp->source == Compare::Imm && !cmp->isSigned && cmp->imm == 0 && e.WantCacheGpr(cmp->a)) {
+            value = e.ReadGpr(cmp->a).cvt64();  // an unsigned compare with 0: the zero-extended register is the difference
+            if (flags) a.test(value, value);
         } else {
             EmitCompareValue(e, *cmp, flags, result);
         }
@@ -290,26 +295,71 @@ uint32_t EmitFusedCompare(BlockEmitter& e, uint32_t index) {
     return 2;
 }
 
-// The frame returned (lr is the address the frame was entered with): f1 becomes the scalar the caller takes (inline when
-// it is not in paired form), then the exit. Else a jump through lr, through the inline cache.
+// The function returned (lr is the address it was entered with, Frame::returnAddress): f1 becomes the scalar the caller takes
+// (inline when it is not in paired form), then the return. Else a jump through lr, through the inline cache.
+//
+// Linux x86-64: (lr & ~3) ^ Frame::returnAddress is 0 for the frame's own function's return, 1 (the tag) for the return of a
+// function a block called with a host call (`ret` to the caller's code after the caller's word is back: ExitSharedReturn, which
+// the return stack predicts), anything else a jump.
 void EmitReturnOrJump(BlockEmitter& e) {
     CodeGenerator& a = e.a;
-    Xbyak::Label notReturn;
-    Xbyak::Label& paired = e.NewLabel();
+    const auto T = CodeGenerator::T_NEAR;
+    const bool f1Scalar = e.KnownForm(e.index, 1) == Form::Scalar;
+    if (!kDirectCalls) {
+        Xbyak::Label notReturn;
+        Xbyak::Label& paired = e.NewLabel();
+        a.mov(eax, e.Lr());
+        a.and_(eax, ~3u);
+        a.cmp(eax, e.FrameReturn());  // kept & ~3 (Frame::returnAddress)
+        a.jne(notReturn, CodeGenerator::T_SHORT);
+        a.test(a.byte[kFrame + static_cast<int>(offsetof(Frame, pairedMask))], 2u);  // bit 1: f1 is Paired
+        a.jnz(paired);
+        e.ExitReturn();
+        e.Cold([&paired](BlockEmitter& c) {
+            c.a.L(paired);
+            c.CallHelper(&JitNormalizeF1, kFrame);
+            c.ExitReturn();
+        });
+        a.L(notReturn);
+        e.ExitDynamicCached(0);
+        return;
+    }
+    Xbyak::Label& frame = e.NewLabel();
+    Xbyak::Label& other = e.NewLabel();
+    Xbyak::Label& sharedTail = e.NewLabel();
+    Xbyak::Label& frameTail = e.NewLabel();
+    Xbyak::Label& sharedF1 = e.NewLabel();
+    Xbyak::Label& frameF1 = e.NewLabel();
     a.mov(eax, e.Lr());
     a.and_(eax, ~3u);
-    a.cmp(eax, a.dword[kFrame + static_cast<int>(offsetof(Frame, returnAddress))]);  // kept & ~3 (Frame::returnAddress)
-    a.jne(notReturn, CodeGenerator::T_SHORT);
-    a.test(a.byte[kFrame + static_cast<int>(offsetof(Frame, pairedMask))], 2u);  // bit 1: f1 is Paired
-    a.jnz(paired);
-    e.ExitReturn();
-    e.Cold([&paired](BlockEmitter& c) {
-        c.a.L(paired);
-        c.CallHelper(&JitNormalizeF1, kFrame);
-        c.ExitReturn();
-    });
-    a.L(notReturn);
+    a.xor_(eax, e.FrameReturn());
+    a.jz(frame, T);
+    a.cmp(eax, 1);
+    a.jne(other, T);
+    if (!f1Scalar) {
+        a.test(a.byte[kFrame + static_cast<int>(offsetof(Frame, pairedMask))], 2u);  // bit 1: f1 is Paired
+        a.jnz(sharedF1, T);
+    }
+    a.L(sharedTail);
+    e.ExitSharedReturn();
+    a.L(frame);
+    if (!f1Scalar) {
+        a.test(a.byte[kFrame + static_cast<int>(offsetof(Frame, pairedMask))], 2u);
+        a.jnz(frameF1, T);
+    }
+    a.L(frameTail);
+    e.ExitFrameReturn();
+    a.L(other);
+    a.xor_(eax, e.FrameReturn());  // lr & ~3 again
     e.ExitDynamicCached(0);
+    e.Cold([&sharedF1, &frameF1, &sharedTail, &frameTail](BlockEmitter& c) {
+        c.a.L(sharedF1);
+        c.CallHelper(&JitNormalizeF1, kFrame);
+        c.a.jmp(sharedTail, CodeGenerator::T_NEAR);
+        c.a.L(frameF1);
+        c.CallHelper(&JitNormalizeF1, kFrame);
+        c.a.jmp(frameTail, CodeGenerator::T_NEAR);
+    });
 }
 
 uint32_t EmitBclr(BlockEmitter& e, uint32_t index) {
@@ -404,14 +454,34 @@ void EmitF1Scalar(BlockEmitter& e) {
     e.a.and_(e.PairedMask(), ~2u);
 }
 
-// Finishes a direct tail call whose saved return address (lr & ~3) sits in ebp: clears f1's paired bit, restores lr,
-// and either returns from the frame or continues at ebp through the inline cache.
+// Finishes a direct tail call whose saved return address (lr & ~3) sits in ebp: restores lr, and either returns (the function
+// returned: f1 is the callee's scalar; the frame or the caller's word it goes back to has no use for f1's paired bit) or clears f1's
+// paired bit and continues at ebp through the inline cache.
 void EmitDirectTailFinish(BlockEmitter& e) {
     CodeGenerator& a = e.a;
+    a.mov(e.Lr(), ebp);
+    if (kDirectCalls) {
+        // ebp + 1 is the tagged field of a function called with a host call that returns (the common case: a tail call is how
+        // most functions a switch dispatches to end), ebp the frame's own function's return address
+        Xbyak::Label& notShared = e.NewLabel();
+        Xbyak::Label& jump = e.NewLabel();
+        a.lea(eax, a.ptr[rbp + 1]);
+        a.cmp(eax, e.FrameReturn());
+        a.jne(notShared, CodeGenerator::T_NEAR);
+        e.ExitSharedReturn();
+        a.L(notShared);
+        a.cmp(ebp, e.FrameReturn());
+        a.jne(jump, CodeGenerator::T_NEAR);
+        e.ExitFrameReturn();
+        a.L(jump);
+        EmitF1Scalar(e);
+        a.mov(eax, ebp);
+        e.ExitDynamicAfterCall(0);  // through the dispatcher when the callee set XER[SO] or moved the epoch
+        return;
+    }
     Xbyak::Label returned;
     EmitF1Scalar(e);
-    a.mov(e.Lr(), ebp);
-    a.cmp(ebp, a.dword[kFrame + static_cast<int>(offsetof(Frame, returnAddress))]);  // kept & ~3 (Frame::returnAddress)
+    a.cmp(ebp, e.FrameReturn());  // kept & ~3 (Frame::returnAddress)
     a.je(returned, CodeGenerator::T_SHORT);
     a.mov(eax, ebp);
     e.ExitDynamicAfterCall(0);  // through the dispatcher when the callee set XER[SO] or moved the epoch
@@ -420,10 +490,13 @@ void EmitDirectTailFinish(BlockEmitter& e) {
 }
 
 // A bl to a translated function `t` that is patched (its guard byte set when the block is compiled), the common JIT->JIT call:
-// while the guard byte stays set and no redirect applies, the callee's block is called in a subcall frame
-// (BlockEmitter::CallSubFrame), which is what calling the wrapper does then (RunPatched, RunCompiledEntry, jit_enter_direct)
-// without the C++ in between. Otherwise the wrapper, or JitCallOp in the rollback loop frame (Call decides its calls, before the
-// float arguments are touched).
+// while the guard byte stays set and no redirect applies, the callee's block is called with a host call in this Frame, which is
+// what calling the wrapper does then (RunPatched, RunCompiledEntry, jit_enter_direct: a Run of the function in a frame of its own)
+// without the C++ in between. The only per-call state of that frame is pairedMask (0: the callee starts with every FPR scalar) and
+// returnAddress (pc + 4): the caller's pair goes on the stack (the return slot, `push`), the callee's is stored tagged (bit 0:
+// returned to with `ret`, ExitSharedReturn, after which the caller drops the slot), and the callee's return puts the caller's back. Then RunPatched's Sync test,
+// NormalizeCallFloatReturn and the validity test. Otherwise the wrapper, or JitCallOp in the rollback loop frame (Call decides its
+// calls, before the float arguments are touched).
 void EmitSubFrameBl(BlockEmitter& e, uint32_t index, const JitCallTarget& t) {
     CodeGenerator& a = e.a;
     const uint32_t pc = e.PcOf(index);
@@ -433,22 +506,31 @@ void EmitSubFrameBl(BlockEmitter& e, uint32_t index, const JitCallTarget& t) {
     Xbyak::Label& wrapper = e.NewLabel();  // the wrapper, float arguments done
     Xbyak::Label& resume = e.NewLabel();
     Xbyak::Label& made = e.NewLabel();
+    Xbyak::Label& sync = e.NewLabel();
     a.mov(e.Lr(), pc + 4);
     a.test(a.byte[kFrame + static_cast<int>(offsetof(Frame, flags))], kFrameFlagLoopFrame);
     a.jnz(loopFrame, T);
     EmitStaticArgTest(e, t);
-    a.cmp(AbsMem(a, t.patchedByte, rcx, 8), 0);
-    a.je(wrapper, T);
-    a.cmp(AbsMem(a, GetPatchedHooks().lowestRedirect, rcx, 32), target);
-    a.jbe(wrapper, T);  // lowestRedirect <= target: RunPatched resolves it
-    e.CallSubFrame(target, pc + 4);
+    a.push(e.FrameWord());
+    a.mov(rax, static_cast<uint64_t>((pc + 4) | 1u) << 32);  // pairedMask 0, returnAddress pc + 4 tagged
+    a.mov(e.FrameWord(), rax);
+    e.CallLinked(target, t.patchedByte, wrapper);  // the guard byte and the redirect bound: tested by the link's stub
+    a.lea(rsp, a.ptr[rsp + 8]);  // the return slot: the callee's `ret` leaves it (ExitSharedReturn)
+    const PatchedHooks& hooks = GetPatchedHooks();
+    a.cmp(AbsMem(a, hooks.pendingFast, rcx, 64), 0);
+    a.jne(sync, T);
+    a.cmp(AbsMem(a, hooks.anyDirty, rcx, 8), 0);
+    a.jne(sync, T);
     a.L(resume);
-    EmitF1Scalar(e);  // NormalizeCallFloatReturn (the callee's frame return made f1 scalar in its own frame)
+    EmitF1Scalar(e);  // NormalizeCallFloatReturn (the callee's return made f1 scalar in its own state)
     a.L(made);
     e.EmitRecheck(pc + 4);
     const JitCallTarget* const tp = &t;
-    e.Cold([&loopFrame, &wrapper, &resume, &made, index, target, pc, tp](BlockEmitter& c) {
+    e.Cold([&loopFrame, &wrapper, &resume, &made, &sync, index, target, pc, tp](BlockEmitter& c) {
         CodeGenerator& g = c.a;
+        g.L(sync);
+        c.CallRaw(reinterpret_cast<const void*>(GetPatchedHooks().sync));
+        g.jmp(resume, CodeGenerator::T_NEAR);
         g.L(wrapper);
         g.mov(c.Pc(), pc);
         g.lea(ArgReg(0), g.ptr[kCtxBase - kCtxBias]);
@@ -475,7 +557,6 @@ void EmitThinBl(BlockEmitter& e, uint32_t index, const JitCallTarget& t) {
     }
     Xbyak::Label& loopFrame = e.NewLabel();
     Xbyak::Label& resume = e.NewLabel();
-    a.mov(e.Pc(), pc);
     a.mov(e.Lr(), pc + 4);
     EmitLoopFrameTest(e, loopFrame);
     EmitStaticArgTest(e, t);
@@ -545,7 +626,6 @@ uint32_t EmitBl(BlockEmitter& e, uint32_t index) {
     }
     Xbyak::Label& loopFrame = e.NewLabel();
     Xbyak::Label& cont = e.NewLabel();
-    a.mov(e.Pc(), pc);
     a.mov(e.Lr(), pc + 4);
     EmitLoopFrameTest(e, loopFrame);
     e.ExitLinked(target);
@@ -563,10 +643,60 @@ uint32_t EmitBl(BlockEmitter& e, uint32_t index) {
     return 1;
 }
 
+// After a call site's shim (JitTailOpCached / JitCallOpCached, which put a translated target at the front of the site's cell): the
+// cell's first entry into the code cache's table (BlockEmitter::TargetTable). Keeps rax (the shim's answer); clobbers rcx, rdx,
+// rsi, xmm0, xmm1.
+void TableFill(BlockEmitter& e, bool tail, Xbyak::Label& cell) {
+    uint8_t* const table = e.TargetTable(tail);
+    if (table == nullptr) return;
+    CodeGenerator& a = e.a;
+    Xbyak::Label skip;
+    a.lea(rcx, a.ptr[a.rip + cell]);
+    a.mov(edx, a.dword[rcx]);
+    a.cmp(edx, JitTargetCell::kNoKey);
+    a.je(skip, CodeGenerator::T_SHORT);
+    a.and_(edx, (BlockEmitter::kTargetTableEntries - 1) << 2);
+    a.mov(rsi, reinterpret_cast<uint64_t>(table));
+    a.lea(rdx, a.ptr[rsi + rdx * 8]);
+    a.movups(xmm0, a.ptr[rcx]);
+    a.movups(xmm1, a.ptr[rcx + 16]);
+    a.movups(a.ptr[rdx], xmm0);
+    a.movups(a.ptr[rdx + 16], xmm1);
+    a.L(skip);
+}
+
+// The code cache's table of translated targets (BlockEmitter::TargetTable) for eax: jumps to `hit` with rdx = the entry, else falls
+// through. A site whose targets are more than its cell's ways (a virtual call over many classes) finds them there instead of going to
+// its shim. Every 8th hit of a table entry (its `hits` byte, counted over all sites) also copies it into this site's first way, so
+// that a site's common target comes back to the one test the site makes first (as the cell's own ways move up). Clobbers rcx, rdx,
+// xmm0, xmm1.
+void TableProbe(BlockEmitter& e, bool tail, Xbyak::Label& cell, Xbyak::Label& hit) {
+    uint8_t* const table = e.TargetTable(tail);
+    if (table == nullptr) return;
+    CodeGenerator& a = e.a;
+    static_assert(sizeof(JitTargetCell) == 32 && offsetof(JitTargetCell, target) == 0);
+    Xbyak::Label miss;
+    a.mov(ecx, eax);
+    a.and_(ecx, (BlockEmitter::kTargetTableEntries - 1) << 2);
+    a.mov(rdx, reinterpret_cast<uint64_t>(table));
+    a.lea(rdx, a.ptr[rdx + rcx * 8]);
+    a.cmp(eax, a.dword[rdx]);
+    a.jne(miss, CodeGenerator::T_SHORT);
+    a.add(a.byte[rdx + static_cast<int>(offsetof(JitTargetCell, hits))], 32);  // carries on the 8th
+    a.jnc(hit, CodeGenerator::T_NEAR);
+    a.movups(xmm0, a.ptr[rdx]);
+    a.movups(xmm1, a.ptr[rdx + 16]);
+    a.lea(rdx, a.ptr[a.rip + cell]);
+    a.movups(a.ptr[rdx], xmm0);
+    a.movups(a.ptr[rdx + 16], xmm1);
+    a.jmp(hit, CodeGenerator::T_NEAR);
+    a.L(miss);
+}
+
 // The ways of a cell after the first (the site tests the first itself): jumps to `hit` with rdx = the matching entry, else to `miss`.
 // eax is the target. An entry hit 8 times while not the first becomes the first (CellPromoteRoutine): the cell keeps the targets in
 // the order the misses put them in (the newest first), and a site's common target moves up to the one test the site makes first.
-// Clobbers rcx, xmm0-xmm3.
+// Clobbers rcx, rdx, xmm0-xmm3.
 void CellWays(BlockEmitter& e, Xbyak::Label& cell, Xbyak::Label& hit, Xbyak::Label& miss) {
     CodeGenerator& a = e.a;
     Xbyak::Label wayHit;
@@ -606,18 +736,18 @@ uint32_t EmitBctrl(BlockEmitter& e, uint32_t index) {
     Xbyak::Label& cell = e.NewCell();
     Xbyak::Label& generic = e.NewLabel();
     Xbyak::Label& resume = e.NewLabel();
-    a.mov(e.Pc(), pc);
     a.mov(e.Lr(), pc + 4);
     EmitLoopFrameTest(e, generic);
     // The cell holds the last translated targets this site called, their records and what to call for each (JitFastCallFor: the
     // entry, or a routine that does what JitThinCall does); the key is the ctr it was found for.
     a.mov(eax, e.Ctr());
-    a.and_(eax, ~3u);
+    a.and_(eax, ~3u);  // the empty entries' keys are 1 (JitTargetCell::kNoKey, JitLink::kNoKey): only a masked ctr never matches them
     if (kDirectCalls) {
-        // The newest target of the cell first, then the inline cache of untranslated targets (1, shared with the block's bctr:
-        // both put only pcs that are no translated function in it, and a call to one in this frame is interpreted here: lr is set,
-        // it is a jump), then the cell's other targets. A miss of all of them is JitCallOpCached; its interpret-here answer
-        // (here, not in the loop frame, where Call decides otherwise: an untranslated target) links cache 1.
+        // The newest target of the cell first, then the code cache's table of translated targets, the inline cache of untranslated
+        // targets (1, shared with the block's bctr: both put only pcs that are no translated function in it, and a call to one in
+        // this frame is interpreted here: lr is set, it is a jump), the cell's other targets. A miss of all of them is
+        // JitCallOpCached; its interpret-here answer (here, not in the loop frame, where Call decides otherwise: an untranslated
+        // target) links cache 1.
         Xbyak::Label& ways = e.NewLabel();
         Xbyak::Label& hit = e.NewLabel();
         Xbyak::Label& miss = e.NewLabel();
@@ -632,11 +762,13 @@ uint32_t EmitBctrl(BlockEmitter& e, uint32_t index) {
         e.EmitRecheck(pc + 4);
         e.Cold([&ways, &hit, &miss, &resume, &cell, index](BlockEmitter& c) {
             c.a.L(ways);
+            TableProbe(c, false, cell, hit);
             c.CacheProbe(1);
             CellWays(c, cell, hit, miss);
             c.a.L(miss);
             c.a.lea(r10, c.a.ptr[c.a.rip + cell]);
             c.CallHelper(&JitCallOpCached, kFrame, &c.block, index, r10);
+            TableFill(c, false, cell);
             c.a.mov(rcx, rax);
             c.a.shr(rcx, 32);
             c.a.jz(resume, CodeGenerator::T_NEAR);
@@ -716,7 +848,6 @@ uint32_t EmitB(BlockEmitter& e, uint32_t index) {
     const JitCallTarget* const t = JitCallTargetFor(o.imm);
     if (t != nullptr) {
         Xbyak::Label& loopFrame = e.NewLabel();
-        a.mov(e.Pc(), e.PcOf(index));
         EmitLoopFrameTest(e, loopFrame);
         EmitStaticArgTest(e, *t);
         if (kDirectCalls && t->fastDirect) {
@@ -741,35 +872,53 @@ uint32_t EmitB(BlockEmitter& e, uint32_t index) {
     return 1;
 }
 
+// Whether the bctr at `index` jumps through a switch's table: ctr set by the op before from a register the op before that loaded with
+// lwzx (`lwzx rT, rB, rI; mtctr rT; bctr`). Its targets are code of the function (cases), never translated functions: the inline
+// cache comes first. Only an order (a heuristic): every target is found either way.
+bool JumpTableSite(const Block& b, uint32_t index) {
+    uint32_t i = index;
+    const auto previous = [&b](uint32_t& at) {
+        while (at > 0 && b.ops[at - 1].kind == K::Jmp) --at;
+        return at > 0 ? &b.ops[--at] : nullptr;
+    };
+    const Op* const mtctr = previous(i);
+    if (mtctr == nullptr || mtctr->kind != K::Mtctr) return false;
+    const Op* const load = previous(i);
+    return load != nullptr && load->kind == K::Lwzx && load->d == mtctr->d;
+}
+
 uint32_t EmitBctr(BlockEmitter& e, uint32_t index) {
     CodeGenerator& a = e.a;
     // A cached target is one the registry did not know when the dispatcher linked it, and the registry is fixed once
     // published: before that, nothing may be cached.
     if (!TranslatedFunctionRegistry::IsLookupPublished()) return e.EmitFallback(index);
-    Xbyak::Label pending, returned, plain, generic;
     const uint32_t pc = e.PcOf(index);
     Xbyak::Label& cell = e.NewCell();
+    Xbyak::Label& generic = e.NewLabel();
     a.mov(eax, e.Ctr());
-    a.and_(eax, ~3u);
+    a.and_(eax, ~3u);  // the empty entries' keys are 1 (JitTargetCell::kNoKey, JitLink::kNoKey): only a masked ctr never matches them
     if (kDirectCalls) {
         // The cell holds the last translated targets this site jumped to (a tail call), their records and what to call for each
         // (JitFastCallFor); the inline cache (1) the untranslated ones, plain jumps. The two hold different pcs, so their order is
-        // free: the cell's newest target first, the inline cache, the cell's other targets.
+        // free: the cell's newest target first, the code cache's table, the inline cache, the cell's other targets; at a switch's
+        // table the inline cache first.
         Xbyak::Label& hit = e.NewLabel();
-        Xbyak::Label notFirst;
+        Xbyak::Label& ways = e.NewLabel();
+        const bool table = JumpTableSite(e.block, index);
+        if (table) e.CacheProbe(1);
         a.cmp(eax, a.dword[a.rip + cell]);
-        a.jne(notFirst, CodeGenerator::T_NEAR);
+        a.jne(ways, CodeGenerator::T_NEAR);
         a.lea(rdx, a.ptr[a.rip + cell]);
         a.L(hit);
-        a.mov(e.Pc(), pc);
         EmitLoopFrameTest(e, generic);
         a.mov(ebp, e.Lr());
         a.and_(ebp, ~3u);
         a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
-        a.call(a.qword[rdx + static_cast<int>(offsetof(JitTargetCell, fast))]);  // keeps rbp: no subcall frame (JitFastCallFor)
+        a.call(a.qword[rdx + static_cast<int>(offsetof(JitTargetCell, fast))]);  // keeps rbp (JitFastCallFor: never jit_subcall)
         EmitDirectTailFinish(e);
-        a.L(notFirst);
-        e.CacheProbe(1);
+        a.L(ways);
+        TableProbe(e, true, cell, hit);
+        if (!table) e.CacheProbe(1);
         CellWays(e, cell, hit, generic);
     } else {
         e.CacheProbe(1);
@@ -779,33 +928,66 @@ uint32_t EmitBctr(BlockEmitter& e, uint32_t index) {
         e.CallHelper(&JitThinTail, kFrame, rdx);
         EmitTailResult(e);
     }
-    a.L(generic);
-    a.lea(r10, a.ptr[a.rip + cell]);
-    e.CallHelper(&JitTailOpCached, kFrame, &e.block, index, r10);
-    EmitShimResult(e);
-    a.cmp(ecx, kJumpHere);
-    a.je(plain);
-    a.cmp(ecx, kReturnFrame);
-    a.je(returned);
-    a.cmp(ecx, kReturnPending);
-    a.je(pending);
-    e.ExitDynamic();
-    a.L(returned);
-    e.ExitReturn();
-    a.L(pending);
-    e.ExitPending();
-    a.L(plain);
-    e.ExitDynamicMiss(1);
+    e.Cold([&generic, &cell, index](BlockEmitter& c) {
+        CodeGenerator& g = c.a;
+        Xbyak::Label pending, returned, plain;
+        g.L(generic);
+        g.lea(r10, g.ptr[g.rip + cell]);
+        c.CallHelper(&JitTailOpCached, kFrame, &c.block, index, r10);
+        if (kDirectCalls) TableFill(c, true, cell);
+        EmitShimResult(c);
+        g.cmp(ecx, kJumpHere);
+        g.je(plain);
+        g.cmp(ecx, kReturnFrame);
+        g.je(returned);
+        g.cmp(ecx, kReturnPending);
+        g.je(pending);
+        c.ExitDynamic();
+        g.L(returned);
+        c.ExitReturn();
+        g.L(pending);
+        c.ExitPending();
+        g.L(plain);
+        c.ExitDynamicMiss(1);  // eax: the target
+    });
     return 1;
 }
 
 }  // namespace
 
+// A compare or record form and the conditional return (bclr without a ctr decrement) that tests lt, gt or eq of its field: the field
+// is written (the return leaves the block) and the return is taken on the host flags of the field value, not on the field read
+// back from memory. The GPR cache is flushed first (EmitOps does it before a Bclr of its own); the FPR cache's pending forms were
+// stored before the compare.
+void EmitCompareReturn(BlockEmitter& e, uint32_t bci, const Compare& c, const Xbyak::Reg32* result, bool resultFlags) {
+    CodeGenerator& a = e.a;
+    const Op& bclr = e.block.ops[bci];
+    const bool flags = !(c.source == Compare::Test && resultFlags);
+    Xbyak::Reg64 value = rax;
+    if (c.source == Compare::Test && c.nonNegative && result != nullptr) {
+        value = result->cvt64();  // zero-extended: the field value itself
+        if (flags) a.test(*result, *result);
+    } else {
+        EmitCompareValue(e, c, flags, result);
+    }
+    e.CrStore(c.field, value);
+    e.FlushAllGprs();  // stores only: the flags stay
+    Xbyak::Label skip;
+    Jcc(a, Invert(CompareCc(true, bclr.a & 3u, (bclr.d & 0x08u) != 0)), skip, CodeGenerator::T_NEAR);
+    EmitReturnOrJump(e);
+    a.L(skip);
+}
+
 uint32_t EmitCompareBranch(BlockEmitter& e, uint32_t index) {
     const Block& b = e.block;
     uint32_t j = index + 1;
     while (j < b.count && b.ops[j].kind == K::Jmp) ++j;
-    if (j >= b.count || b.ops[j].kind != K::Bc || KindForced(K::Bc)) return 0;
+    if (j >= b.count) return 0;
+    const Op& next = b.ops[j];
+    // bclr: no ctr decrement, a condition that is not SO (whose bit the host flags do not have)
+    const bool isReturn = next.kind == K::Bclr && !KindForced(K::Bclr) && (next.d & 0x04u) != 0 && (next.d & 0x10u) == 0 &&
+                          (next.a & 3u) != 3u;
+    if (!isReturn && (next.kind != K::Bc || KindForced(K::Bc))) return 0;
     const Op& o = b.ops[index];
     const Op& bc = b.ops[j];
     Compare c{};
@@ -829,7 +1011,8 @@ uint32_t EmitCompareBranch(BlockEmitter& e, uint32_t index) {
     case K::Cmplw: c = {Compare::Reg, false, field, 0, o.a, o.b}; break;
     default: result = EmitRecordResult(e, o, c, resultFlags); break;
     }
-    EmitCondBranch(e, j, &c, result, resultFlags);
+    if (isReturn) EmitCompareReturn(e, j, c, result, resultFlags);
+    else EmitCondBranch(e, j, &c, result, resultFlags);
     return j - index + 1;
 }
 

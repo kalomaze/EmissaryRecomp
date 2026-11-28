@@ -41,6 +41,8 @@
 #include <atomic>
 #include <cstring>
 #include <exception>
+#include <utility>
+#include <vector>
 
 #include "brawl_dirty_memory.h"
 #include "isa/ppc_isa_float.h"
@@ -48,7 +50,160 @@
 #include "lean_window.h"
 #include "memory_access.h"
 
+#if defined(__linux__) && defined(__x86_64__)
+#include <signal.h>
+#include <ucontext.h>
+#define MKW_JIT_FAULT_STORES 1
+#else
+#define MKW_JIT_FAULT_STORES 0
+#endif
+
 namespace PpcInterpreter::detail::x64 {
+
+// --- fault-based stores: the sites, and the handler that sends a faulting store to its slow entry ----------------------------
+// With the store view (lean_window.h, g_storeView), a guest store is one store instruction at base + kStoreViewOffset + ea,
+// which faults exactly where the store policy would send the store to the checked path (memory.cpp keeps the view's protection
+// in step with the policy), or where a store's bytes reach a chunk the policy flags or no region backs. A fault at a registered
+// site (the instruction's address in a code chunk's table) resumes at the site's slow entry, in the op's cold code, with every
+// register as the store found it; the entry tests the policy as the interpreter's store does and either stores through the
+// window (LeanTryStore's fast path) or calls the checked path's routine. The handler also patches the store instruction into a
+// jump to the slow entry (every store instruction here is at least 8 bytes: its displacement is a disp32), so a site faults at
+// most once per compile. Any other fault goes to the handler that was installed before (the runtime's report, or the default).
+//
+// A chunk's table is written only by the thread whose code cache owns the chunk, while it compiles (never while it runs that
+// chunk's code), and read only by the handler on a thread that faulted in that chunk's code: the same thread.
+
+struct FaultChunk {
+    const uint8_t* base;
+    size_t size;
+    std::vector<std::pair<uint32_t, uint32_t>> sites;  // (store instruction, slow entry) as offsets from base, by store
+    uint32_t slot;
+};
+
+namespace {
+
+constexpr uint32_t kFaultSlots = 4096;
+struct FaultSlot {
+    std::atomic<uintptr_t> base{0};  // 0: free, 1: being filled, else the chunk's base
+    std::atomic<size_t> size{0};
+    std::atomic<FaultChunk*> chunk{nullptr};
+};
+FaultSlot g_faultSlots[kFaultSlots];
+bool g_faultStores = false;
+std::atomic<uint64_t> g_faultSites{0}, g_faults{0}, g_faultRepeats{0}, g_faultChunks{0};
+
+#if MKW_JIT_FAULT_STORES
+uintptr_t g_storeLo = 0, g_storeSpan = 0;  // where a store through the store view can fault
+struct sigaction g_previousSegv;
+
+// The slow entry of the store instruction at rip, or 0 when rip is no registered site.
+uintptr_t FindFaultSite(uintptr_t rip) {
+    for (FaultSlot& s : g_faultSlots) {
+        const uintptr_t base = s.base.load(std::memory_order_acquire);
+        if (base <= 1 || rip - base >= s.size.load(std::memory_order_relaxed)) continue;
+        const FaultChunk* const c = s.chunk.load(std::memory_order_relaxed);
+        const uint32_t at = static_cast<uint32_t>(rip - base);
+        const auto it = std::lower_bound(c->sites.begin(), c->sites.end(), std::make_pair(at, uint32_t{0}));
+        return it != c->sites.end() && it->first == at ? base + it->second : 0;
+    }
+    return 0;
+}
+
+void OnStoreFault(int sig, siginfo_t* info, void* context) {
+    ucontext_t* const uc = static_cast<ucontext_t*>(context);
+    const uintptr_t at = reinterpret_cast<uintptr_t>(info != nullptr ? info->si_addr : nullptr);
+    if (sig == SIGSEGV && info != nullptr && at - g_storeLo < g_storeSpan) {
+        greg_t& rip = uc->uc_mcontext.gregs[REG_RIP];
+        const uintptr_t site = static_cast<uintptr_t>(rip);
+        if (const uintptr_t slow = FindFaultSite(site)) {
+            uint8_t* const code = reinterpret_cast<uint8_t*>(site);
+            if (code[0] == 0xE9u) g_faultRepeats.fetch_add(1, std::memory_order_relaxed);
+            const int32_t rel = static_cast<int32_t>(static_cast<intptr_t>(slow) - static_cast<intptr_t>(site + 5));
+            code[0] = 0xE9u;  // jmp rel32 over the store instruction's first bytes (it is longer; the rest is never reached)
+            std::memcpy(code + 1, &rel, sizeof(rel));
+            rip = static_cast<greg_t>(slow);
+            g_faults.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    // not a store of compiled code: what was there before handles it
+    if ((g_previousSegv.sa_flags & SA_SIGINFO) != 0) {
+        if (g_previousSegv.sa_sigaction != nullptr) {
+            g_previousSegv.sa_sigaction(sig, info, context);
+            return;
+        }
+    } else if (g_previousSegv.sa_handler != SIG_DFL && g_previousSegv.sa_handler != SIG_IGN) {
+        g_previousSegv.sa_handler(sig);
+        return;
+    }
+    signal(sig, SIG_DFL);  // the instruction runs again and the default action ends the process
+}
+#endif
+
+}  // namespace
+
+bool FaultStoresInit() {
+    static const bool ok = [] {
+        if (!LeanWindow::g_storeView) return true;
+#if MKW_JIT_FAULT_STORES
+        struct sigaction action {};
+        action.sa_sigaction = OnStoreFault;
+        action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&action.sa_mask);
+        // base + 1 GiB + ea + d: from d = -32 KiB under the cached copy to the tail and the guard after it
+        g_storeLo = reinterpret_cast<uintptr_t>(MemoryInline::g_leanBase) + LeanWindow::kStoreViewOffset - 0x8000u;
+        g_storeSpan = (uintptr_t{1} << 32) + 0x8000u + 2 * LeanWindow::kAliasTail;
+        if (sigaction(SIGSEGV, &action, &g_previousSegv) != 0) return false;
+        g_faultStores = true;
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return ok;
+}
+
+bool FaultStores() { return FaultStoresInit() && g_faultStores; }
+
+FaultChunk* FaultChunkOpen(const uint8_t* base, size_t size) {
+    if (!FaultStores()) return nullptr;
+    for (uint32_t i = 0; i < kFaultSlots; ++i) {
+        uintptr_t expected = 0;
+        if (!g_faultSlots[i].base.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) continue;
+        FaultChunk* const c = new (std::nothrow) FaultChunk{base, size, {}, i};
+        if (c == nullptr) {
+            g_faultSlots[i].base.store(0, std::memory_order_release);
+            return nullptr;
+        }
+        g_faultSlots[i].size.store(size, std::memory_order_relaxed);
+        g_faultSlots[i].chunk.store(c, std::memory_order_relaxed);
+        g_faultSlots[i].base.store(reinterpret_cast<uintptr_t>(base), std::memory_order_release);
+        g_faultChunks.fetch_add(1, std::memory_order_relaxed);
+        return c;
+    }
+    return nullptr;
+}
+
+void FaultChunkClose(FaultChunk* chunk) {
+    if (chunk == nullptr) return;
+    FaultSlot& s = g_faultSlots[chunk->slot];
+    s.base.store(1, std::memory_order_release);
+    s.chunk.store(nullptr, std::memory_order_relaxed);
+    s.size.store(0, std::memory_order_relaxed);
+    s.base.store(0, std::memory_order_release);
+    g_faultChunks.fetch_sub(1, std::memory_order_relaxed);
+    delete chunk;
+}
+
+void FaultChunkAdd(FaultChunk* chunk, const uint8_t* code, const BlockEmitter& e) {
+    const size_t at = static_cast<size_t>(code - chunk->base);
+    for (uint32_t i = 0; i < e.FaultSiteCount(); ++i) {
+        const auto site = std::make_pair(static_cast<uint32_t>(at + e.FaultSiteStore(i)), static_cast<uint32_t>(at + e.FaultSiteSlow(i)));
+        chunk->sites.insert(std::upper_bound(chunk->sites.begin(), chunk->sites.end(), site), site);
+    }
+    g_faultSites.fetch_add(e.FaultSiteCount(), std::memory_order_relaxed);
+}
+
 namespace {
 
 using namespace Xbyak::util;
@@ -364,15 +519,18 @@ void EmitLoadSwapped(Xbyak::CodeGenerator& a, unsigned width, bool reverse = fal
 // g_aliased): [r12 + base + disp] with the base register's 32-bit value zero-extended (a cache slot's 64-bit register
 // holds it so) and |disp| < 32 KiB, [r12 + rax] for an address computed in eax (32-bit: indexed forms, and update forms,
 // which write eax to rA), [r12 + canonical] for an absolute one. Sets eax for update forms; uses eax for a base read from
-// memory. ReadGpr the base before the operand registers that must stay pinned.
+// memory. ReadGpr the base before the operand registers that must stay pinned. With the store view the address is one GiB
+// up (every copy there reads the same bytes): loads then use the copies the stores use, so that a page the JIT reads and
+// writes has one TLB entry for both, as the window's for the code that masks.
 Xbyak::RegExp EmitAliasedAddress(BlockEmitter& e, const Op& o, const Shape& s) {
     Xbyak::CodeGenerator& a = e.a;
+    const int view = LeanWindow::g_storeView ? static_cast<int>(LeanWindow::kStoreViewOffset) : 0;
     const int32_t disp = static_cast<int32_t>(o.imm);
     if (s.zeroBase) {
         if (!s.indexed) return kLean + static_cast<int>(o.imm & kMask);
-        if (e.WantCacheGpr(o.b)) return kLean + e.ReadGpr(o.b).cvt64();
+        if (e.WantCacheGpr(o.b)) return kLean + e.ReadGpr(o.b).cvt64() + view;
         a.mov(eax, e.Gpr(o.b));
-        return kLean + rax;
+        return kLean + rax + view;
     }
     const Xbyak::Reg32* base = e.WantCacheGpr(o.a) ? &e.ReadGpr(o.a) : nullptr;
     if (s.indexed || s.update) {  // the address computed in 32 bits (a sum of two registers can pass 2^32)
@@ -392,11 +550,11 @@ Xbyak::RegExp EmitAliasedAddress(BlockEmitter& e, const Op& o, const Shape& s) {
             a.mov(eax, e.Gpr(o.a));
             if (disp != 0) a.add(eax, disp);
         }
-        return kLean + rax;
+        return kLean + rax + view;
     }
-    if (base != nullptr) return kLean + base->cvt64() + disp;
+    if (base != nullptr) return kLean + base->cvt64() + (disp + view);
     a.mov(eax, e.Gpr(o.a));
-    return kLean + rax + disp;
+    return kLean + rax + (disp + view);
 }
 
 // --- forward jumps to cold code ----------------------------------------------------------------------------------------
@@ -468,21 +626,9 @@ struct StoreCold {
     uint8_t ra, rb, width;
     bool update, indexed, reverse;
     BlockEmitter::GprSnapshot snap;
-    void operator()(BlockEmitter& e) const {
-        Xbyak::CodeGenerator& a = e.a;
-        Resolve(a, slow);
-        e.EmitFlushSnapshot(snap);
-        e.StorePc(pcIndex);
-        if (reverse) {  // the shim writes big-endian: hand it the value swapped, so memory gets the register's own byte order
-            if (width == 4) a.bswap(edx);
-            else if (width == 2) a.rol(dx, 8);
-        }
-        e.CallHelper(ShimFor(width), kFrame, eax, rdx);
-        EmitPendingCheck(e);
-        e.EmitReloadSnapshotVolatile(snap);
-        if (update) EmitRebuildEa(a, e, ra, imm, indexed, rb);
-        JmpTo(a, join);
-    }
+    bool fault = false;  // the slow entry of fault site `site` (the address in eax, the value in edx)
+    uint8_t site = 0;
+    void operator()(BlockEmitter& e) const;
 };
 
 // The store of `width` bytes of v (host order) at `at`, byte-swapped unless reverse (stwbrx, sthbrx: the register's bytes
@@ -553,6 +699,166 @@ Patch EmitStoreChecked(BlockEmitter& e, unsigned width, bool reverse = false) {
     return slow;
 }
 
+// --- fault sites: stores through the store view (the handler is at the top of this file) -----------------------------------
+// A site is one store instruction at [r12 + reg + disp + kStoreView] (lean_window.h); a store that faults there resumes at the
+// site's slow entry in the op's cold code, which begins with EmitSiteFast: the policy test of the store's first byte (what
+// LeanTryStore tests), then the store through the window and back to the main path right after the site, or on to the op's
+// checked path. A site's marks come after it on the main path: only a store that went through (to a chunk the policy leaves
+// clear) or came back from the fast part reaches them.
+
+#if defined(__MOVBE__)
+constexpr bool kMovbe = true;
+#else
+constexpr bool kMovbe = false;
+#endif
+constexpr int kStoreView = static_cast<int>(LeanWindow::kStoreViewOffset);
+
+// The guest address of a site's store: (the 32-bit value in host register `reg` + disp) mod 2^32.
+struct SiteAddr {
+    uint8_t reg;
+    int32_t disp;
+};
+
+void EmitRawStore(CG& a, unsigned width, const Xbyak::RegExp& at, const Xbyak::Reg32& v) {
+    switch (width) {
+    case 1: a.mov(a.byte[at], v.cvt8()); break;
+    case 2: a.mov(a.word[at], v.cvt16()); break;
+    case 4: a.mov(a.dword[at], v); break;
+    default: a.mov(a.qword[at], v.cvt64()); break;
+    }
+}
+
+// Byte order the other way in edx / rdx (the value a site without movbe swapped before storing, back to host order).
+void EmitUnswap(CG& a, unsigned width) {
+    if (width == 2) a.rol(dx, 8);
+    else if (width == 4) a.bswap(edx);
+    else if (width == 8) a.bswap(rdx);
+}
+
+// Whether a site of this width stores edx swapped by the instructions before it (a build without movbe).
+bool SiteSwapsFirst(unsigned width, bool reverse) { return !kMovbe && width > 1 && !reverse; }
+
+// A site: the store of `width` bytes of v (host order), byte-swapped unless reverse. Answers the site.
+uint32_t EmitSiteStore(BlockEmitter& e, unsigned width, SiteAddr at, const Xbyak::Reg32& v, bool reverse = false) {
+    CG& a = e.a;
+    const Xbyak::RegExp to = kLean + Xbyak::Reg64(at.reg) + (at.disp + kStoreView);
+    if (SiteSwapsFirst(width, reverse)) {  // swapped into edx first: the site is the plain store after it
+        if (v.getIdx() != edx.getIdx()) {
+            if (width == 8) a.mov(rdx, v.cvt64());
+            else a.mov(edx, v);
+        }
+        EmitUnswap(a, width);
+        const uint32_t site = e.AddFaultSite();
+        EmitRawStore(a, width, to, edx);
+        return site;
+    }
+    const uint32_t site = e.AddFaultSite();
+    EmitStoreValue(a, width, to, v, reverse);  // one instruction (mov or movbe)
+    return site;
+}
+
+// What the first part of a site's slow entry marks after its store through the window: nothing (a group member: its leader
+// marked the group's bytes), the pair of the store's own first byte, or a leader's range (from `offset` bytes below its first
+// byte, `span` bytes).
+struct SiteMarks {
+    uint8_t offset = 0, span = 0;
+    bool none = false;
+};
+constexpr SiteMarks kMarkNone{0, 0, true};
+constexpr SiteMarks kMarkOwn{0, 0, false};
+
+// The first part of a site's slow entry (see above): the policy test of the store's first byte (with `both`, of its last byte
+// too: psq_st's pair tests both ends, as the interpreter's quantized store does), then the store through the window at the
+// canonical address and its marks (`marks`), on to `join` (after the main path's marks, which are made from the unmasked
+// address of a store that went through the store view: EmitMarkUnmasked). v: the register the site stored. Answers the jumps to
+// the checked path. Clobbers esi and edi (no op holds a value in them at a site).
+Patches EmitSiteFast(BlockEmitter& e, uint32_t site, SiteAddr at, unsigned width, const Xbyak::Reg32& v, bool reverse,
+                     uint32_t join, bool both, SiteMarks marks) {
+    CG& a = e.a;
+    e.FaultSiteSlowHere(site);
+    Patches checked{};
+    a.lea(esi, a.ptr[Xbyak::Reg64(at.reg) + at.disp]);
+    a.and_(esi, kMask);
+    a.mov(edi, esi);
+    a.shr(edi, MemoryInline::kLeanPolicyShift);
+    a.cmp(a.byte[kLean + rdi + kPolicyDisp], 0);
+    checked.Add(EmitJcc(a, kNe));
+    if (both) {
+        a.lea(edi, a.ptr[rsi + static_cast<int>(width - 1)]);
+        a.and_(edi, kMask);
+        a.shr(edi, MemoryInline::kLeanPolicyShift);
+        a.cmp(a.byte[kLean + rdi + kPolicyDisp], 0);
+        checked.Add(EmitJcc(a, kNe));
+    }
+    if (SiteSwapsFirst(width, reverse)) EmitRawStore(a, width, kLean + rsi, edx);
+    else EmitStoreValue(a, width, kLean + rsi, v, reverse);
+#if MKW_LEAN_DIRTY_MARKS
+    if (!marks.none) {  // as the main path's marks, from the canonical address (the store need not be in the cached view)
+        if (marks.offset != 0) {
+            a.sub(esi, marks.offset);
+            a.and_(esi, kMask);
+        }
+        if (marks.span > kGroupOnePair) {
+            a.lea(edi, a.ptr[rsi + (marks.span - 1)]);
+            a.shr(edi, 6);
+            a.mov(a.byte[kLean + rdi + kDirtyDisp], 1);
+        }
+        a.shr(esi, 6);
+        a.mov(a.word[kLean + rsi + kDirtyDisp], 0x0101);
+    }
+#else
+    (void)marks;
+#endif
+    JmpTo(a, join);
+    return checked;
+}
+
+// The marks of a store that went through the store view, from its unmasked guest address in r (clobbered): such a store is in
+// the cached view (lean_window.h: only that copy is writable), whose address >> 6 is the canonical one's plus 0x02000000, so
+// the mark is at a fixed distance below the canonical one with no mask. A group's range may start up to kGroupSpanMax bytes
+// below 0x80000000: those marks land in the 64 KiB below the dirty map, which memory.cpp backs with the store view.
+constexpr int kMarkUnmaskedDisp = kDirtyDisp - static_cast<int>(0x80000000u >> 6);
+void EmitMarkUnmasked(CG& a, const Xbyak::Reg32& r) {
+#if MKW_LEAN_DIRTY_MARKS
+    a.shr(r, 6);
+    a.mov(a.word[kLean + r.cvt64() + kMarkUnmaskedDisp], 0x0101);
+#else
+    (void)a;
+    (void)r;
+#endif
+}
+
+// The marks of a site's store whose guest address is in eax (after the site).
+void EmitMarksOfEax(CG& a) {
+#if MKW_LEAN_DIRTY_MARKS
+    a.mov(ecx, eax);
+    EmitMarkUnmasked(a, ecx);
+#else
+    (void)a;
+#endif
+}
+
+void StoreCold::operator()(BlockEmitter& e) const {
+    Xbyak::CodeGenerator& a = e.a;
+    if (fault) {
+        EmitSiteFast(e, site, SiteAddr{static_cast<uint8_t>(rax.getIdx()), 0}, width, edx, reverse, join, false, kMarkOwn).Resolve(a);
+        if (SiteSwapsFirst(width, reverse)) EmitUnswap(a, width);
+    } else {
+        Resolve(a, slow);
+    }
+    e.EmitFlushSnapshot(snap);
+    e.StorePc(pcIndex);
+    if (reverse) {  // the shim writes big-endian: hand it the value swapped, so memory gets the register's own byte order
+        if (width == 4) a.bswap(edx);
+        else if (width == 2) a.rol(dx, 8);
+    }
+    e.CallHelper(ShimFor(width), kFrame, eax, rdx);
+    EmitPendingCheck(e);
+    e.EmitReloadSnapshotVolatile(snap);
+    if (update) EmitRebuildEa(a, e, ra, imm, indexed, rb);
+    JmpTo(a, join);
+}
+
 // --- store groups: which stores share a policy test and dirty marks (the rules are at the top of this file) ---------------
 
 bool GroupedStore(K k, uint8_t& width, bool& update) {
@@ -608,6 +914,7 @@ void BuildPlan(BlockEmitter& e) {
         bool update = false;
         if (GroupedStore(o.kind, width, update)) {
             const Value v = val[o.a];
+            p.mmio[i] = v.mmio;
             const int64_t lo = v.off + imm, hi = lo + width;
             Group* g = nullptr;
             for (Group& c : groups)
@@ -684,18 +991,29 @@ void BuildPlan(BlockEmitter& e) {
 // The slow path of a D-form store that tests for itself or leads a group. The address and the value are taken again from
 // the guest registers once the snapshot is flushed (the main path changed none of them before the test). A leader's
 // range policy byte is set when its chunk or the next one is flagged: its own chunk's byte and whether the range reaches
-// the next chunk decide first (back to the main path when neither).
+// the next chunk decide first (back to the main path when neither). With fault stores the main path tests nothing: this is
+// the slow entry of the store's site (EmitSiteFast first, the policy of the store's own first byte; ecx holds the guest
+// address of the range's first byte, `offset` below the store's), and the members fault for themselves.
 struct StoreDCold {
     Patch slow;
     uint32_t join, back, pcIndex, imm;
     uint8_t ra, rs, width, offset, span;
     bool update, joinNeedsEa, leader;  // joinNeedsEa: the join writes rA from eax (else it adds to rA's register)
     BlockEmitter::GprSnapshot snap;
+    bool fault = false;
+    uint8_t site = 0, value = 0;  // fault: the site, and the host register it stored
     void operator()(BlockEmitter& e) const {
         Xbyak::CodeGenerator& a = e.a;
-        Resolve(a, slow);
+        if (fault) {
+            const SiteMarks marks{offset, leader ? span : uint8_t{0}, false};
+            EmitSiteFast(e, site, SiteAddr{static_cast<uint8_t>(rcx.getIdx()), offset}, width, Xbyak::Reg32(value), false, join,
+                         false, marks)
+                .Resolve(a);
+        } else {
+            Resolve(a, slow);
+        }
         Patches real{};
-        if (leader) {  // rsi = the range's chunk, cx = the low half of its canonical first byte
+        if (leader && !fault) {  // rsi = the range's chunk, cx = the low half of its canonical first byte
             a.cmp(a.byte[kLean + rsi + kPolicyDisp], 0);
             real.Add(EmitJcc(a, kNe));
             a.cmp(cx, 0x10000 - span);
@@ -738,9 +1056,125 @@ struct StoreDCold {
     }
 };
 
+// The slow entry of a group member's site (fault stores): EmitSiteFast, else the checked path's routine for its own store as
+// the interpreter's (the address and the value taken again from the guest registers), then on after the site (the leader marked
+// the group's bytes).
+struct MemberCold {
+    uint32_t join, pcIndex, imm;
+    int32_t disp;  // the site's address: reg + disp
+    uint8_t site, reg, value, ra, rs, width;
+    bool update;
+    BlockEmitter::GprSnapshot snap;
+    void operator()(BlockEmitter& e) const {
+        Xbyak::CodeGenerator& a = e.a;
+        EmitSiteFast(e, site, SiteAddr{reg, disp}, width, Xbyak::Reg32(value), false, join, false, kMarkNone).Resolve(a);
+        e.EmitFlushSnapshot(snap);
+        e.StorePc(pcIndex);
+        a.mov(edx, e.Gpr(rs));
+        EmitRebuildEa(a, e, ra, imm);
+        e.CallHelper(ShimFor(width), kFrame, eax, rdx);
+        EmitPendingCheck(e);
+        e.EmitReloadSnapshotVolatile(snap);
+        if (update) EmitRebuildEa(a, e, ra, imm);  // the join writes rA from eax
+        JmpTo(a, join);
+    }
+};
+
+// A D-form store with fault stores (role as the plan has it, see EmitIntStoreD): one site, and for a store that is not a member
+// the marks after it (of the group's bytes for a leader). The main path tests no policy.
+uint32_t EmitIntStoreDFault(BlockEmitter& e, const Op& o, const Shape& s, uint8_t role) {
+    Xbyak::CodeGenerator& a = e.a;
+    BlockEmitter::MemPlan& p = e.memPlan;
+    const uint32_t i = e.index;
+    const int32_t disp = static_cast<int32_t>(o.imm);
+    const Xbyak::Reg32* base = e.WantCacheGpr(o.a) ? &e.ReadGpr(o.a) : nullptr;
+    const Xbyak::Reg32* value = e.WantCacheGpr(o.d) ? &e.ReadGpr(o.d, 1u << o.a) : nullptr;
+    if (value == nullptr) {
+        a.mov(edx, e.Gpr(o.d));
+        value = &edx;
+    }
+    if (role == kRoleMember) {
+        // the address: base + disp, in eax for an update form (rA's new value) or a base read from memory
+        SiteAddr at{};
+        if (s.update) {
+            if (base != nullptr) a.lea(eax, a.ptr[base->cvt64() + disp]);
+            else {
+                a.mov(eax, e.Gpr(o.a));
+                if (disp != 0) a.add(eax, disp);
+            }
+            at = SiteAddr{static_cast<uint8_t>(rax.getIdx()), 0};
+        } else if (base != nullptr) {
+            at = SiteAddr{static_cast<uint8_t>(base->getIdx()), disp};
+        } else {
+            a.mov(eax, e.Gpr(o.a));
+            at = SiteAddr{static_cast<uint8_t>(rax.getIdx()), disp};
+        }
+        const BlockEmitter::GprSnapshot snap = e.SnapshotGprs();
+        const uint32_t site = EmitSiteStore(e, s.width, at, *value);
+        const uint32_t join = Here(a);
+        if (s.update) {
+            if (e.GprReadLater(o.a)) a.mov(e.WriteGpr(o.a), eax);
+            else { e.DropGpr(o.a); a.mov(e.Gpr(o.a), eax); }
+        }
+        e.Cold(MemberCold{join, i, o.imm, at.disp, static_cast<uint8_t>(site), at.reg, static_cast<uint8_t>(value->getIdx()), o.a,
+                          o.d, s.width, s.update, snap});
+        return 1;
+    }
+    const int32_t first = role == kRoleLeader ? p.rangeDisp[i] : disp;  // from the base to the first byte marked
+    const int32_t offset = disp - first;
+    // an update form whose base is cached and read again adds the displacement to its register at the join (both paths
+    // reach it with the old value there); any other keeps the address in eax for rA
+    const bool joinAdds = s.update && base != nullptr && e.GprReadLater(o.a);
+    // ecx = the guest address of the first byte marked (32 bits: the site adds `offset` in 64, past 2^32 into the tail, which
+    // faults); the site stores at ecx + offset
+    if (s.update && !joinAdds) {  // eax = the address (rA's new value)
+        if (base != nullptr) a.lea(eax, a.ptr[base->cvt64() + disp]);
+        else {
+            a.mov(eax, e.Gpr(o.a));
+            a.add(eax, disp);
+        }
+        if (first == disp) a.mov(ecx, eax);
+        else a.lea(ecx, a.ptr[rax + (first - disp)]);
+    } else if (base != nullptr) {
+        if (first != 0) a.lea(ecx, a.ptr[base->cvt64() + first]);
+        else a.mov(ecx, *base);
+    } else {
+        a.mov(ecx, e.Gpr(o.a));
+        if (first != 0) a.add(ecx, first);
+    }
+    const BlockEmitter::GprSnapshot snap = e.SnapshotGprs();
+    const uint32_t site = EmitSiteStore(e, s.width, SiteAddr{static_cast<uint8_t>(rcx.getIdx()), offset}, *value);
+#if MKW_LEAN_DIRTY_MARKS
+    // as EmitIntStoreD's: the pair from the range's first block and, for a range that may reach two blocks on, its last byte's;
+    // from the unmasked address (EmitMarkUnmasked: only a store that went through the store view gets here)
+    const bool far = role == kRoleLeader && p.span[i] > kGroupOnePair;
+    if (far) a.lea(esi, a.ptr[rcx + (p.span[i] - 1)]);
+    EmitMarkUnmasked(a, ecx);
+    if (far) {
+        a.shr(esi, 6);
+        a.mov(a.byte[kLean + rsi + kMarkUnmaskedDisp], 1);
+    }
+#endif
+    p.done[i] = role == kRoleLeader;
+    const uint32_t join = Here(a);
+    if (joinAdds) {
+        a.add(e.WriteGpr(o.a), disp);
+    } else if (s.update) {
+        if (e.GprReadLater(o.a)) a.mov(e.WriteGpr(o.a), eax);
+        else { e.DropGpr(o.a); a.mov(e.Gpr(o.a), eax); }
+    }
+    StoreDCold cold{Patch{}, join, 0, i, o.imm, o.a, o.d, s.width, static_cast<uint8_t>(offset),
+                    role == kRoleLeader ? p.span[i] : uint8_t{0}, s.update, s.update && !joinAdds, role == kRoleLeader, snap};
+    cold.fault = true;
+    cold.site = static_cast<uint8_t>(site);
+    cold.value = static_cast<uint8_t>(value->getIdx());
+    e.Cold(cold);
+    return 1;
+}
+
 // A D-form integer store (rA != 0, not byte-reversed) as the plan has it: alone (the policy test, the store, its marks),
 // leading a group (the range policy test and the group's marks), or in a group whose leader was emitted as one (the
-// store alone).
+// store alone). With fault stores: EmitIntStoreDFault (a base of the MMIO window keeps the checked path).
 uint32_t EmitIntStoreD(BlockEmitter& e, const Op& o, const Shape& s) {
     Xbyak::CodeGenerator& a = e.a;
     BlockEmitter::MemPlan& p = e.memPlan;
@@ -752,6 +1186,7 @@ uint32_t EmitIntStoreD(BlockEmitter& e, const Op& o, const Shape& s) {
     }
     if (role == kRoleMember) g_groups.members.fetch_add(1, std::memory_order_relaxed);
     if (role == kRoleLeader) g_groups.leaders.fetch_add(1, std::memory_order_relaxed);
+    if (FaultStores() && !p.mmio[i]) return EmitIntStoreDFault(e, o, s, role);
     if (role == kRoleMember && LeanWindow::g_aliased) {  // the store alone, at its unmasked address
         // A member's bytes lie in the range its leader tested, which no 1 GiB view's end (the 32-bit wrap included) cuts:
         // the address is never below the window, and past 4 GiB it is in the aliased tail.
@@ -892,6 +1327,20 @@ uint32_t EmitIntStore(BlockEmitter& e, const Op& o, const Shape& s, bool fromFpr
     if (fromFpr) a.mov(edx, e.FprWord(o.d, 0));
     else if (e.WantCacheGpr(o.d)) a.mov(edx, e.ReadGpr(o.d));
     else a.mov(edx, e.Gpr(o.d));
+    if (FaultStores()) {  // the site at eax, then the marks
+        const BlockEmitter::GprSnapshot snap = e.SnapshotGprs();
+        StoreCold cold{Patch{}, 0, e.index, o.imm, o.a, o.b, s.width, s.update, s.indexed, s.reverse, snap};
+        cold.fault = true;
+        cold.site = static_cast<uint8_t>(EmitSiteStore(e, s.width, SiteAddr{static_cast<uint8_t>(rax.getIdx()), 0}, edx, s.reverse));
+                EmitMarksOfEax(a);
+        cold.join = Here(a);
+        if (s.update) {
+            if (e.GprReadLater(o.a)) a.mov(e.WriteGpr(o.a), eax);
+            else { e.DropGpr(o.a); a.mov(e.Gpr(o.a), eax); }
+        }
+        e.Cold(cold);
+        return 1;
+    }
     EmitCanonical(e);
     const BlockEmitter::GprSnapshot snap = e.SnapshotGprs();
     const Patch slow = EmitStoreChecked(e, s.width, s.reverse);
@@ -1078,7 +1527,8 @@ uint32_t EmitLfs(BlockEmitter& e, const Op& o, bool update, bool indexed, bool z
     Patch other{};
 #if !MKW_FAST_FLOAT
     // Normal or zero: t = the word shifted left once (no sign), t - 2^24 is below 0xFE000000 for a normal; a zero's word (0 or
-    // 0x80000000) is put in that range by the cmov, so zeros and normals take the same path with no branch between them.
+    // 0x80000000) is put in that range by the cmov, so zeros and normals take the same path with no branch between them (a
+    // second branch for zeros, two fewer instructions, mispredicts where zeros and normals mix: measured +80% cycles on lfs).
     a.lea(esi, a.ptr[rdx + rdx - 0x01000000]);
     a.test(edx, 0x7FFFFFFF);
     a.cmovz(esi, edx);
@@ -1129,6 +1579,10 @@ struct StfCold {
     uint8_t d, ra, rb, width;
     bool update, hasSubnormal, indexed, havePaired;
     BlockEmitter::GprSnapshot snap;
+    // fault stores: the site (its address addrReg + addrDisp), and whether eax must be made for the routine
+    bool fault = false, rebuildEa = false;
+    uint8_t site = 0, addrReg = 0;
+    int32_t addrDisp = 0;
     void operator()(BlockEmitter& e) const {
         Xbyak::CodeGenerator& a = e.a;
         if (havePaired) {
@@ -1144,9 +1598,15 @@ struct StfCold {
             a.mov(edx, eax);
             JmpTo(a, haveBits);
         }
-        Resolve(a, slow);
+        if (fault) {
+            EmitSiteFast(e, site, SiteAddr{addrReg, addrDisp}, width, edx, false, join, false, kMarkOwn).Resolve(a);
+            if (SiteSwapsFirst(width, false)) EmitUnswap(a, width);
+        } else {
+            Resolve(a, slow);
+        }
         e.EmitFlushSnapshot(snap);
         e.StorePc(pcIndex);
+        if (rebuildEa) EmitRebuildEa(a, e, ra, imm, indexed, rb);
         e.CallHelper(ShimFor(width), kFrame, eax, rdx);
         EmitPendingCheck(e);
         e.EmitReloadSnapshotVolatile(snap);
@@ -1212,10 +1672,29 @@ uint32_t EmitStf(BlockEmitter& e, const Op& o, bool single, bool update, bool in
         cold.haveBits = Here(a);
 #endif
     }
-    EmitEa(e, o, indexed, zeroBase);
-    EmitCanonical(e);
     cold.width = single ? 4 : 8;
-    cold.slow = EmitStoreChecked(e, cold.width);
+    if (FaultStores()) {  // a site, then the marks
+        cold.fault = true;
+        const int hit = !update && !indexed && !zeroBase ? e.FindCachedGpr(o.a) : -1;
+        if (hit >= 0) {  // at base + disp, the marks from ecx: no eax (the routine's call makes it)
+            const Xbyak::Reg32& base = BlockEmitter::GprCacheReg(static_cast<uint32_t>(hit));
+            cold.addrReg = static_cast<uint8_t>(base.getIdx());
+            cold.addrDisp = static_cast<int32_t>(o.imm);
+            cold.rebuildEa = true;
+            cold.site = static_cast<uint8_t>(EmitSiteStore(e, cold.width, SiteAddr{cold.addrReg, cold.addrDisp}, edx));
+            a.lea(ecx, a.ptr[base.cvt64() + cold.addrDisp]);
+            EmitMarkUnmasked(a, ecx);
+        } else {
+            EmitEa(e, o, indexed, zeroBase);
+            cold.addrReg = static_cast<uint8_t>(rax.getIdx());
+            cold.site = static_cast<uint8_t>(EmitSiteStore(e, cold.width, SiteAddr{cold.addrReg, 0}, edx));
+                        EmitMarksOfEax(a);
+        }
+    } else {
+        EmitEa(e, o, indexed, zeroBase);
+        EmitCanonical(e);
+        cold.slow = EmitStoreChecked(e, cold.width);
+    }
     cold.join = Here(a);
     if (update) a.mov(e.WriteGpr(o.a), eax);
     cold.pcIndex = e.index;
@@ -1272,9 +1751,12 @@ uint32_t EmitPsqL(BlockEmitter& e, const Op& o, bool update) {
     if (w == 0) a.test(e.Gqr(i), 0xFFFF0000u);  // type 0 and load scale 0
     else a.test(e.Gqr(i), 0x00070000u);         // type 0
     cold.generic = EmitJcc(a, kNe);
-    EmitCanonical(e);
+    // the bytes at eax unmasked in the aliased view (EmitAliasedAddress), else at the canonical address
+    Xbyak::RegExp at = kLean + rcx;
+    if (LeanWindow::g_aliased) at = kLean + rax + (LeanWindow::g_storeView ? static_cast<int>(LeanWindow::kStoreViewOffset) : 0);
+    else EmitCanonical(e);
     if (w == 0) {
-        EmitLoadSwapped(a, 8);  // ps0 in the high word, ps1 in the low
+        EmitLoadSwappedAt(a, 8, edx, at);  // ps0 in the high word, ps1 in the low
         FpMovqTo(a, xmm0, rdx);
 #if !MKW_FAST_FLOAT
         // a NaN lane (a signalling one is quieted by the loader): that is the shim's
@@ -1292,7 +1774,7 @@ uint32_t EmitPsqL(BlockEmitter& e, const Op& o, bool update) {
 #endif
     } else {
         // PpcLoadSinglePsqFloatFastInline: ps0 = the word as it is, ps1 = 1.0f
-        EmitLoadSwapped(a, 4);
+        EmitLoadSwappedAt(a, 4, edx, at);
         a.shl(rdx, 32);
         a.mov(esi, 0x3F800000);
         a.or_(rdx, rsi);
@@ -1325,8 +1807,11 @@ struct PsqStCold {
     uint8_t d, b, ra;
     bool update;
     BlockEmitter::GprSnapshot snap;
+    bool fault = false;  // fault stores: the site (at eax, `width` bytes of rdx)
+    uint8_t site = 0, width = 0;
     void operator()(BlockEmitter& e) const {
         Xbyak::CodeGenerator& a = e.a;
+        if (fault) EmitSiteFast(e, site, SiteAddr{static_cast<uint8_t>(rax.getIdx()), 0}, width, edx, false, join, width == 8, kMarkOwn).Resolve(a);
         generic.Resolve(a);
         e.EmitFlushSnapshot(snap);
         e.StorePc(pcIndex);
@@ -1348,13 +1833,23 @@ uint32_t EmitPsqSt(BlockEmitter& e, const Op& o, bool update) {
     else a.test(e.Gqr(i), 0x00000007u);         // single float: store type 0 (ignores store scale)
     cold.generic.Add(EmitJcc(a, kNe));
     // The pair to store: the register's bits when it is held as a pair; a register held as a scalar is Paired(f, r) of it
-    // (PPC_PsFromScalarInline: the double narrowed by cvtsd2ss, in both lanes; prologues spill callee-saved FPRs this way).
-    // W = 1 stores ps0 alone: edx.
-    FprBitsToRdx(e, o.d);
+    // (PPC_PsFromScalarInline: the double narrowed by cvtsd2ss, in both lanes; prologues spill callee-saved FPRs this way),
+    // narrowed straight from the register's slot or memory. W = 1 stores ps0 alone: edx.
+    const int slot = e.FindCachedFpr(o.d);
+    const auto pairBits = [&]() {
+        FprBitsToRdx(e, o.d);
+        if (w != 0) a.shr(rdx, 32);  // ps0 sits in the high word of the paired FPR
+    };
     const auto fromScalar = [&]() {
-        FpMovqTo(a, xmm0, rdx);
-        if (kFpAvx) a.vcvtsd2ss(xmm0, xmm0, xmm0);
-        else a.cvtsd2ss(xmm0, xmm0);
+        if (slot >= 0) {
+            const Xbyak::Xmm& x = BlockEmitter::FprCacheReg(static_cast<uint32_t>(slot));
+            if (kFpAvx) a.vcvtsd2ss(xmm0, xmm0, x);
+            else a.cvtsd2ss(xmm0, x);
+        } else if (kFpAvx) {
+            a.vcvtsd2ss(xmm0, xmm0, e.Fpr(o.d));
+        } else {
+            a.cvtsd2ss(xmm0, e.Fpr(o.d));
+        }
         if (w == 0) {
             if (kFpAvx) a.vmovsldup(xmm0, xmm0);  // the single in lanes 0 and 1
             else a.pshufd(xmm0, xmm0, 0x00);
@@ -1365,45 +1860,71 @@ uint32_t EmitPsqSt(BlockEmitter& e, const Op& o, bool update) {
             a.movd(edx, xmm0);
         }
     };
+    // The store keeps a lane unless it is a subnormal (flushed to a signed zero) or a NaN (quieted): those, and only those, are
+    // the shim's. Per lane, with m = its bits & 0x7FFFFFFF: (m << 1) - 2^24 is at most 0xFE000000 for a normal or an infinity;
+    // a zero is the other lane kept (tested out of the way). lane 0 is the low word (edx), lane 1 the high word.
+    const auto laneTest = [&](int lane) {
+#if !MKW_FAST_FLOAT
+        Xbyak::Label keep;
+        const Xbyak::Reg32 bits = lane == 0 ? edx : esi;
+        if (lane != 0) {
+#if defined(__BMI2__)
+            a.rorx(rsi, rdx, 32);
+#else
+            a.mov(rsi, rdx);
+            a.shr(rsi, 32);
+#endif
+        }
+        a.lea(edi, a.ptr[bits.cvt64() + bits.cvt64() - 0x01000000]);
+        a.cmp(edi, 0xFE000000u);
+        a.jbe(keep);
+        a.test(bits, 0x7FFFFFFF);
+        cold.generic.Add(EmitJcc(a, kNe));
+        a.L(keep);
+#else
+        (void)lane;
+#endif
+    };
     const Form known = e.KnownForm(e.index, o.d);
     if (known == Form::Paired) {
         BlockEmitter::NoteForm(BlockEmitter::FormEvent::TestSkipped);
-        if (w != 0) a.shr(rdx, 32);  // ps0 sits in the high word of the paired FPR
+        pairBits();
+        laneTest(0);
+        if (w == 0) laneTest(1);
     } else if (known == Form::Scalar) {
         BlockEmitter::NoteForm(BlockEmitter::FormEvent::ConversionForced);
         fromScalar();
+        laneTest(0);  // a pair made of a scalar has two equal lanes
     } else {
         BlockEmitter::NoteForm(BlockEmitter::FormEvent::TestEmitted);
         Xbyak::Label scalar, done;
         a.test(e.PairedMask(), 1u << (o.d & 31u));
-        a.jz(scalar, CG::T_SHORT);
-        if (w != 0) a.shr(rdx, 32);
-        a.jmp(done, CG::T_SHORT);
+        a.jz(scalar, CG::T_NEAR);
+        pairBits();
+        laneTest(0);
+        if (w == 0) laneTest(1);
+        a.jmp(done, CG::T_NEAR);
         a.L(scalar);
         fromScalar();
+        laneTest(0);
         a.L(done);
     }
-#if !MKW_FAST_FLOAT
-    // The store keeps a lane unless it is a subnormal (flushed to a signed zero) or a NaN (quieted): those, and only
-    // those, are the shim's. Per lane, m = bits & 0x7FFFFFFF: a normal, an infinity or a zero is kept as it is.
-    const int lanes = w == 0 && known != Form::Scalar ? 2 : 1;  // a pair made of a scalar has two equal lanes
-    for (int lane = 0; lane < lanes; ++lane) {
-        Xbyak::Label keep;
-        if (lane == 0) {
-            a.mov(esi, edx);
-        } else {
-            a.mov(rsi, rdx);
-            a.shr(rsi, 32);
-        }
-        a.and_(esi, 0x7FFFFFFF);
-        a.lea(edi, a.ptr[rsi - 0x00800000]);
-        a.cmp(edi, 0x7F000000);
-        a.jbe(keep);
-        a.test(esi, esi);
-        cold.generic.Add(EmitJcc(a, kNe));
-        a.L(keep);
+    if (FaultStores()) {  // a site (whose slow entry tests both ends of a pair), then the marks
+        cold.fault = true;
+        cold.width = w == 0 ? 8 : 4;
+        cold.site = static_cast<uint8_t>(EmitSiteStore(e, cold.width, SiteAddr{static_cast<uint8_t>(rax.getIdx()), 0}, edx));
+                EmitMarksOfEax(a);
+        cold.join = Here(a);
+        if (update) a.mov(e.WriteGpr(o.a), eax);
+        cold.pcIndex = e.index;
+        cold.imm = o.imm;
+        cold.d = o.d;
+        cold.b = o.b;
+        cold.ra = o.a;
+        cold.update = update;
+        e.Cold(cold);
+        return 1;
     }
-#endif
     EmitCanonical(e);
     if (w == 0) {
         // both ends of the 8 bytes: a pair can straddle two chunks (LeanStoreNeedsPolicy(addr) and (addr + 7))
@@ -1581,5 +2102,9 @@ JitX64StoreGroupStats JitX64GetStoreGroupStats() {
     return JitX64StoreGroupStats{g.leaders.load(std::memory_order_relaxed), g.members.load(std::memory_order_relaxed),
                                  g.rangeBack, g.slowGoOn.load(std::memory_order_relaxed),
                                  g.slowLeave.load(std::memory_order_relaxed)};
+}
+JitX64FaultStats JitX64GetFaultStats() {
+    return JitX64FaultStats{x64::g_faultSites.load(std::memory_order_relaxed), x64::g_faults.load(std::memory_order_relaxed),
+                            x64::g_faultRepeats.load(std::memory_order_relaxed), x64::g_faultChunks.load(std::memory_order_relaxed)};
 }
 }  // namespace PpcInterpreter::detail

@@ -115,12 +115,26 @@ inline Cc Invert(Cc c) { return static_cast<Cc>(static_cast<uint8_t>(c) ^ 1u); }
 // jcc to `target` on condition `cc` (T_NEAR: always the 6-byte form).
 void Jcc(Xbyak::CodeGenerator& a, Cc cc, const Xbyak::Label& target, Xbyak::CodeGenerator::LabelType type);
 
-// Whether GuestCodePatch registered what a subcall's tests and return read (it does so with the hooks that give JitCallTarget its
-// patchedByte): a call site may then call a patched function in a subcall frame (BlockEmitter::CallSubFrame, jit_subcall).
+// Whether GuestCodePatch registered what a call of a patched function tests before and after it (it does so with the hooks that give
+// JitCallTarget its patchedByte): a call site may then call a patched function's block with a host call (jit_x64_branch.cpp,
+// jit_subcall).
 bool SubFramesPossible();
 // The shared routine that moves a call cell's entry to the front (Linux x86-64): called with rcx = the cell, rdx = the entry;
 // answers rdx = the cell's first entry, which is now that one. Clobbers xmm0-xmm3.
 const void* CellPromoteRoutine();
+
+// Fault-based stores (jit_x64_mem.cpp): guest stores go through the store view (LeanWindow::g_storeView) and its faults are
+// handled, when the memory made the store view and the handler is installed. FaultStoresInit decides it once, at the first code
+// cache (false: the store view is there but the handler could not be installed, and no code may run); FaultStores answers it.
+bool FaultStoresInit();
+bool FaultStores();
+// The fault sites of one code chunk, as the handler looks them up: opened with the chunk (null when FaultStores() is off or no
+// registry entry is left), a compiled block's sites added once the block is placed (code: its buffer), closed before the chunk
+// is unmapped.
+struct FaultChunk;
+FaultChunk* FaultChunkOpen(const uint8_t* base, size_t size);
+void FaultChunkClose(FaultChunk* chunk);
+void FaultChunkAdd(FaultChunk* chunk, const uint8_t* code, const BlockEmitter& e);
 
 // A memory operand of `bits` (8, 16, 32, 64) at the fixed host address p: [disp32] when p fits a sign-extended 32-bit
 // displacement (the statics of a non-PIE executable), else [scratch] with the address loaded into scratch here.
@@ -216,6 +230,8 @@ public:
     Xbyak::Address Fpr(uint32_t r) const;      // qword: the register's 64 raw bits (CpuContext form: ps0 as a double or paired)
     Xbyak::Address FprWord(uint32_t r, uint32_t half) const;  // dword; half 0: the low word (ps1), 1: the high word (ps0)
     Xbyak::Address PairedMask() const;         // dword: Frame::pairedMask (bit r = 1 iff fpr[r] is Paired)
+    Xbyak::Address FrameReturn() const;        // dword: Frame::returnAddress (bit 0: the function was called with a host call)
+    Xbyak::Address FrameWord() const;          // qword: pairedMask | returnAddress << 32 (what a host call keeps on the stack)
     Xbyak::Address FrameFlags() const;         // dword: Frame::flags (kFrameFlag*)
     Xbyak::Address Executed() const;           // qword: Frame::executed
     // The same registers' addresses by host offset into CpuContext, for state this list lacks (offsetof(CpuContext, ...)).
@@ -264,10 +280,17 @@ public:
     // of one block share the cache.
     void CacheProbe(uint32_t which = 0);
     void ExitDynamicMiss(uint32_t which = 0);
-    // The frame's function returned (a blr to the address it was entered with), or an exception is stored in
-    // frame.pending.
+    // The function running returned (a blr to the address it was entered with: Frame::returnAddress), or an exception is stored
+    // in frame.pending. ExitReturn tests Frame::returnAddress's tag: a function a block called with a host call (CallLinked,
+    // jit_subcall; tagged) returns to its caller's code with the caller's pairedMask and returnAddress back from the return slot
+    // (ExitSharedReturn: `ret`, the caller drops the slot), the frame's own function leaves the frame (ExitFrameReturn). f1 must be scalar by then (the
+    // caller takes it so). Clobbers rax.
     void ExitReturn();
+    void ExitFrameReturn();
+    void ExitSharedReturn();
     void ExitPending();
+    // jcc to a routine of the shared code (rel32 when in reach, else the inverted jcc over JmpAbs). Clobbers rcx when far.
+    void JumpIfAbs(Cc cc, const void* target);
 
     // --- calls ------------------------------------------------------------------------------------------------------
     // Calls fn with up to kMaxCallArgs integer arguments loaded into the host's argument registers (see CallArg). The result
@@ -282,16 +305,14 @@ public:
     // the caller has set (xmm0 and xmm1 are the first two on both ABIs; on Win64 float arguments share positions with the
     // integer ones, so a helper that takes (double, uint32_t) has the integer in rdx there and rsi on SysV).
     void CallRaw(const void* fn);
-    // Calls the shared JIT->patched-JIT subcall trampoline (eax = target, rdx = const JitCallTarget*). Linux x86-64 only.
-    void CallSubCall();
-    // A call of the patched function at `target` in a subcall frame of its own (kFrameFlagSubCall: pairedMask 0, returnAddress
-    // as given, pc = target; entry is set from pc by JitDirectContinue, its only reader), linked like ExitLinked(target) to the
-    // target's block: what GuestCodePatch::RunPatched
-    // and RunCompiledEntry do for it, minus their tests, which the caller makes first: the current frame is not the rollback loop
-    // frame, the target's guard byte is set and no redirect applies. lr is set. The callee's return (its frame's
-    // ExitReturn) comes back after the call with r13 the caller's frame again; its exits that are not linked continue it in the
-    // dispatcher (JitDirectContinue) and come back here the same way. Clobbers every scratch register. Linux x86-64 only.
-    void CallSubFrame(uint32_t target, uint32_t returnAddress);
+    // A host call of the patched function at targetPc's block through a call link: a `call rel32` patched like ExitLinked's jmp to
+    // the target block's linked entry. Its unlinked stub tests what a call of the patched function's wrapper would decide (the
+    // guard byte `guard` set, the redirect bound above targetPc): then the shared lift code with the slot, which has the dispatcher
+    // run the callee and link the slot; else the caller's Frame word back from the return slot, the return address and the slot
+    // dropped, and a jump to `wrapper` (the site's call of the wrapper). A call link is aimed only by its stub: Resume leaves it
+    // suspended (GuestCodePatch suspends every slot when a guard byte drops or the bound moves). The caller has pushed the return
+    // slot and set the callee's Frame word (jit_x64_branch.cpp). Linux x86-64 only.
+    void CallLinked(uint32_t targetPc, const uint8_t* guard, Xbyak::Label& wrapper);
 
     // Op `index` as a call to the interpreter's handler and the handling of its answer (go on, or leave the block); the
     // number of ops it ran (2 for a fused pair). Used by the core for every op without native code.
@@ -362,6 +383,12 @@ public:
     // written guest memory or run guest code. If it fails, control leaves for nextPc, through the dispatcher. Falls through
     // when the block still matches guest memory. Clobbers rax (and the flags).
     void EmitRecheck(uint32_t nextPc);
+    // Guarded code (JitGuardedLine, BrawlDirtyMemory::guardedWritten): the lines of the block in 4 KiB pages registered as
+    // executable, where every guest store takes the checked path and a mark drops the block (its epoch 0, its slots suspended)
+    // before compiled code can go on, are not tested: the linked entry and the test after a call test the marks of the other
+    // lines only (none: the linked entry tests nothing, the test after a call is the epoch alone). Set by EmitPrologue; the core
+    // copies Guarded into Block::jitGuarded, which has the block cache put the guarded lines in the guard tables.
+    bool Guarded() const { return guarded_; }
 
     // Stores the current pc of op `i` into ctx->pc (for helpers and handlers that read it).
     void StorePc(uint32_t i);
@@ -382,6 +409,12 @@ public:
     // done (jump or `lea` to it with rip-relative addressing).
     static constexpr uint32_t kMaxCells = 16;
     Xbyak::Label& NewCell();
+    // The code cache's tables of translated call targets, one for bctr's tail calls and one for bctrl's calls (their entries' `fast`
+    // differ, JitFastCallFor): kTargetTableEntries JitTargetCells each, direct-mapped by (target >> 2) & (entries - 1), starting
+    // empty. A site whose cell misses looks here before calling its shim (JitTailOpCached / JitCallOpCached, which fill the cell),
+    // and the shim's path copies the cell's first entry here. Null without a code cache (no table then).
+    static constexpr uint32_t kTargetTableEntries = 256;
+    uint8_t* TargetTable(bool tail) const;
     // The probe of a cell for the guest target in eax (already & ~3): falls through with rcx = the cell's address and rdx = the
     // record of the entry whose key is eax, or jumps to `miss` (near). A cell holds kCellWays entries (a JitTargetCell each,
     // after the code), the newest first; `NewCell` makes room for all of them.
@@ -434,14 +467,28 @@ public:
     // Made by the group at the block's first memory op (an emitter compiles one block). Per op: role (0: the store tests
     // the policy and marks for itself, 1: it leads a group, 2: it belongs to the group op leader[i] leads); a leader's
     // range of bytes (rangeDisp: from its base register's value to the group's lowest byte; span: the bytes); whether a
-    // leader's code was emitted as one (done) and whether a member relied on it (used).
+    // leader's code was emitted as one (done) and whether a member relied on it (used); whether a store's base is the MMIO
+    // window's (mmio: a lis of its high half; the checked path every time).
     struct MemPlan {
         bool built = false;
         uint8_t role[kMaxBlock + 1] = {}, leader[kMaxBlock + 1] = {}, span[kMaxBlock + 1] = {};
-        bool done[kMaxBlock + 1] = {}, used[kMaxBlock + 1] = {};
+        bool done[kMaxBlock + 1] = {}, used[kMaxBlock + 1] = {}, mmio[kMaxBlock + 1] = {};
         int32_t rangeDisp[kMaxBlock + 1] = {};
     };
     MemPlan memPlan;
+
+    // --- fault sites (jit_x64_mem.cpp: stores through the store view, lean_window.h) --------------------------------------
+    // With FaultStores(), a guest store is one store instruction into the store view, which faults where the store policy
+    // would send it to the checked path; the fault handler sends it to its slow entry (cold code) and patches the store
+    // instruction into a jump there. AddFaultSite: the store instruction is the next one emitted here (answers the site);
+    // FaultSiteSlowHere: the current position, in cold code, is that site's slow entry (every site gets one, or the block
+    // is not compiled).
+    static constexpr uint32_t kMaxFaultSites = kMaxBlock + 8;
+    uint32_t AddFaultSite();
+    void FaultSiteSlowHere(uint32_t site);
+    uint32_t FaultSiteCount() const { return faultSiteCount_; }
+    uint32_t FaultSiteStore(uint32_t i) const { return faultStore_[i]; }  // offsets from the buffer's start
+    uint32_t FaultSiteSlow(uint32_t i) const { return faultSlow_[i]; }
 
     // --- intra-block FPR cache (jit_x64_fpr.cpp) -------------------------------------------------------------------------
     // Guest FPRs held in xmm registers within a block. A slot's low quadword holds the register's 64 raw bits exactly as
@@ -581,6 +628,10 @@ private:
         uint32_t pc;
         uint32_t patchOffset;  // offset of 5-byte `jmp rel32` in block buffer (conditional: of a `jcc rel32` + 1), or kNoPatch for indirect
         bool conditional = false;  // ExitLinkedIf
+        bool call = false;         // CallLinked: a `call rel32`; retOffset is where it returns
+        uint32_t retOffset = 0;
+        const uint8_t* guard = nullptr;      // CallLinked: the target's guard byte
+        Xbyak::Label* wrapper = nullptr;     //   and the site's call of its wrapper
         Xbyak::Label stub;
         Xbyak::Label far;      // `jmp [rip + slot]` fallback when target lies outside ±2 GiB
         Xbyak::Label slot;
@@ -622,8 +673,14 @@ private:
     uint32_t gprReadLater_[kMaxBlock + 1] = {};
     uint32_t gprTick_ = 0;
     bool inCold_ = false;
+    uint32_t faultStore_[kMaxFaultSites] = {}, faultSlow_[kMaxFaultSites] = {};
+    uint32_t faultSiteCount_ = 0;
     void* owner_ = nullptr;
     bool staleStub_ = false;
+    bool guarded_ = false;    // some line's mark left untested (Guarded)
+    bool untested_ = false;   // every line's: the linked entry tests nothing
+    uint64_t testMask_[kMaxSegments < 2 ? 2 : kMaxSegments] = {};  // block.check[k].mask without the guarded lines
+    void ComputeGuard();
     uint32_t selfLoopPrefix_ = 0;  // a jump to the block's own start from an op before this goes straight to its entry
     uint32_t coldOp_ = 0;          // the op whose cold code Finish is emitting
     static uint32_t SelfLoopPrefix(const Block& b);
@@ -692,6 +749,7 @@ struct JitX64Stats {
     uint64_t cacheHits, cacheMisses;  // inline-cache probes that jumped / that left for the dispatcher (only while BRAWL_JIT_STATS is on)
     uint64_t staleStubs = 0, staleStubFailures = 0;  // stale stubs made (StaleCell) / that could not be made
     uint64_t selfLoops = 0;  // jumps back to a block's own start emitted straight to its entry (BlockEmitter::SelfLoopPrefix)
+    uint64_t guarded = 0;    // blocks compiled as guarded code (no mark test on their linked entry: BlockEmitter::Guarded)
 };
 JitX64Stats JitX64GetStats();
 // What the condition register analysis did (jit_x64_cr.cpp): blocks analysed, compare and record-form CR writes not emitted,
@@ -714,6 +772,12 @@ struct JitX64StoreGroupStats {
     uint64_t leaders, members, rangeBack, slowGoOn, slowLeave;
 };
 JitX64StoreGroupStats JitX64GetStoreGroupStats();
+// Fault-based stores (jit_x64_mem.cpp): fault sites registered, faults handled (each patches its site into a jump to its slow
+// entry), faults handled at a site already patched (none expected: a patched site no longer stores there), code chunks open.
+struct JitX64FaultStats {
+    uint64_t sites, faults, repeated, chunks;
+};
+JitX64FaultStats JitX64GetFaultStats();
 
 // What the FPR cache did at compile time (jit_x64_fpr.cpp): operand reads served by a slot, slots filled from memory, slots
 // stored (flushes and evictions), and flushes that wrote pending form bits.
