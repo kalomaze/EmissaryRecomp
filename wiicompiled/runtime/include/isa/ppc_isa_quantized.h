@@ -855,6 +855,22 @@ inline void PpcStoreSinglePsqFloatStackInline(uint32_t addr, double value)
     PpcWriteUnpairedPsqStackInline(addr, first);
 }
 
+// The word PpcStoreSinglePsqFloatStackInline stores, from ps0's bits without the widening: the widening quiets a
+// signalling NaN and the FTZ narrowing flushes a subnormal (whether or not DAZ already flushed it on the widening), which
+// is PpcStorePsqFloatBitsInline's per-lane rule (checked over all 2^32 ps0 words, with and without FTZ+DAZ, by
+// tests/float_conversion_exhaustive.cpp).
+inline uint32_t PpcStoreSinglePsqFloatStackBitsInline(double value)
+{
+    return PpcStorePsqFloatBitsInline(PpcBitCastToU32Inline(PpcGetPs0Inline(value)));
+}
+
+// The stack psq_st W=1 float arm, forced inline at the hot wrapper (the plain inline body above stayed an out-of-line
+// call at every FPR save site).
+MKW_PPC_FORCE_INLINE void PpcStoreSinglePsqFloatStackHotInline(uint32_t addr, double value)
+{
+    MemoryInline::WriteStack32(addr, PpcStoreSinglePsqFloatStackBitsInline(value));
+}
+
 template <typename QuantizedType>
 inline void PpcStoreSinglePsqQuantizedStackInline(uint32_t addr, double value, uint32_t scale)
 {
@@ -927,6 +943,20 @@ return PpcLoadSinglePsqQuantizedFastInline<int16_t>(addr, scale);
 
     return PPC_PsqL(addr, W, I);
 }
+
+// The OSInitFastCast encodings: GQR2-GQR5 hold u8, u16, s8 and s16 with scale 0 in both halves (0x00040004 ..
+// 0x00070007), and the stack psq sites through them (FPR saves, fast casts) run with exactly that value. The stack
+// wrappers give that one encoding an inline arm after the float one: the same body the cold generic switch would pick
+// for that halfword, with the scale the GQR holds (0). Other GQRs and other values still reach the generic body.
+template <uint32_t I>
+inline constexpr uint32_t kPpcPsqFastCastType = (I >= 2u && I <= 5u) ? I + 2u : 0u;
+
+template <uint32_t Type>
+struct PpcPsqQuantizedTypeOf;
+template <> struct PpcPsqQuantizedTypeOf<4u> { using Type = uint8_t; };
+template <> struct PpcPsqQuantizedTypeOf<5u> { using Type = uint16_t; };
+template <> struct PpcPsqQuantizedTypeOf<6u> { using Type = int8_t; };
+template <> struct PpcPsqQuantizedTypeOf<7u> { using Type = int16_t; };
 
 // Hot wrapper: the float encoding (quantization type 0) is what the SDK leaves
 // in the GQRs for the overwhelming majority of psq_l sites, so it is tested with
@@ -1132,6 +1162,22 @@ MKW_PPC_FORCE_INLINE double PPC_PsqLStackInline(CpuContext* cpu, uint32_t addr)
         if (((gqr >> 16) & 0x7u) == 0u) [[likely]]
         {
             return PpcLoadSinglePsqFloatStackInline(addr);
+        }
+    }
+    if constexpr (kPpcPsqFastCastType<I> != 0u)
+    {
+        constexpr uint32_t type = kPpcPsqFastCastType<I>;
+        using Quantized = typename PpcPsqQuantizedTypeOf<type>::Type;
+        // The generic body: W=0 dispatches on the whole load halfword, W=1 on the type with the load scale applied.
+        if constexpr (W == 0u)
+        {
+            if ((gqr & 0xFFFF0000u) == (type << 16)) [[likely]]
+                return PpcLoadPairPsqIntegerStackInline<Quantized>(addr);
+        }
+        else
+        {
+            if ((gqr & 0x3F070000u) == (type << 16)) [[likely]]
+                return PpcLoadSinglePsqQuantizedStackInline<Quantized>(addr, 0u);
         }
     }
 
@@ -1465,8 +1511,30 @@ MKW_PPC_FORCE_INLINE void PPC_PsqStStackInline(CpuContext* cpu, uint32_t addr, d
         // Scalar float ignores the store scale, exactly like the generic switch.
         if ((gqr & 0x7u) == 0u) [[likely]]
         {
-            PpcStoreSinglePsqFloatStackInline(addr, value);
+            PpcStoreSinglePsqFloatStackHotInline(addr, value);
             return;
+        }
+    }
+    if constexpr (kPpcPsqFastCastType<I> != 0u)
+    {
+        constexpr uint32_t type = kPpcPsqFastCastType<I>;
+        using Quantized = typename PpcPsqQuantizedTypeOf<type>::Type;
+        // The generic body: W=0 dispatches on the whole store halfword, W=1 on the type with the store scale applied.
+        if constexpr (W == 0u)
+        {
+            if ((gqr & 0x0000FFFFu) == type) [[likely]]
+            {
+                PpcStorePairPsqQuantizedStackInline<Quantized>(addr, value, 0u);
+                return;
+            }
+        }
+        else
+        {
+            if ((gqr & 0x00003F07u) == type) [[likely]]
+            {
+                PpcStoreSinglePsqQuantizedStackInline<Quantized>(addr, value, 0u);
+                return;
+            }
         }
     }
 

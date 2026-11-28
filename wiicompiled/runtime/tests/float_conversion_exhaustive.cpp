@@ -79,6 +79,42 @@ void CheckPsqScalarStore(const char* mode)
     }
 }
 
+// The stack psq_st W=1 float word: the integer per-lane rule (PpcStoreSinglePsqFloatStackBitsInline) against the
+// widen-then-FTZ body it replaced at the hot wrapper, for every ps0 word, with a pseudo-random ps1.
+void CheckPsqStackScalarStore(const char* mode)
+{
+    uint32_t value = 0;
+    uint64_t state = 0x13198A2E03707344ull;
+    do
+    {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        const double pair = PpcPackPairedBitsInline(value, static_cast<uint32_t>(state >> 32));
+        const uint32_t got = PpcStoreSinglePsqFloatStackBitsInline(pair);
+        const uint32_t want = PpcConvertToSingleFTZInline(
+            PpcBitCastToU64Inline(static_cast<double>(PpcGetPs0Inline(pair))));
+        if (got != want)
+            Fail(mode, value, got, want);
+    } while (++value != 0);
+}
+
+// Informational: the words whose plain host cast differs from the manual's widening. Under FTZ+DAZ (the game thread's
+// MXCSR once the guest sets FPSCR[NI]) these include every subnormal (DAZ reads them as zero), so the lfs fast-path test
+// cannot shrink to an exponent-255-only check.
+void CountCastMismatches(const char* mode)
+{
+    uint64_t nonNan = 0, nan = 0;
+    uint32_t value = 0;
+    do
+    {
+        float single;
+        std::memcpy(&single, &value, sizeof(single));
+        if (PpcBitCastToU64Inline(static_cast<double>(single)) != PpcConvertToDoubleBitsSlow(value))
+            ++(((value >> 23) & 0xFFu) == 0xFFu ? nan : nonNan);
+    } while (++value != 0);
+    std::printf("host cast != manual widening (%s): %llu exponent-255 words, %llu others\n", mode,
+                static_cast<unsigned long long>(nan), static_cast<unsigned long long>(nonNan));
+}
+
 // fmuls and the fused single family as floats (PpcFmulsFloatInline, PpcFusedSingleFloatInline) against the double
 // entry points, whose results must be exactly their widenings: 2^25 operand triples per form, drawn from a mix of
 // widened singles (any word, so subnormals, infinities and NaNs of both kinds), single-precision products' typical
@@ -151,10 +187,14 @@ int main()
     const unsigned int defaultCsr = _mm_getcsr();
     CheckWiden("PpcConvertToDoubleBitsInline (default MXCSR)");
     CheckPsqScalarStore("PpcStorePsqCastFloatBitsInline (default MXCSR)");
+    CheckPsqStackScalarStore("PpcStoreSinglePsqFloatStackBitsInline (default MXCSR)");
+    CountCastMismatches("default MXCSR");
     CheckSingleProducts();
     _mm_setcsr(defaultCsr | 0x8040u);  // FTZ | DAZ, as the runtime sets them with FPSCR[NI]
     CheckWiden("PpcConvertToDoubleBitsInline (FTZ+DAZ)");
     CheckPsqScalarStore("PpcStorePsqCastFloatBitsInline (FTZ+DAZ)");
+    CheckPsqStackScalarStore("PpcStoreSinglePsqFloatStackBitsInline (FTZ+DAZ)");
+    CountCastMismatches("FTZ+DAZ");
     CheckSingleProducts();
     _mm_setcsr(defaultCsr);
     if (failures != 0)
