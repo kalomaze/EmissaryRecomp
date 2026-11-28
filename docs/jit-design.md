@@ -13,7 +13,8 @@ stays: it is the reference the JIT is tested against, and the engine wherever th
    bits for every input class (NaNs, subnormals, NI mode).
 2. **Nothing about the code is assumed.** A compiled block runs only while guest memory holds the words it was
    compiled from. The JIT reuses the block cache's check (`Block::epoch`, the dirty marks under its code) and never
-   adds a second invalidation scheme.
+   adds a second invalidation scheme: a link slot is aimed at a block only while the block cache holds it current in the
+   current epoch, so a linked entry tests only the marks (below).
 3. **The interpreter is the fallback for everything.** Any op the backend has no native code for is compiled as a call
    to the interpreter's handler for it.
 4. **No C++ exception and no `longjmp` unwinds JIT frames by table.** Every C++ function JIT code calls is a
@@ -55,30 +56,50 @@ entered `SetJitThreshold` times (two by default).
 | `r13` | `Frame*` (FPR forms, return address, entry, pending exception) |
 | `r14` | the address of `BrawlDirtyMemory::markEpoch`, for the entry check |
 | `r15` | guest instructions run since the trampoline was entered (added to `Frame::executed` on the way out) |
-| `rbp` | free, callee-saved |
-| `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`-`r11`, `xmm0`-`xmm5` | scratch |
+| `rbp`, `r8`-`r11` | the GPR cache within a block (guest GPRs, zero-extended to 64 bits; `rbp` callee-saved) |
+| `xmm6`-`xmm15` (SysV), `xmm4`-`xmm5` (Win64) | the FPR cache within a block (a guest FPR's 64 raw bits) |
+| `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `xmm0`-`xmm3` | scratch (emitted code leaves `xmm4`-`xmm5` alone on both ABIs) |
 
 `rsp` is 16-byte aligned inside blocks; on Windows the trampoline's frame holds the 32-byte shadow space. Helper calls
 go through one emitter routine that hides the SysV / Win64 argument registers. Guest registers live in memory between
-ops; no host register carries a guest value from one op to the next.
+blocks; within a block the two caches may hold them (stored before anything that calls or leaves the block, `jit_x64.h`).
 
 ### A block's code
 
 ```
-checked:   epoch == markEpoch, and the block's dirty marks clear     else -> stale
+hot code (one part of each code chunk, blocks one after another):
+linked:    the block's dirty marks clear                              else -> stale (far)
 entry:     r15 += count
-           op 0 ... op n-1           native, or a call to the fallback
-exits:     static target -> jmp [link.target]
+           op 0 ... op n-1           native, or a call to the fallback; slow paths jump to far code
+exits:     static target -> jmp rel32, patched to the target's `linked` (or its unlinked stub)
            dynamic target -> an inline cache keyed by guest pc, else the exit stub
            hook pc -> exit stub
-stale:     exit {Continue, start, no link}; after repeated failures, a stub that compares the block's words in place
+           the block's own start, when no op before can write memory or run C++ -> entry (no test)
+far code (another part):
+checked:   epoch == markEpoch                                          else -> plain stale exit; then jmp linked
+stale:     through the stale cell: counted, and past a threshold a stub that compares the block's words in place
+plain:     exit {Continue, start, no link}
+           the fallback exit, the ops' cold paths, inline-cache misses, unlinked stubs
+data (a third part): link slots, the stale cell, inline caches, call cells (written at run time)
 ```
 
-- Linked jumps go to `checked`; the dispatcher, having run `Find`, enters at `entry`.
-- After a call that returns into the block, the block's own check runs again; failing it exits with the next pc.
+- Links and inline caches go to `linked`; entries from outside compiled code (the dispatcher's fast entries, `jit_subcall`) to
+  `checked`; the dispatcher, having run `Find`, enters at `entry`.
+- A slot is aimed at a block only while its epoch is the current one (`Block::jitLinked`). Whatever drops a block (epoch 0:
+  rollback's consume and restore notifications, a mark cleared under it) suspends its incoming slots first (they leave through
+  their unlinked stubs, staying on its list); the refresh that finds its words unchanged aims them again. When
+  `markEpoch` moves (memory rewritten without marks), every slot is suspended before compiled code can follow one: the
+  interpreter does it when it first validates a block in the new epoch, and every way compiled code goes on after C++ ran
+  either tests its block's epoch (`EmitRecheck`, after a call), compares the link epoch (`ExitDynamicAfterCall`, after a tail
+  call), or calls `JitNoteEpoch` before returning (the fallback, the store shims).
+- After a call that returns into the block, the block's own check (epoch and marks) runs again; failing it exits with the
+  next pc.
 - A link is a data slot (`jmp [slot]`), first aimed at its own unlinked stub, which exits with the slot's address. The
-  dispatcher finds the target block and stores its `checked` address in the slot. A block that is replaced or dropped
-  resets its incoming slots. A target that is a hook pc is never linked.
+  dispatcher finds the target block and stores its `linked` address in the slot. A block that is replaced resets its
+  incoming slots. A target that is a hook pc is never linked.
+- The three parts keep hot code dense (no cold path, stub or data between two blocks' main paths) and keep every line written
+  at run time (slots, cells, counters) out of the lines that execute; a block that does not fit the room left in a part starts
+  a new chunk.
 - Exit status: `Continue` (next pc), `Return` (the frame's function returned), `Pending` (an exception is stored in
   the frame).
 - A block whose dirty marks stay set though its words do not change (a mod's variable inside a function's code) gets,
@@ -92,13 +113,16 @@ leaves the same bytes in the context whichever engine ran it (a write the livene
 of the field in the same block overwrites):
 
 - a compare stores the 64-bit difference of its operands, sign- or zero-extended (`movsxd` or a 32-bit load, `sub`, one
-  8-byte store). Unless `MKW_LEAN_FLAGS`, a set XER[SO] sends the value through `PpcCrvWithSo` first, a compare and a
-  conditional jump to a cold call; a record form is the same with the result against 0;
+  8-byte store); a record form is the same with the result against 0. The interpreter copies a set XER[SO] into the value
+  (`PpcCrvWithSo`); compiled code never runs while XER[SO] is set (`JitBlocksMayRun`: the dispatcher interprets until it is
+  clear), so its values need no copy. What can set it inside compiled code leaves for the dispatcher when it did: a call
+  into guest code (`EmitRecheck`), a fallback op, `mtxer`, a tail call that goes on at lr (`BlockEmitter::JumpIfSo`);
 - `fcmpu` stores one of the four constants (`kPpcCrvLt`, `kPpcCrvGt`, `kPpcCrvEq`, `kPpcCrvSo`) chosen by `cmov`;
 - a `bc` tests one field value in memory: LT is `test byte [field + 7], 0x40`, GT `cmp qword [field], 0` and a signed
   condition, EQ `cmp dword [field], 0`, SO bit 59 xor bit 62 (a shift, an xor and `bt`);
 - a fused compare and `bc` branches on the host flags of the compare's own 64-bit difference (its signed conditions are
-  the compare's for both signednesses) and stores the value on each path;
+  the compare's for both signednesses); the value and every dirty GPR slot are stored before the branch, so that the taken
+  path is one `jcc rel32` patched to the target block like a `jmp` link (`ExitLinkedIf`);
 - `mcrf` copies the 8-byte value, `mtcrf` stores `kPpcCrvTable[nibble]` for each field its mask names, `stwcx.` stores
   the value of nibble 2 or 3 by XER[SO]; `mfcr` and the CR logic ops call `noexcept` helpers that run the interpreter's own
   code (`PpcGetCr`, `PpcCrvWithBit`, `PpcCrvLogic`).
@@ -124,18 +148,35 @@ code; what is left (rare instruction forms, overflow-enable forms) takes this pa
 - FPR forms (`jit_x64_forms.cpp`): `Frame::form[]` says whether a register holds a double or a pair. Within a block the
   form is known after a register's first write or tested use; native float code tests the byte only when it is not
   known, and converts through the same instructions the interpreter's helpers use.
+- FPR cache (`jit_x64_fpr.cpp`): float ops read and write guest FPRs in xmm slots within a block, and keep the form bits they
+  write (`Frame::pairedMask`) pending until the next flush. Every slot is volatile: a call or exit stores and empties the
+  cache, a `bc` stores the dirty slots and pending forms before it branches (a record form paired with its `bc` stores them
+  before its flags, which the form store would clobber), and the snapshots slow paths store and reload carry it.
+- Store groups (`jit_x64_mem.cpp`): integer D-form stores off one base value (followed through `addi`, `mr` and update
+  forms) with no call between them share one store-policy test and one set of dirty marks, made by the first of them for
+  the bytes all of them write (at most 129); the others are the bare byte-swapped store. A leader whose range needs the
+  checked path stores through it and either goes on (the range is plain RAM) or leaves the block before the others.
+- Loads (and grouped stores) on Linux use the aliased 4 GiB view of the lean window (`lean_window.h`): `[r12 + base +
+  disp]` with no mask, the window being mapped four times plus its first 64 KiB once more past 4 GiB.
 
 ## Calls from compiled code
 
-- A `bl`, `bctrl`, `b` or `bctr` to a translated function goes through `JitThinCall` / `JitThinTail` with a per-target
-  `JitCallTarget` (the record's entry and guards, the float ABI), settled when the block is compiled. A call site that knows
-  its callee tests the callee's float argument registers in line. `bctrl` and `bctr` keep their last four targets in a cell
-  of the block's data (`kCellWays`). The rollback loop frame always takes the general path (`Call`).
+- A `bl`, `bctrl`, `b` or `bctr` to a translated function calls its entry directly when the record needs no guard, else
+  goes through `JitThinCall` / `JitThinTail` with a per-target `JitCallTarget` (the record's entry and guards, the float ABI),
+  settled when the block is compiled. A call site that knows its callee tests the callee's float argument registers in line.
+  `bctrl` and `bctr` keep their last eight targets in a cell of the block's data (`kCellWays`), each with what the site calls
+  for it (`JitFastCallFor`: the entry, or a shared routine); an entry hit often moves to the front. Untranslated targets of
+  either go through the block's inline cache 1. The rollback loop frame always takes the general path (`Call`).
 - A call to a patched function (a translated function whose guard byte is set, which `GuestCodePatch::RunPatched` runs in
-  the interpreter) is the same thin call: the callee's wrapper runs `RunPatched`, which enters the patched code with a `Run`
-  of its own.
+  the interpreter) from a `bl` is a call in a *subcall frame*: while the guard byte stays set and no redirect applies, the
+  site builds the callee's `Frame` in a trampoline-shaped host frame (`BlockEmitter::CallSubFrame`) and jumps to the
+  callee's block through a link slot; the callee's return comes back with a host `ret`, after `RunPatched`'s `Sync` test.
+  Exits of the callee that are not linked continue it in the dispatcher (`JitDirectContinue`) and come back the same way.
+  A `bctrl` does the same through `jit_subcall` (fast-entry table). Otherwise the wrapper runs `RunPatched`.
 - `GuestCodePatch::RunPatched` enters compiled code through `RunCompiledEntry`, which does what `Run` does for a first
   block that has code, is current and is no hook pc, and hands anything else to the general entry.
+- Linux x86-64: code space is mapped within a rel32 displacement of the executable's text (a reservation at the top of the
+  reachable window), so calls of translated functions and runtime helpers are `call rel32`.
 
 ## Switches
 
@@ -158,9 +199,14 @@ Read once, at first use.
 | `BRAWL_JIT_NO_FORMS=1` | the FPR form analysis off: every form unknown (a diagnostic; `jit_forms_tests` passes with it, no ctest entry runs it) |
 | `BRAWL_JIT_NO_CR_LIVENESS=1` | every condition register field live (a diagnostic; `jit_quality_tests` passes with it, no ctest entry runs it) |
 | `BRAWL_JIT_NO_FUSED_FLAGS=1` | fused compare and bc write the field and branch on it (`mkw_jit_quality_bookkeeping_tests`) |
+| `BRAWL_JIT_NO_FUSED_FCMP=1` | an `fcmpu` always writes its field and the `bc` after it reads the field in memory |
+| `BRAWL_JIT_NO_FPR_CACHE=1` | no FPR cache: every float op loads and stores its registers (the pending forms stay) |
+| `BRAWL_LEAN_ALIAS=0` | the lean window without its aliased 4 GiB view (Linux): loads and grouped stores mask their address |
+| `BRAWL_JIT_CHURN=<file>`, `BRAWL_JIT_PROBE=<pc,...>` | block cache and JIT churn counters (only in a build with `MKW_JIT_CHURN=1`); the registers logged before the op at each pc (`ppc_interpreter_diag.h`) |
 | `BRAWL_JIT_FORMS_FAULT=<1-4>`, `BRAWL_JIT_STALE_FAULT=<n>` | make the form analysis or the stale stub wrong on purpose, to show the tests notice |
 | `BRAWL_JIT_STALE_STUB=<n>` | stale paths of a block before it gets a stub; 0 never (`jit_stale_tests` sets 8) |
 | `BRAWL_JIT_FAR_JUMPS=1` | jumps to the shared routines always take the long form (`mkw_jit_quality_far_tests`) |
+| `BRAWL_JIT_FAR_MEMORY=1` | code space mapped anywhere, not near the executable (`mkw_jit_branch_direct_far_tests`) |
 | `BRAWL_JIT_EXEC_MEM=1`, `BRAWL_JIT_BLOCK_PC=1` | blocks add their count to `frame.executed` in memory; blocks store `ctx->pc` at entry |
 
 ## Files
@@ -188,7 +234,8 @@ Built with `-DMKW_BUILD_INTERPRETER_TESTS=ON`; `ctest -R "jit|interpreter|guest_
   registered functions, exceptions through a call.
 - Per group: `jit_int`, `jit_mem` (also compares dirty marks and exceptions from stores), `jit_fp` (every float kind
   over NaN, denormal and rounding operand tables, both forms), `jit_forms`, `jit_generic`, `jit_branch` (every branch
-  form, calls of every guard class, patched callees), `jit_quality` (condition-register liveness, the entry check),
+  form, calls of every guard class, patched callees, subcall frames; `mkw_jit_branch_direct_tests` runs them entered through
+  `jit_enter_direct`), `jit_quality` (condition-register liveness, the entry check),
   `jit_stale`, `jit_core` (links, retire, the code limit), `jit_exec_memory`.
 - The existing interpreter tests, run with the JIT as the engine.
 - The rollback benchmark (`tools/rollback_bench`): every run must match the replay's checksums, with code variants off

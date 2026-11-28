@@ -3,8 +3,8 @@
 //
 // A compare or record form writes its CR field through memory (ctx->crv[field]). Most of those writes are never read: the next
 // compare of the same field overwrites them before a branch, mfcr or the end of the block. AnalyseCr finds them once, when
-// the block is compiled; the integer and branch groups skip the write (CrDead) or, for a compare fused with its bc, write the
-// field only on the taken path.
+// the block is compiled; the integer group skips the write (CrDead). A compare paired with its bc writes it in any case (the
+// bc can leave the block).
 //
 // A field written by op i is dead after i when, walking the ops after i on the fall-through path, a later op overwrites the
 // field in full before one that can read the condition register or leave the block is reached. Only op kinds that are
@@ -137,8 +137,8 @@ void BlockEmitter::AnalyseCr() {
 // --- field values -------------------------------------------------------------------------------------------------------------
 //
 // What the interpreter stores for a compare is PpcCrvCompare's: the 64-bit difference of the operands, sign- or zero-extended,
-// with XER[SO] copied in through PpcCrvWithSo. The code here makes that value in rax and stores it: three or four instructions
-// for a compare, and the SO path out of line.
+// with XER[SO] copied in through PpcCrvWithSo. Compiled code runs only while XER[SO] is clear (BlockEmitter::JumpIfSo), so the
+// value is the difference itself: the code here makes it in rax and stores it, two or three instructions for a compare.
 
 void BlockEmitter::CrDiffImm(bool isSigned, uint32_t imm, bool flags) {
     if (imm == 0) {
@@ -153,10 +153,12 @@ void BlockEmitter::CrDiffImm(bool isSigned, uint32_t imm, bool flags) {
 
 void BlockEmitter::CrDiffGpr(bool isSigned, uint32_t reg) {
     const int hit = FindCachedGpr(reg);
+    if (hit >= 0 && !isSigned) {  // the cache register is zero-extended
+        a.sub(rax, GprCacheReg64(static_cast<uint32_t>(hit)));
+        return;
+    }
     if (hit >= 0) {
-        const Xbyak::Reg32& src = GprCacheReg(static_cast<uint32_t>(hit));
-        if (isSigned) a.movsxd(rcx, src);
-        else a.mov(ecx, src);
+        a.movsxd(rcx, GprCacheReg(static_cast<uint32_t>(hit)));
     } else {
         if (isSigned) a.movsxd(rcx, Gpr(reg));
         else a.mov(ecx, Gpr(reg));
@@ -164,23 +166,10 @@ void BlockEmitter::CrDiffGpr(bool isSigned, uint32_t reg) {
     a.sub(rax, rcx);
 }
 
-void BlockEmitter::CrStore(uint32_t field) {
-    if (!MKW_LEAN_FLAGS) {  // XER[SO] is copied into the field; translated code never sets it, so the call is out of line
-        Xbyak::Label& so = NewLabel();
-        Xbyak::Label& store = NewLabel();
-        const GprSnapshot snap = SnapshotGprs();
-        a.cmp(Xer(), 0);
-        a.js(so);
-        a.L(store);
-        Cold([&so, &store, snap](BlockEmitter& cold) {
-            cold.a.L(so);
-            cold.EmitFlushSnapshot(snap);
-            cold.CallHelper(&PpcCrvWithSo, rax);
-            cold.EmitReloadSnapshotVolatile(snap);
-            cold.a.jmp(store);
-        });
-    }
-    a.mov(Crv(field), rax);
+void BlockEmitter::CrStore(uint32_t field) { CrStore(field, rax); }
+
+void BlockEmitter::CrStore(uint32_t field, const Xbyak::Reg64& value) {
+    a.mov(Crv(field), value);  // no SO copy: XER[SO] is clear while compiled code runs (JumpIfSo)
     NoteCr(CrEvent::CompactWrite);
 }
 

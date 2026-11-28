@@ -123,10 +123,9 @@ struct PatchStats {
         pagesCompared{0}, pagesChanged{0};
 };
 PatchStats g_stats;
-bool PatchStatsEnabled() {
-    static const bool on = std::getenv("BRAWL_PATCH_STATS") != nullptr;
-    return on;
-}
+// Read once at load (a namespace-scope constant: no guard variable to test on every patched call and NoteWrite).
+const bool g_patchStatsOn = std::getenv("BRAWL_PATCH_STATS") != nullptr;
+inline bool PatchStatsEnabled() { return g_patchStatsOn; }
 inline void Bump(std::atomic<uint32_t>& counter, uint32_t n = 1) {
     if (__builtin_expect(PatchStatsEnabled(), 0))
         counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);

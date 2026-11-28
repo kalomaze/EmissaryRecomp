@@ -570,7 +570,7 @@ if(MKW_BUILD_INTERPRETER_TESTS)
         target_sources(${target} PRIVATE
             tests/interpreter_test_support.cpp
             src/abi_bridge.cpp src/fpu_helpers.cpp src/memory.cpp src/lean_base.cpp src/lean_window.cpp
-            src/ppc_helpers.cpp src/ppc_quantized.cpp src/ppc_interpreter.cpp src/det_clock.cpp)
+            src/ppc_helpers.cpp src/ppc_quantized.cpp src/ppc_interpreter.cpp src/ppc_interpreter_diag.cpp src/det_clock.cpp)
         if(MKW_FLAT_MEMORY)
             target_sources(${target} PRIVATE src/guest_flat_memory.cpp)
         endif()
@@ -652,6 +652,13 @@ if(MKW_BUILD_INTERPRETER_TESTS)
         add_executable(mkw_jit_branch_tests tests/jit_branch_tests.cpp)
         mkw_configure_interpreter_test(mkw_jit_branch_tests)
         add_test(NAME mkw_jit_branch_tests COMMAND mkw_jit_branch_tests)
+        # the same programs entered through jit_enter_direct (as the game enters patched code), so calls between patched
+        # functions take subcall frames; again with code space far from the executable and the other bookkeeping switches
+        add_test(NAME mkw_jit_branch_direct_tests COMMAND mkw_jit_branch_tests)
+        set_tests_properties(mkw_jit_branch_direct_tests PROPERTIES ENVIRONMENT "JIT_BRANCH_DIRECT=1")
+        add_test(NAME mkw_jit_branch_direct_far_tests COMMAND mkw_jit_branch_tests)
+        set_tests_properties(mkw_jit_branch_direct_far_tests PROPERTIES
+            ENVIRONMENT "JIT_BRANCH_DIRECT=1;BRAWL_JIT_FAR_JUMPS=1;BRAWL_JIT_FAR_MEMORY=1;BRAWL_JIT_EXEC_MEM=1;BRAWL_JIT_BLOCK_PC=1")
     endif()
     if(MKW_JIT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/tests/jit_quality_tests.cpp")
         add_executable(mkw_jit_quality_tests tests/jit_quality_tests.cpp)

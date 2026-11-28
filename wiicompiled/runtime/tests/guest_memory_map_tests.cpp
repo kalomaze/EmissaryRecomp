@@ -4,6 +4,7 @@
 #include "brawl_dirty_memory.h"
 #include "brawl_snapshot_store.h"
 #include "brawl_write_watch.h"
+#include "lean_window.h"
 #include "memory.h"
 #include "recomp_mod_loader.h"
 
@@ -88,7 +89,7 @@ void TestEveryPageAgainstDolphin() {
     const auto regions = Memory::DescribeRegions();
     uint64_t ram = 0, extras = 0, mismatches = 0;
 #if MKW_LEAN_MEMORY
-    uint64_t leanFolds = 0;
+    uint64_t leanFolds = 0, aliasedPages = 0;
 #endif
     for (uint64_t page = 0; page < (uint64_t{1} << 32); page += 0x1000) {
         const uint32_t ea = static_cast<uint32_t>(page) + 0x7FC;  // inside the page, word aligned
@@ -140,6 +141,13 @@ void TestEveryPageAgainstDolphin() {
             const uint32_t before = HostRead32(primary), tag = 0x5A000000u | static_cast<uint32_t>(page >> 12);
             HostWrite32(primary, tag);
             ok = ok && HostRead32(MemoryInline::LeanHost(ea)) == tag;
+            // the aliased view (lean_window.h): the same bytes at base + ea, and at base + 4 GiB + ea for the first 64 KiB
+            if (LeanWindow::g_aliased) {
+                ok = ok && HostRead32(MemoryInline::g_leanBase + ea) == tag;
+                if (ea < LeanWindow::kAliasTail)
+                    ok = ok && HostRead32(MemoryInline::g_leanBase + (uint64_t{1} << 32) + ea) == tag;
+                ++aliasedPages;
+            }
             HostWrite32(primary, before);
         }
 #endif
@@ -152,8 +160,11 @@ void TestEveryPageAgainstDolphin() {
     std::printf("every page: %llu RAM pages as on Dolphin, %llu accepted extra pages (physical views, module homes)",
                 static_cast<unsigned long long>(ram), static_cast<unsigned long long>(extras));
 #if MKW_LEAN_MEMORY
-    std::printf(", %llu lean-window pages at 0xA0000000 folded onto the locked cache",
-                static_cast<unsigned long long>(leanFolds));
+    std::printf(", %llu lean-window pages at 0xA0000000 folded onto the locked cache, %llu read through the aliased view",
+                static_cast<unsigned long long>(leanFolds), static_cast<unsigned long long>(aliasedPages));
+#if defined(__linux__)
+    Check(aliasedPages != 0 || std::getenv("BRAWL_LEAN_ALIAS") != nullptr, "the aliased view is there (Linux)");
+#endif
 #endif
     std::printf("\n");
 }

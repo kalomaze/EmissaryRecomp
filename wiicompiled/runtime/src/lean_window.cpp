@@ -29,6 +29,8 @@ extern "C" uint32_t HorizonLeanWindowBack(uint8_t* target, uint64_t size);
 
 namespace LeanWindow {
 
+bool g_aliased = false;
+
 #if defined(_WIN32)
 namespace {
 // Placeholder flags, declared here so the build does not depend on the Windows SDK version that first shipped them.
@@ -77,7 +79,7 @@ uint32_t Commit(uint8_t* at, uint64_t size) {
     return committed == at ? 0u : static_cast<uint32_t>(GetLastError());
 }
 
-bool MapShared(uint64_t size, uint8_t* const* targets, int count, std::string* error) {
+bool MapSharedViews(uint64_t size, const View* views, int count, std::string* error) {
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, static_cast<DWORD>(size >> 32),
                                         static_cast<DWORD>(size & 0xFFFFFFFFu), nullptr);
     if (section == nullptr) {
@@ -85,10 +87,11 @@ bool MapShared(uint64_t size, uint8_t* const* targets, int count, std::string* e
         return false;
     }
     for (int i = 0; i < count; ++i) {
-        Split(targets[i], size);
-        void* const view = Api().mapViewOfFile3(section, GetCurrentProcess(), targets[i], 0, static_cast<SIZE_T>(size),
-                                                kMemReplacePlaceholder, PAGE_READWRITE, nullptr, 0);
-        if (view != targets[i]) {
+        Split(views[i].at, views[i].length);
+        void* const view = Api().mapViewOfFile3(section, GetCurrentProcess(), views[i].at, views[i].offset,
+                                                static_cast<SIZE_T>(views[i].length), kMemReplacePlaceholder,
+                                                PAGE_READWRITE, nullptr, 0);
+        if (view != views[i].at) {
             *error = "MapViewOfFile3 failed (error " + std::to_string(GetLastError()) + ")";
             CloseHandle(section);
             return false;
@@ -104,7 +107,7 @@ uint8_t* Reserve(uint64_t size) { return static_cast<uint8_t*>(HorizonLeanWindow
 
 uint32_t Commit(uint8_t* at, uint64_t size) { return HorizonLeanWindowBack(at, size); }
 
-bool MapShared(uint64_t, uint8_t* const*, int, std::string* error) {
+bool MapSharedViews(uint64_t, const View*, int, std::string* error) {
     *error = "Horizon cannot map one memory object twice";
     return false;
 }
@@ -121,7 +124,7 @@ uint32_t Commit(uint8_t* at, uint64_t size) {
     return mprotect(at, size, PROT_READ | PROT_WRITE) == 0 ? 0u : static_cast<uint32_t>(errno);
 }
 
-bool MapShared(uint64_t size, uint8_t* const* targets, int count, std::string* error) {
+bool MapSharedViews(uint64_t size, const View* views, int count, std::string* error) {
     const auto fail = [&](const char* what, int fd) {
         *error = std::string(what) + " failed (" + std::strerror(errno) + ")";
         if (fd >= 0) close(fd);
@@ -152,14 +155,26 @@ bool MapShared(uint64_t size, uint8_t* const* targets, int count, std::string* e
     if (ftruncate(fd, static_cast<off_t>(size)) != 0) return fail("ftruncate", fd);
     for (int i = 0; i < count; ++i) {
         // MAP_FIXED replaces part of the window's own PROT_NONE reservation, nothing else.
-        void* const view = mmap(targets[i], size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
-        if (view != targets[i]) return fail("mmap", fd);
+        void* const view = mmap(views[i].at, views[i].length, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd,
+                                static_cast<off_t>(views[i].offset));
+        if (view != views[i].at) return fail("mmap", fd);
     }
     close(fd);  // the mappings keep the object
     return true;
 }
 
 #endif
+
+bool MapShared(uint64_t size, uint8_t* const* targets, int count, std::string* error) {
+    constexpr int kMaxViews = 32;
+    if (count < 0 || count > kMaxViews) {
+        *error = "too many views";
+        return false;
+    }
+    View views[kMaxViews];
+    for (int i = 0; i < count; ++i) views[i] = View{targets[i], 0, size};
+    return MapSharedViews(size, views, count, error);
+}
 
 }  // namespace LeanWindow
 

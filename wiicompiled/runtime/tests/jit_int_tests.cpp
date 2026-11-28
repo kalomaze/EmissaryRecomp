@@ -188,7 +188,7 @@ CpuContext StateFor(size_t i, bool wide, size_t k) {
     c.gpr[0] = (k & 2) ? kEdges[(x * 3 + y) % kEdgeCount] : next();
     c.gpr[1] = 0x80180000u;
     JitTestCr::Randomize(c, next);
-    const uint32_t xers[] = {0u, 0x20000000u, 0x80000000u, 0xE0000000u};
+    const uint32_t xers[] = {0u, 0x20000000u, 0x60000000u, 0xE0000000u};  // SO set: compiled code does not run (JitBlocksMayRun)
     c.xer = xers[k % 4] | (next() & 0x7Fu);
     c.ctr = next();
     c.lr = kReturn;

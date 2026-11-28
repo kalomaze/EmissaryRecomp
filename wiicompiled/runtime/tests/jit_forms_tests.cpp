@@ -18,7 +18,8 @@
 //    analysis does not know (mffs), a thin call to a registered function (which normalises its float arguments), a call of a
 //    patched function (a registered function that runs interpreted guest code in a Run of its own);
 //  * random chains of 2 to 9 float ops over a few registers (the same register changing form several times, sources and
-//    destinations aliasing, slow paths from NaN inputs), with barriers dropped in at random;
+//    destinations aliasing, slow paths from NaN inputs), with barriers dropped in at random, and chains of 6 to 14 over f1-f12
+//    (more registers than the FPR cache's slots: evictions of dirty slots, refills, flushes at the barriers);
 //  * each program from register states whose forms are Scalar, Paired and mixed, prepared in an earlier block (so the sequence
 //    starts with nothing known) or in the same block (so the sources are known), and values from the edge tables, NI on and off.
 // The counters (JitX64GetFormStats) show the knowledge was used where it must be: for `A; B` in one block the form tests emitted
@@ -124,8 +125,8 @@ constexpr uint32_t Cmpwi(uint32_t crf, uint32_t ra, int32_t i) { return D(11, cr
 // --- the kinds -----------------------------------------------------------------------------------------------------------------
 // word(d, a, b, c): the instruction with these registers in its fields (c is the frC field of the A-forms). `src`: the fields
 // (bit 0 a, 1 b, 2 c, 3 d) whose register the op reads through a form test and conversion; `dform`: the form it leaves its
-// destination in (S scalar, P paired, C copies a source's, N writes none); `psqStore`: a quantized store, whose test is skipped
-// only for a register known Paired.
+// destination in (S scalar, P paired, C copies a source's, N writes none); `psqStore`: a quantized store, which needs no test
+// for a register whose form is known (Paired: native; Scalar: the shim, unconditionally).
 enum class DForm : uint8_t { S, P, C, N };
 struct Kind {
     const char* name;
@@ -544,8 +545,9 @@ void Matrix(bool full) {
                     // block goes on (a barrier that keeps the knowledge) and A's destination form is known
                     const bool destKnown = a.dform == DForm::S || a.dform == DForm::P;
                     const bool alias_ = (Keeps(x) || x == Barrier::TakenBc) && destKnown && ((bSrc >> ad) & 1u) != 0 && b.src != 0;
-                    // a quantized store tests unless the register is known Paired
-                    const bool skips = alias_ && !(b.psqStore && a.dform == DForm::S);
+                    // a quantized store of a known form tests nothing either (a known Scalar goes to the shim without a test: the
+                    // form bit in memory may still be pending)
+                    const bool skips = alias_;
                     // B is compiled in A's block, and also in a block of its own where the barrier ends the block at run time: after
                     // a taken bc (the compiled block goes on past it; the knowledge with it) and after a call to untranslated code
                     // (which leaves the block: B follows the return, in a new block, and also the call's resume path in the old one)
@@ -588,6 +590,29 @@ void Chains(unsigned count, uint64_t seed) {
     }
 }
 
+// Longer chains over f1-f12, more registers than the FPR cache has slots (jit_x64_fpr.cpp): slots are evicted and refilled
+// while dirty, around slow paths (NaN inputs), barriers that flush the cache (calls, Generic ops, taken branches) and ones that
+// keep it (a bc not taken stores the dirty slots and keeps the clean ones).
+void WideChains(unsigned count, uint64_t seed) {
+    Rng rng(seed);
+    for (unsigned n = 0; n < count; ++n) {
+        const unsigned len = 6 + rng.Below(9);
+        std::vector<std::vector<uint32_t>> body;
+        std::vector<Barrier> barriers;
+        std::string what = "wide chain";
+        for (unsigned i = 0; i < len; ++i) {
+            const Kind& k = kKinds[rng.Below(kKindCount)];
+            const uint32_t d = 1 + rng.Below(12), a = 1 + rng.Below(12), b = 1 + rng.Below(12), c = 1 + rng.Below(12);
+            body.push_back({k.word(d, a, b, c)});
+            what += Fmt(" %s(f%u,f%u,f%u,f%u)", k.name, d, a, b, c);
+            const uint32_t pick = rng.Below(100);
+            barriers.push_back(pick < 85 ? Barrier::None : static_cast<Barrier>(1 + rng.Below(static_cast<uint32_t>(Barrier::kCount) - 1)));
+        }
+        g_context = "";
+        Sequence(what, body, barriers, rng.Below(2) != 0, StatesFor(rng, 4));
+    }
+}
+
 // Counters that must not fire: a barrier that ends the knowledge, then a source the block does not know.
 void Directed() {
     if (!g_checkCounters) return;
@@ -623,6 +648,7 @@ void AllPhases(bool full, unsigned chains) {
     ClearCode();
     Matrix(full);
     Chains(chains, 77);
+    WideChains(chains / 2, 78);
     Directed();
 }
 
@@ -673,11 +699,13 @@ int main() {
     uint64_t result = g_failures;
     if (env("BRAWL_JIT_NO_FORMS") || std::getenv("BRAWL_JIT_FORMS_FAULT") != nullptr || env("BRAWL_JIT_FALLBACK")) return result == 0 ? 0 : 1;
 
-    // the analysis made wrong four ways: each must make a program fail
+    // the analysis made wrong five ways: each must make a program fail
     int missed = 0;
     g_quiet = true;
     g_checkCounters = false;
-    for (int fault = 1; fault <= 4; ++fault) {
+    // fault 5 (a double result taken for a single) matters only to the inline arithmetic, which forced helpers do not use
+    const int faults = env("BRAWL_JIT_FP_HELPERS") ? 4 : 5;
+    for (int fault = 1; fault <= faults; ++fault) {
         setenv("BRAWL_JIT_FORMS_FAULT", std::to_string(fault).c_str(), 1);
         const uint64_t before = g_failures;
         AllPhases(false, chains / 3);
@@ -689,7 +717,7 @@ int main() {
     unsetenv("BRAWL_JIT_FORMS_FAULT");
     g_quiet = false;
     if (missed != 0) {
-        std::printf("jit forms: %d of the 4 deliberate faults were not noticed\n", missed);
+        std::printf("jit forms: %d of the %d deliberate faults were not noticed\n", missed, faults);
         ++result;
     }
     return result == 0 ? 0 : 1;

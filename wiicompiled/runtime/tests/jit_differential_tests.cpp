@@ -20,6 +20,7 @@
 #include "jit_test_cr.h"
 #include "memory.h"
 #include "ppc_interpreter.h"
+#include "../src/ppc_interpreter_internal.h"
 
 #include <algorithm>
 #include <chrono>
@@ -412,7 +413,8 @@ CpuContext BaseState(Rng& r, uint32_t fpscr = 0) {
     c.gpr[29] = kDataBase + 0x800u;
     c.gpr[30] = kDataBase + kProbeOffset;
     JitTestCr::Randomize(c, [&] { return r.Next(); });
-    c.xer = r.Chance(80) ? (r.Next() & 0xE000007Fu) : r.Next();
+    // XER[SO] set in one state in eight: compiled code does not run while it is set (JitBlocksMayRun), so the others run there
+    c.xer = (r.Chance(80) ? (r.Next() & 0x6000007Fu) : (r.Next() & 0x7FFFFFFFu)) | (r.Chance(12) ? 0x80000000u : 0u);
     c.ctr = RandInt(r);
     c.lr = kReturn;
     c.fpscr = fpscr;
@@ -728,6 +730,11 @@ void FnReenter(CpuContext* c) {
     c->lr = saved;
     c->gpr[3] += 1u;
 }
+// Sets XER[SO] when r3 is odd (a callee that leaves it set: compiled code must not go on with it set).
+void FnSetSo(CpuContext* c) {
+    if (c->gpr[3] & 1u) c->xer |= 0x80000000u;
+    c->gpr[3] += 2u;
+}
 // Throws when r6 is odd, after changing a register and guest memory.
 void FnThrow(CpuContext* c) {
     c->gpr[3] ^= 0xDEAD0000u;
@@ -737,7 +744,8 @@ void FnThrow(CpuContext* c) {
 }
 
 constexpr uint32_t kFnModify = kFuncBase + 0x00, kFnFloat = kFuncBase + 0x10, kFnWrite = kFuncBase + 0x20,
-                   kFnReenter = kFuncBase + 0x30, kFnThrow = kFuncBase + 0x40;
+                   kFnReenter = kFuncBase + 0x30, kFnThrow = kFuncBase + 0x40, kFnRewrite = kFuncBase + 0x50,
+                   kFnRestore = kFuncBase + 0x60, kFnSetSo = kFuncBase + 0x70;
 
 void RegisterFunction(uint32_t address, const char* name, void (*fn)(CpuContext*)) {
     TranslatedFunctionInfo info{};
@@ -1323,6 +1331,31 @@ void AddScalarFloatPrograms() {
         a << blr();
         AddProgram("float", "fcmpu fcmpo every field", a, FloatTripleStates(rng, 1500));
     }
+    // A compare and the bc right after it on each bit of its field, taken when set and when clear (the JIT branches on the
+    // compare's flags), with the field read after the branch on both paths or overwritten on the path that goes on (so the
+    // block writes it on the taken path only), and FPRs written before the compare (the bc stores them first).
+    {
+        const States st = FloatTripleStates(rng, 600);
+        for (uint32_t bit = 0; bit < 4; ++bit)
+            for (uint32_t want = 0; want < 2; ++want)
+                for (uint32_t dead = 0; dead < 2; ++dead) {
+                    Asm a;
+                    const Label taken = a.NewLabel();
+                    a << li(5, 0);
+                    a << fx(63, 4, 0, 1, 72);  // fmr f4, f1: a dirty FPR cache slot at the branch
+                    a << (bit & 1 ? fcmpo(1, 1, 2) : fcmpu(1, 1, 2));
+                    a.Bc(want ? 12u : 4u, 4u + bit, taken);
+                    a << li(5, 1);
+                    if (dead) a << fcmpu(1, 2, 3);
+                    a.Bind(taken);
+                    a << mfcr(6);
+                    a.Probe(6);
+                    a.Probe(5);
+                    a.ProbeF(4);
+                    a << blr();
+                    AddProgram("float", Fmt("fcmpu bc bit %u %s %s", bit, want ? "set" : "clear", dead ? "field dead" : "field live"), a, st);
+                }
+    }
     // FPSCR moves. The register image and the status bits go through the helpers every engine shares.
     States fpscrStates;
     const uint32_t fpscrs[] = {0u, 4u, 0xFFFFFFFFu, 0xA5A5A5A5u, 0x000000F8u, 0xFFFFE0FFu, 0x0000F000u, 0x80000000u, 0x1F80F000u};
@@ -1668,6 +1701,69 @@ void AddFusedPairs() {
                 AddProgram("control", Fmt("%s cr%u + bc BO=%u BI=%u", names[kind], crf, o[0], o[1]), a, states);
             }
         }
+}
+
+// A compare or record form and the bc that tests its field, not adjacent (a followed b between) or adjacent but not a fused kind (the
+// record forms): compiled as one pair. The result register read later or not (cached or not), in place or not, the field read or
+// overwritten after the branch, the ctr forms.
+void AddSplitPairs() {
+    Rng rng(43);
+    using namespace ppc;
+    States states;
+    const uint32_t values[] = {0u, 1u, 0x40u, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu, 0x8001u, 0xF0F00000u};
+    for (uint32_t x : values)
+        for (uint32_t y : {0u, 0x40u, 0x80000000u, 0xFFFFFFFFu}) {
+            CpuContext c = BaseState(rng);
+            c.gpr[3] = x;
+            c.gpr[4] = y;
+            c.ctr = rng.Below(3);
+            states.push_back(c);
+        }
+    struct First { const char* name; uint32_t word; uint32_t field; };
+    const First firsts[] = {
+        {"andi. r5,r3,0x8001", andi_(5, 3, 0x8001), 0}, {"andi. r3,r3,0xf0", andi_(3, 3, 0xF0), 0},
+        {"andis. r5,r3,0x8000", andis_(5, 3, 0x8000), 0}, {"andis. r5,r3,0xf0", andis_(5, 3, 0xF0), 0},
+        {"rlwinm. r5,r3,26,31,31", rlwinm(5, 3, 26, 31, 31, 1), 0}, {"rlwinm. r5,r3,4,0,27", rlwinm(5, 3, 4, 0, 27, 1), 0},
+        {"rlwinm. r3,r3,0,16,31", rlwinm(3, 3, 0, 16, 31, 1), 0}, {"rlwinm. r5,r3,0,0,31", rlwinm(5, 3, 0, 0, 31, 1), 0},
+        {"rlwinm. r5,r3,8,0,31", rlwinm(5, 3, 8, 0, 31, 1), 0}, {"and. r5,r3,r4", logic(28, 5, 3, 4, 1), 0},
+        {"and. r3,r3,r4", logic(28, 3, 3, 4, 1), 0}, {"and. r4,r3,r4", logic(28, 4, 3, 4, 1), 0},
+        {"or. r5,r3,r4", logic(444, 5, 3, 4, 1), 0}, {"mr. r5,r3", logic(444, 5, 3, 3, 1), 0},
+        {"mr. r3,r3", logic(444, 3, 3, 3, 1), 0}, {"cmpwi cr2,r3,0x40", cmpwi(2, 3, 0x40), 2},
+        {"cmplwi cr0,r3,0x8001", cmplwi(0, 3, 0x8001), 0}, {"cmpw cr7,r3,r4", cmpw(7, 3, 4), 7},
+        {"cmplw cr0,r4,r3", cmplw(0, 4, 3), 0}};
+    // pre: a float op before the pair whose form write is pending in the FPR cache (ps_merge00: Paired, an `or` of the form
+    // mask when stored; frsp: Scalar, an `and`), stored before the branch: not between a record form and the branch on its flags
+    const uint32_t pres[] = {0u, fx(4, 5, 1, 2, 528), fx(63, 6, 0, 1, 12)};
+    for (const First& f : firsts)
+        for (uint32_t pre = 0; pre < 3; ++pre)
+        for (int split = 0; split < 2; ++split)
+            for (int after = 0; after < 3; ++after)
+                for (const uint32_t bo : {12u, 4u, 8u, 0u})
+                    for (uint32_t bit = 0; bit < 3; ++bit) {
+                        if ((bo == 8u || bo == 0u) && (bit != 2 || after != 0)) continue;
+                        if (pre != 0 && after != 0) continue;
+                        Asm a;
+                        Label next = a.NewLabel(), taken = a.NewLabel(), end = a.NewLabel();
+                        a.Save();
+                        if (pre != 0) a << pres[pre];
+                        a << f.word;
+                        if (split) {
+                            a.B(next);
+                            a.Bind(next);
+                        }
+                        a.Bc(bo, f.field * 4 + bit, taken);
+                        if (after == 0) a << addi(7, 5, 1) << addi(9, 3, 1);  // the result read after the branch
+                        else if (after == 1) a << mfcr(8);                    // the field read
+                        else a << cmpwi(f.field, 4, 3);                       // the field overwritten
+                        a << li(6, 1);
+                        a.B(end);
+                        a.Bind(taken);
+                        a << li(6, 2) << mfcr(8);
+                        a.Bind(end);
+                        a.Done();
+                        AddProgram("control", Fmt("%s%s%s; bc %u,%u; after %d", pre == 1 ? "ps_merge00 f5,f1,f2; " : pre == 2 ? "frsp f6,f1; " : "",
+                                                  f.name, split ? "; b .+4" : "", bo, f.field * 4 + bit, after), a, states);
+                    }
 }
 
 void AddLoops() {
@@ -2118,6 +2214,105 @@ void AddRegisteredCalls() {
     }
 }
 
+// === XER[SO] ========================================================================================================
+// Compiled code stores compare results without the SO copy and runs only while XER[SO] is clear: what sets it inside a block
+// (mtxer, an OE form, a callee) must hand the rest to the dispatcher, which interprets until it is clear again (mcrxr, mtxer).
+// Each program compares and branches after the point that may set it, in the same block, in a loop and after calls.
+void AddSummaryOverflow() {
+    Rng rng(71);
+    using namespace ppc;
+    States states;
+    for (unsigned i = 0; i < 16; ++i) {
+        CpuContext c = BaseState(rng);
+        c.xer = (i % 8 == 7 ? 0x80000000u : 0u) | (rng.Next() & 0x6000007Fu);  // SO already set in two
+        c.gpr[3] = (i & 1 ? 0x80000000u : 0u) | (i & 2 ? 1u : 0u) | (rng.Next() & 0x7FFFFFFEu & (i & 4 ? ~0u : 0xFFu));
+        c.gpr[4] = rng.Chance(50) ? rng.Pick(kIntEdges) : rng.Next();
+        c.gpr[5] = rng.Chance(50) ? c.gpr[4] : rng.Next();
+        c.gpr[12] = (i & 1) ? 0x7FFFFFFFu : 0x10u;  // the OE add overflows with r13 = 1
+        c.gpr[13] = 1;
+        c.lr = kReturn;
+        states.push_back(c);
+    }
+    {
+        Asm a;
+        Label skip = a.NewLabel();
+        a << cmpwi(1, 4, 5) << mtspr(1, 3) << cmpwi(0, 4, 7) << cmplw(2, 4, 5) << addi(6, 4, 1) << cmpwi(6, 6, 0);
+        a.Bc(12, 26, skip);
+        a << li(7, 1) << cmpw(0, 5, 4);
+        a.Bind(skip);
+        a << mfcr(8);
+        a.Probe(8);
+        a << mfxer(9);
+        a.Probe(9);
+        a << blr();
+        AddProgram("xer so", "mtxer, then compares and a compare and bc", a, states);
+    }
+    {
+        Asm a;
+        Label loop = a.NewLabel(), out = a.NewLabel();
+        a << li(10, 4) << mtctr(10);
+        a.Bind(loop);
+        a << cmpw(3, 4, 5) << arith(266, 14, 12, 13, 1, 0) << cmpwi(0, 14, 0) << addi(12, 14, 0);
+        a.Bc(12, 2, out);
+        a.Bc(16, 0, loop);
+        a.Bind(out);
+        a << mfcr(8);
+        a.Probe(8);
+        a << mfxer(9);
+        a.Probe(9);
+        a << blr();
+        AddProgram("xer so", "addo in a loop of compares", a, states);
+    }
+    {
+        Asm a;
+        Label next = a.NewLabel();
+        a << mcrxr(7) << cmpwi(1, 4, 0);
+        a.B(next);
+        a.Bind(next);
+        a << cmpw(0, 4, 5) << mfcr(8);
+        a.Probe(8);
+        a << blr();
+        AddProgram("xer so", "mcrxr clears it, then compares", a, states);
+    }
+    {
+        Asm a;
+        a.Save();
+        a << cmpwi(1, 4, 9);
+        a.BAbs(kFnSetSo, true);
+        a << cmpwi(0, 4, 3) << cmpw(2, 4, 5) << mfcr(8);
+        a.Probe(8);
+        a.Done();
+        AddProgram("xer so", "bl to a function that sets it, then compares", a, states);
+    }
+    {
+        Asm a;
+        Label skip = a.NewLabel();
+        a.Save();
+        a.Li32(12, kFnSetSo);
+        a << mtctr(12) << bctrl() << cmpwi(0, 4, 3);
+        a.Bc(4, 2, skip);
+        a << cmplw(5, 4, 5);
+        a.Bind(skip);
+        a << mfcr(8);
+        a.Probe(8);
+        a.Done();
+        AddProgram("xer so", "bctrl to a function that sets it, then a compare and bc", a, states);
+    }
+    {
+        Asm a;
+        Label local = a.NewLabel();
+        a.Save();
+        a.B(local, true);
+        a << cmpwi(0, 4, 3) << cmpw(1, 4, 5) << mfcr(8);
+        a.Probe(8);
+        a.Done();
+        a.Bind(local);
+        a << cmpwi(6, 5, 1);
+        a.BAbs(kFnSetSo, false);
+        AddProgram("xer so", "tail b from a local callee to a function that sets it", a, states);
+    }
+}
+
 // === Stale code ====================================================================================================
 
 // Writes a word into guest memory as it is held (the host's form of the guest word), without a dirty mark.
@@ -2134,6 +2329,121 @@ const uint32_t kPatchWords[] = {
     ppc::addi(4, 4, 1), ppc::addi(4, 4, 9), ppc::nop(), ppc::li(4, -1), ppc::mulli(4, 4, 3), ppc::logic(444, 4, 4, 3),
     ppc::cmpwi(0, 4, 0), ppc::arith(40, 4, 3, 4, 0, 0), ppc::xori(5, 5, 1), 0x48000008u /* b .+8 */,
     ppc::addic_(4, 4, -1), ppc::rlwinm(4, 4, 3, 0, 28), ppc::mflr(4), ppc::addi(4, 4, 1)};
+
+// A registered function that rewrites guest memory as a save-state load or a rollback restore does in the middle of a call:
+// r4 to the address in r3 without a dirty mark, then a new epoch. Code that was linked before must not run after it without
+// a check of its words.
+void FnRewrite(CpuContext* c) {
+    RawWrite(c->gpr[3], c->gpr[4]);
+    BrawlDirtyMemory::MarksCleared();
+    c->gpr[7] = c->gpr[3] + 8u;
+}
+// The same as a rollback restore tells it, with no new epoch: the block cache drops what it built since the snapshot (all of
+// it, for snapshot 0), which the compiled code's own epoch tests must see.
+void FnRestore(CpuContext* c) {
+    RawWrite(c->gpr[3], c->gpr[4]);
+    BrawlDirtyMemory::MarksRestored(0);
+    c->gpr[7] = c->gpr[3] + 12u;
+}
+
+// A word rewritten without marks by a call the running chain of compiled blocks makes (FnRewrite), reached after the call
+// through a link slot or an inline cache, which do not test the target's epoch (Block::jitLinked). The call is made three
+// ways: a bl to the registered function (the block's own check follows), a blrl (a Generic op: the interpreter's handler makes
+// the call, JitFallbackOp), and a tail call from interpreted code of the frame (the continuation goes through the inline cache:
+// ExitDynamicAfterCall). The rewritten word is a later block's first, or the word the tail call returns to.
+void AddLinkEpochPrograms() {
+    using namespace ppc;
+    Rng rng(62);
+    // A registered function rewrites the instruction after its own call, as a restore does (no mark, no new epoch, the caller's
+    // block dropped): the caller's test after the call must fail on the epoch its code holds.
+    {
+        Asm a;
+        Label patched = a.NewLabel();
+        a.Save();
+        a.LiLabel(3, patched);
+        a << mr(4, 8);
+        a.BAbs(kFnRestore, true);
+        a.Bind(patched);
+        a << addi(10, 4, 0) << xori(11, 11, 2);
+        a.Done();
+        States st;
+        for (int round = 0; round < 2; ++round)
+            for (uint32_t w : kPatchWords)
+                for (int repeat = 0; repeat < 3; ++repeat) {
+                    CpuContext c = BaseState(rng);
+                    c.gpr[8] = w;
+                    st.push_back(c);
+                }
+        AddProgram("stale", "a call rewrites the next instruction without marks, restore notification", a, st);
+    }
+    for (int how = 0; how < 3; ++how) {
+        Asm a;
+        Label later = a.NewLabel(), patched = a.NewLabel(), leaf = a.NewLabel(), end = a.NewLabel();
+        a.Save();
+        a.LiLabel(3, how == 2 ? patched : later);
+        a << mr(4, 8);
+        if (how == 0) {
+            a.BAbs(kFnRewrite, true);
+        } else if (how == 1) {
+            a.Li32(12, kFnRewrite);
+            a << mtlr(12) << blrl();
+        } else {
+            a.B(leaf, true);
+        }
+        a.Bind(patched);
+        a << addi(10, 4, 0) << xori(11, 11, 2);
+        if (how != 2) {
+            a.LiLabel(12, later);
+            a << mtctr(12) << bctr();
+            a << nop();
+            a.Bind(later);
+            a << addi(4, 4, 1) << xori(5, 5, 0x33);
+        }
+        a.B(end);
+        a << nop();
+        a.Bind(leaf);
+        a.BAbs(kFnRewrite, false);
+        a.Bind(end);
+        a.Done();
+        // Each word three runs in a row: the rewritten block is compiled and linked while its word stays, so that the next word
+        // meets a slot or cache entry aimed at it.
+        States st;
+        for (int round = 0; round < 2; ++round)
+            for (uint32_t w : kPatchWords)
+                for (int repeat = 0; repeat < 3; ++repeat) {
+                    CpuContext c = BaseState(rng);
+                    c.gpr[8] = w;
+                    st.push_back(c);
+                }
+        static const char* const kHow[] = {"bl", "blrl (Generic)", "tail call back to interpreted code"};
+        AddProgram("stale", Fmt("a call rewrites code without marks, new epoch (%s)", kHow[how]), a, st);
+    }
+}
+
+// The same programs with the link epoch made wrong on purpose four ways (g_jitEpochFault): each must make a program fail.
+void LinkEpochFaults() {
+    if (!PpcInterpreter::JitAvailable()) return;
+    const unsigned failures = g_failures, reported = g_reported;
+    int notNoticed = 0;
+    std::printf("  link epoch faults:");
+    for (int fault = 1; fault <= 4; ++fault) {
+        PpcInterpreter::detail::g_jitEpochFault = fault;
+        const unsigned before = g_failures;
+        g_reported = kMaxReports;  // the failures expected here are not printed
+        AddLinkEpochPrograms();
+        const unsigned noticed = g_failures - before;
+        std::printf(" %d: %u failed;", fault, noticed);
+        if (noticed == 0) ++notNoticed;
+    }
+    PpcInterpreter::detail::g_jitEpochFault = 0;
+    g_failures = failures;
+    g_reported = reported;
+    std::printf("\n");
+    if (notNoticed != 0) {
+        std::fprintf(stderr, "FAIL: %d of the 4 deliberate link epoch faults were not noticed\n", notNoticed);
+        ++g_failures;
+    }
+}
 
 void AddStaleCode() {
     Rng rng(61);
@@ -2294,6 +2604,7 @@ void AddStaleCode() {
             }
         AddProgram("stale", "guest callee patches the caller's next operation", a, st);
     }
+    AddLinkEpochPrograms();
 }
 
 // === Random programs ===============================================================================================
@@ -2972,6 +3283,9 @@ int main() {
     RegisterFunction(kFnWrite, "DiffWrite", FnWrite);
     RegisterFunction(kFnReenter, "DiffReenter", FnReenter);
     RegisterFunction(kFnThrow, "DiffThrow", FnThrow);
+    RegisterFunction(kFnRewrite, "DiffRewrite", FnRewrite);
+    RegisterFunction(kFnRestore, "DiffRestore", FnRestore);
+    RegisterFunction(kFnSetSo, "DiffSetSo", FnSetSo);
     TranslatedFunctionRegistry::Finalize();
     WriteSupportCode();
     if (!SanityChecks()) return 2;
@@ -3004,11 +3318,14 @@ int main() {
     Stage("paired singles", AddPairedSinglePrograms);
     Stage("branch forms", AddBranchForms);
     Stage("compare and branch pairs", AddFusedPairs);
+    Stage("split compare and branch pairs", AddSplitPairs);
     Stage("loops and block lengths", AddLoops);
     Stage("b chains", AddChains);
     Stage("local calls and jumps", AddLocalCalls);
     Stage("registered functions", AddRegisteredCalls);
+    Stage("XER[SO] set in compiled code", AddSummaryOverflow);
     Stage("stale code", AddStaleCode);
+    Stage("link epoch faults", LinkEpochFaults);
     {
         const auto t = Clock::now();
         const unsigned before = g_failures;

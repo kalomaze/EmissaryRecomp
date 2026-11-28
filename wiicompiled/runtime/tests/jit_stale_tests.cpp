@@ -1,7 +1,8 @@
 // The JIT's stale stubs (src/jit/jit_x64.cpp, StaleCell): a block whose dirty marks stay set because its own code stores to a data
 // word inside its 64-byte mark range fails its entry check on every linked entry and would go round the dispatcher each time.
-// After a threshold of failures its stale path jumps to a stub that, when the block's epoch is the current one, compares the
-// block's guest words in place and enters the block when all are unchanged.
+// After a threshold of failures its stale path jumps to a stub that compares the block's guest words in place and enters the block
+// when all are unchanged (a stale epoch never gets there: the block's full entry sends it to the dispatcher, and link slots are
+// aimed only at blocks of the current epoch).
 //
 // Every program here is run under Engine::Classic and Engine::Jit (threshold 0) and the whole contexts and the words it wrote
 // are compared; the backend's counters show that the stub was made and that the dispatcher round trips stopped:
@@ -11,13 +12,14 @@
 //  * a real code change: the loop stores over one of its own instructions every iteration, a different word from iteration 150 on,
 //    which must be noticed on the very next entry (the result counts the iterations each version ran);
 //  * the same for a block of two segments (a `b` followed), the changed word in the second;
-//  * an epoch bump (what rollback's consume does) between two runs of a block that has a stub: the stub declines for the old
-//    epoch, the dispatcher refreshes the block, and the same stub serves the new one;
+//  * an epoch bump (what rollback's consume does) between two runs of a block that has a stub: the slots aimed in the old epoch
+//    are reset, the dispatcher refreshes the block, and the same stub serves the new one;
 //  * a retire and rebuild: the code is rewritten from outside between runs, the old block and its stub are dropped, the new block
 //    gets its own;
 //  * other threads with their own caches and stubs, and the cache dropped past its code limit with stubs live (BRAWL_JIT_CODE_LIMIT,
 //    small here: the interpreter never destroys a thread's cache otherwise);
-//  * the same programs with the stub made wrong on purpose five ways (BRAWL_JIT_STALE_FAULT): each must make a program fail.
+//  * the same programs with the stub made wrong on purpose four ways (BRAWL_JIT_STALE_FAULT 1, 3, 4, 5): each must make a program
+//    fail.
 //
 // Run under valgrind --smc-check=all or with ASan for the destruction cases.
 #include "jit_test_env.h"
@@ -245,7 +247,7 @@ void CaseTwoSegments() {
 }
 
 // Two runs of one loop with an epoch bump between: the same stub serves both, and meeting the new epoch costs a dispatcher
-// round trip (the stub declines: the dispatcher refreshes the block and its epoch).
+// round trip (the refresh of the entry block resets the slots aimed in the old epoch: the loop is linked again).
 void CaseEpoch() {
     const Program p = Reached();
     const CpuContext init = InitialContext(p.base, kIterations);
@@ -356,10 +358,10 @@ int main() {
     std::printf("jit stale: %llu stubs made (%llu failed), %d failures\n", static_cast<unsigned long long>(s.staleStubs),
                 static_cast<unsigned long long>(s.staleStubFailures), baseline);
 
-    // the stub made wrong on purpose, five ways: each must show
+    // the stub made wrong on purpose, four ways: each must show
     int notNoticed = 0;
     g_quiet = true;
-    for (int fault = 1; fault <= 5; ++fault) {
+    for (int fault : {1, 3, 4, 5}) {
         setenv("BRAWL_JIT_STALE_FAULT", std::to_string(fault).c_str(), 1);
         const int before = g_failures;
         AllCases(false);
@@ -370,7 +372,7 @@ int main() {
     }
     unsetenv("BRAWL_JIT_STALE_FAULT");
     g_quiet = false;
-    CHECK(notNoticed == 0, "%d of the 5 deliberate faults were not noticed", notNoticed);
+    CHECK(notNoticed == 0, "%d of the 4 deliberate faults were not noticed", notNoticed);
     std::printf("jit stale: %d failures\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

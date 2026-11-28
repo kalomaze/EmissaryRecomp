@@ -346,6 +346,25 @@ uint64_t g_leanBackedBytes = 0;
 // The window's 64 KiB chunks already backed (aliased views share their backing): BackLeanWindow's, and MEM1's and its
 // mirrors' shared views (MapLeanBanks).
 uint8_t g_leanChunkBacked[MemoryInline::kLeanWindowSize >> MemoryInline::kLeanPolicyShift];
+
+// The aliased view (lean_window.h): the views of `length` bytes of one shared object at window offset `offset` (64 KiB
+// aligned), the object's bytes from `objectOffset`: the window's own and its aliases (+1, +2, +3 GiB, and the tail at
+// +4 GiB for what lies in the window's first 64 KiB). Answers how many it wrote to `views` (at most 5).
+int LeanAliasViews(uint64_t offset, uint64_t objectOffset, uint64_t length, LeanWindow::View* views) {
+    uint8_t* const window = MemoryInline::LeanBaseAtInit();
+    int n = 0;
+    views[n++] = LeanWindow::View{window + offset, objectOffset, length};
+    if (!LeanWindow::g_aliased) return n;
+    for (uint64_t k = 1; k < LeanWindow::kAliasViews; ++k)
+        views[n++] = LeanWindow::View{window + offset + k * MemoryInline::kLeanWindowSize, objectOffset, length};
+    if (offset < LeanWindow::kAliasTail) {
+        const uint64_t tail = std::min<uint64_t>(length, LeanWindow::kAliasTail - offset);
+        views[n++] = LeanWindow::View{window + LeanWindow::kAliasViews * MemoryInline::kLeanWindowSize + offset,
+                                      objectOffset, tail};
+    }
+    return n;
+}
+
 void BackLeanWindow(uint64_t offset, uint64_t size) {
     constexpr uint32_t kShift = MemoryInline::kLeanPolicyShift;  // backing granularity: one policy chunk, 64 KiB
     uint8_t* const backed = g_leanChunkBacked;
@@ -359,11 +378,19 @@ void BackLeanWindow(uint64_t offset, uint64_t size) {
         }
         uint8_t* const at = MemoryInline::LeanBaseAtInit() + (first << kShift);
         const uint64_t bytes = (last - first) << kShift;
-        const uint32_t rc = LeanWindow::Commit(at, bytes);
+        uint32_t rc = 0;
+        std::string error;
+        if (LeanWindow::g_aliased) {  // one shared object, at its window offset and its aliases
+            LeanWindow::View views[5];
+            const int n = LeanAliasViews(first << kShift, 0, bytes, views);
+            if (!LeanWindow::MapSharedViews(bytes, views, n, &error)) rc = 1;
+        } else {
+            rc = LeanWindow::Commit(at, bytes);
+        }
         if (rc != 0) {
             std::ostringstream message;
             message << "lean memory: could not back window bytes 0x" << std::hex << (first << kShift) << "+0x" << bytes
-                    << " (error 0x" << rc << ")";
+                    << " (error 0x" << rc << (error.empty() ? "" : ": ") << error << ")";
             throw std::runtime_error(message.str());
         }
         std::memset(backed + first, 1, last - first);
@@ -598,8 +625,17 @@ void MapLeanBanks(const std::vector<LeanBankCopies>& banks, uint8_t* window) {
             marks.push_back(window + marksOffset);
         }
         std::string error = "a copy not 64 KiB aligned, or already backed";
-        if (shareable && LeanWindow::MapShared(bank.size, data.data(), static_cast<int>(data.size()), &error) &&
-            LeanWindow::MapShared(marksSize, marks.data(), static_cast<int>(marks.size()), &error)) {
+        // each copy's views: its window offset and, in the aliased view, its aliases (LeanAliasViews)
+        const auto mapCopies = [&](uint64_t size, const std::vector<uint8_t*>& targets) {
+            std::vector<LeanWindow::View> views;
+            for (uint8_t* const target : targets) {
+                LeanWindow::View v[5];
+                const int n = LeanAliasViews(static_cast<uint64_t>(target - window), 0, size, v);
+                views.insert(views.end(), v, v + n);
+            }
+            return LeanWindow::MapSharedViews(size, views.data(), static_cast<int>(views.size()), &error);
+        };
+        if (shareable && mapCopies(bank.size, data) && mapCopies(marksSize, marks)) {
             for (size_t i = 0; i < data.size(); ++i) {
                 const uint64_t dataChunk = static_cast<uint64_t>(data[i] - window) >> kShift;
                 const uint64_t marksChunk = static_cast<uint64_t>(marks[i] - window) >> kShift;
@@ -759,16 +795,27 @@ void Memory::Init(const Config& config) {
     // masked address, so the physical, cached and uncached views of MEM1/MEM2 alias by construction.
     // Address space only: BackLeanWindow backs the parts in use. The 64 KiB after it (kLeanGuardSize) stay reserved and
     // unbacked, so a resolved read range's access past the window's end faults (memory_access.h, kLeanRangePolicyOffset).
+    // Linux reserves the aliased view around it (lean_window.h, g_aliased): 64 KiB below, the window and its three
+    // aliases, the tail, 64 KiB after (BRAWL_LEAN_ALIAS=0: the window alone).
     static uint8_t* const window = [] {
-        constexpr uint64_t kReserved = MemoryInline::kLeanWindowSize + MemoryInline::kLeanGuardSize;
-        uint8_t* const reserved = LeanWindow::Reserve(kReserved);
+#if defined(__linux__)
+        const char* const env = std::getenv("BRAWL_LEAN_ALIAS");
+        const bool alias = env == nullptr || env[0] != '0';
+#else
+        const bool alias = false;
+#endif
+        const uint64_t below = alias ? MemoryInline::kLeanGuardSize : 0;
+        const uint64_t views = alias ? LeanWindow::kAliasViews * MemoryInline::kLeanWindowSize + LeanWindow::kAliasTail
+                                     : MemoryInline::kLeanWindowSize;
+        uint8_t* const reserved = LeanWindow::Reserve(below + views + MemoryInline::kLeanGuardSize);
 #if defined(_WIN32)
         if (reserved == nullptr)
             throw std::runtime_error("lean memory: could not reserve the 1 GiB guest window (it needs Windows 10 1803 "
                                      "or newer: VirtualAlloc2, MapViewOfFile3)");
 #endif
         if (reserved == nullptr) throw std::runtime_error("lean memory: could not reserve the 1 GiB guest window");
-        return reserved;
+        LeanWindow::g_aliased = alias;
+        return reserved + below;
     }();
     MemoryInline::SetLeanBase(window);
     BackLeanWindow(MemoryInline::kLeanPolicyOffset, MemoryInline::kLeanWindowSize >> MemoryInline::kLeanPolicyShift);

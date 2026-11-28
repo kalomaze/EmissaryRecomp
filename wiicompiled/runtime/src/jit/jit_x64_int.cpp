@@ -78,10 +78,43 @@ bool SprWord(BlockEmitter& e, uint32_t spr, Xbyak::Address& out) {
 
 // --- CR fields -------------------------------------------------------------------------------------------------------
 
-// CR0 from the value in reg (SetCr0: a signed compare against zero, whose difference is the value itself).
-void EmitSetCr0From(BlockEmitter& e, const Xbyak::Reg32& reg) {
+// CR0 from the value in reg (SetCr0: a signed compare against zero, whose difference is the value itself). `nonNegative`: the value
+// is known not negative, so the register (zero-extended, see the GPR cache) is the field value.
+void EmitSetCr0From(BlockEmitter& e, const Xbyak::Reg32& reg, bool nonNegative = false) {
+    if (nonNegative) {
+        e.CrStore(0, reg.cvt64());
+        return;
+    }
     e.a.movsxd(rax, reg);
     e.CrStore(0);
+}
+
+// Calls f with guest register r as an operand: its cache register (loaded into the cache first when a later op reads it), else its
+// word in memory.
+template <typename F>
+void WithGpr(BlockEmitter& e, uint32_t r, F&& f) {
+    if (e.WantCacheGpr(r)) f(e.ReadGpr(r));
+    else f(e.Gpr(r));
+}
+
+// A compare that writes its field (live): rax = the field value (PpcCrvCompare's, BlockEmitter::CrStore), stored. An unsigned
+// compare of a cached register is one lea (the register is zero-extended).
+void EmitCompare(BlockEmitter& e, const Op& o, bool isSigned, bool withReg) {
+    auto& c = e.a;
+    const uint32_t field = static_cast<uint32_t>(o.d) >> 2;
+    const int hit = e.WantCacheGpr(o.a) ? static_cast<int>(e.ReadGpr(o.a).getIdx()) : -1;
+    if (!isSigned && !withReg && hit >= 0 && o.imm <= 0x7FFFFFFFu) {
+        if (o.imm == 0) c.mov(eax, Xbyak::Reg32(hit));
+        else c.lea(rax, c.ptr[Xbyak::Reg64(hit) - static_cast<int32_t>(o.imm)]);
+    } else {
+        WithGpr(e, o.a, [&](const Xbyak::Operand& op) {
+            if (isSigned) c.movsxd(rax, op);
+            else c.mov(eax, op);
+        });
+        if (withReg) e.CrDiffGpr(isSigned, o.b);
+        else e.CrDiffImm(isSigned, o.imm, false);
+    }
+    e.CrStore(field);
 }
 
 // A compare or record form whose CR field no later op of the block reads (BlockEmitter::CrDead) writes nothing: a compare
@@ -121,7 +154,7 @@ void EmitLogicImm(BlockEmitter& e, Logic op, uint32_t dst, uint32_t src, uint32_
         const Xbyak::Reg32& d = e.ModifyGpr(dst);
         if (op == Logic::And && imm == 0) e.a.xor_(d, d);
         else if (imm != 0 || op == Logic::And) LogicRegImm(e, op, d, imm);
-        if (rc) EmitSetCr0From(e, d);
+        if (rc) EmitSetCr0From(e, d, op == Logic::And && (imm & 0x80000000u) == 0);
         return;
     }
     const Xbyak::Reg32& s = e.ReadGpr(src);
@@ -132,7 +165,7 @@ void EmitLogicImm(BlockEmitter& e, Logic op, uint32_t dst, uint32_t src, uint32_
         e.a.mov(d, s);
         if (imm != 0 || op == Logic::And) LogicRegImm(e, op, d, imm);
     }
-    if (rc) EmitSetCr0From(e, d);
+    if (rc) EmitSetCr0From(e, d, op == Logic::And && (imm & 0x80000000u) == 0);
 }
 
 // r[dst] = r[s1] op r[s2], with every aliasing of the three registers; Rc: also CR0.
@@ -169,10 +202,11 @@ void EmitLogicReg(BlockEmitter& e, Logic op, uint32_t dst, uint32_t s1, uint32_t
 void EmitRlwinm(BlockEmitter& e, const Op& o, bool rc) {
     auto& c = e.a;
     const uint32_t src = o.d, dst = o.a, sh = o.b, mask = o.imm;
+    const bool nonNegative = (mask & 0x80000000u) == 0;
     if (mask == 0) {
         const Xbyak::Reg32& d = e.WriteGpr(dst);
         c.xor_(d, d);
-        if (rc) EmitSetCr0From(e, d);
+        if (rc) EmitSetCr0From(e, d, true);
         return;
     }
     if (sh == 0 && mask == 0xFFFFFFFFu) {
@@ -180,24 +214,46 @@ void EmitRlwinm(BlockEmitter& e, const Op& o, bool rc) {
         if (rc) EmitSetCr0From(e, e.ReadGpr(dst));
         return;
     }
-    const Xbyak::Reg32& s = e.ReadGpr(src);
-    const Xbyak::Reg32& d = dst == src ? e.ModifyGpr(dst) : e.WriteGpr(dst, 1u << src);
-    if (sh == 0 && mask == 0xFFu) {
-        c.movzx(d, s.cvt8());
-    } else if (sh == 0 && mask == 0xFFFFu) {
-        c.movzx(d, s.cvt16());
-    } else {
-        if (dst != src) c.mov(d, s);
-        if (sh != 0 && mask == (0xFFFFFFFFu << sh)) {
-            c.shl(d, static_cast<uint8_t>(sh));
-        } else if (sh != 0 && mask == (0xFFFFFFFFu >> (32u - sh))) {
-            c.shr(d, static_cast<uint8_t>(32u - sh));
-        } else {
+    const bool shl = sh != 0 && mask == (0xFFFFFFFFu << sh), shr = sh != 0 && mask == (0xFFFFFFFFu >> (32u - sh));
+    if (dst == src) {
+        const Xbyak::Reg32& d = e.ModifyGpr(dst);
+        if (sh == 0 && mask == 0xFFu) c.movzx(d, d.cvt8());
+        else if (sh == 0 && mask == 0xFFFFu) c.movzx(d, d.cvt16());
+        else if (shl) c.shl(d, static_cast<uint8_t>(sh));
+        else if (shr) c.shr(d, static_cast<uint8_t>(32u - sh));
+        else {
             if (sh != 0) c.rol(d, static_cast<uint8_t>(sh));
-            if (mask != 0xFFFFFFFFu) c.and_(d, mask);
+            c.and_(d, mask);
         }
+        if (rc) EmitSetCr0From(e, d, nonNegative);
+        return;
     }
-    if (rc) EmitSetCr0From(e, d);
+    // dst != src: the source as a register (cached, or loaded when a later op reads it) or its word in memory; three-operand forms
+    // (rorx, lea) where they save the copy
+    const Xbyak::Reg32* sr = e.WantCacheGpr(src) ? &e.ReadGpr(src) : nullptr;
+    const Xbyak::Reg32& d = e.WriteGpr(dst, 1u << src);
+    const Xbyak::Address m = e.Gpr(src);
+    if (sh == 0 && mask == 0xFFu) {
+        if (sr != nullptr) c.movzx(d, sr->cvt8());
+        else c.movzx(d, c.byte[m.getRegExp()]);  // the low byte of the host-order word
+    } else if (sh == 0 && mask == 0xFFFFu) {
+        if (sr != nullptr) c.movzx(d, sr->cvt16());
+        else c.movzx(d, c.word[m.getRegExp()]);
+    } else if (shl && sr != nullptr && sh <= 3) {
+        if (sh == 1) c.lea(d, c.ptr[sr->cvt64() + sr->cvt64()]);
+        else c.lea(d, c.ptr[sr->cvt64() * (1 << sh)]);
+    } else if (shl || shr || sh == 0) {
+        if (sr != nullptr) c.mov(d, *sr);
+        else c.mov(d, m);
+        if (shl) c.shl(d, static_cast<uint8_t>(sh));
+        else if (shr) c.shr(d, static_cast<uint8_t>(32u - sh));
+        else c.and_(d, mask);
+    } else {
+        if (sr != nullptr) c.rorx(d, *sr, static_cast<uint8_t>(32u - sh));  // rotl by sh
+        else c.rorx(d, m, static_cast<uint8_t>(32u - sh));
+        if (mask != 0xFFFFFFFFu) c.and_(d, mask);
+    }
+    if (rc) EmitSetCr0From(e, d, nonNegative);
 }
 
 // r[a] = (rotl(r[d], sh) & mask) | (r[a] & ~mask)
@@ -354,19 +410,22 @@ void EmitSubfic(BlockEmitter& e, const Op& o) {
     EmitSetCaFromMask(e);
 }
 
-// r[a] = r[d] << (r[b] & 63) as 64 bits, low half: counts 32..63 give 0, as PPC_Slw and PPC_Srw.
+// r[a] = r[d] << (r[b] & 63) as 64 bits, low half: counts 32..63 give 0, as PPC_Slw and PPC_Srw. The cache registers are
+// zero-extended, so the 64-bit shift reads them as they are.
 void EmitShiftReg(BlockEmitter& e, const Op& o, bool left) {
     auto& c = e.a;
-    c.mov(ecx, e.ReadGpr(o.b));
-    c.mov(eax, e.ReadGpr(o.d, 1u << o.b));  // zero-extends into rax
+    const Xbyak::Reg64 count = e.ReadGpr(o.b).cvt64();
+    const Xbyak::Reg64 value = e.ReadGpr(o.d, 1u << o.b).cvt64();
 #if defined(__BMI2__)
-    if (left) c.shlx(rax, rax, rcx);
-    else c.shrx(rax, rax, rcx);
+    if (left) c.shlx(rax, value, count);
+    else c.shrx(rax, value, count);
 #else
+    c.mov(ecx, count.cvt32());
+    c.mov(eax, value.cvt32());
     if (left) c.shl(rax, cl);
     else c.shr(rax, cl);
 #endif
-    c.mov(e.WriteGpr(o.a), eax);
+    c.mov(e.WriteGpr(o.a, (1u << o.b) | (1u << o.d)), eax);
 }
 
 void EmitCntlzw(BlockEmitter& e, const Op& o) {
@@ -415,33 +474,24 @@ uint32_t EmitIntOp(BlockEmitter& e, const Op& o) {
     case K::Xori:
     case K::Xoris: EmitLogicImm(e, Logic::Xor, o.a, o.d, o.imm, false); return 1;
     case K::AndiRc:
-    case K::AndisRc: EmitLogicImm(e, Logic::And, o.a, o.d, o.imm, !CrDeadNote(e, 0)); return 1;
+    case K::AndisRc:
+        if (const uint32_t n = EmitCompareBranch(e, e.index)) return n;
+        EmitLogicImm(e, Logic::And, o.a, o.d, o.imm, !CrDeadNote(e, 0));
+        return 1;
     case K::Rlwinm: EmitRlwinm(e, o, false); return 1;
-    case K::RlwinmRc: EmitRlwinm(e, o, !CrDeadNote(e, 0)); return 1;
+    case K::RlwinmRc:
+        if (const uint32_t n = EmitCompareBranch(e, e.index)) return n;
+        EmitRlwinm(e, o, !CrDeadNote(e, 0));
+        return 1;
     case K::Rlwimi: EmitRlwimi(e, o); return 1;
     case K::Cmpwi:
-        if (CrDeadNote(e, o.d >> 2)) return 1;
-        c.movsxd(rax, e.ReadGpr(o.a));
-        e.CrDiffImm(true, o.imm, false);
-        e.CrStore(o.d >> 2);
-        return 1;
     case K::Cmplwi:
-        if (CrDeadNote(e, o.d >> 2)) return 1;
-        c.mov(eax, e.ReadGpr(o.a));
-        e.CrDiffImm(false, o.imm, false);
-        e.CrStore(o.d >> 2);
-        return 1;
     case K::Cmpw:
-    case K::Cmplw: {
+    case K::Cmplw:
         if (CrDeadNote(e, o.d >> 2)) return 1;
-        const bool isSigned = o.kind == K::Cmpw;
-        const Xbyak::Reg32& ra = e.ReadGpr(o.a);
-        if (isSigned) c.movsxd(rax, ra);
-        else c.mov(eax, ra);
-        e.CrDiffGpr(isSigned, o.b);
-        e.CrStore(o.d >> 2);
+        if (const uint32_t n = EmitCompareBranch(e, e.index)) return n;
+        EmitCompare(e, o, o.kind == K::Cmpwi || o.kind == K::Cmpw, o.kind == K::Cmpw || o.kind == K::Cmplw);
         return 1;
-    }
     case K::Add: EmitAdd(e, o); return 1;
     case K::Subf: EmitSubf(e, o); return 1;
     case K::Neg: {
@@ -466,9 +516,15 @@ uint32_t EmitIntOp(BlockEmitter& e, const Op& o) {
         return 1;
     }
     case K::Or: EmitLogicReg(e, Logic::Or, o.a, o.d, o.b, false); return 1;
-    case K::OrRc: EmitLogicReg(e, Logic::Or, o.a, o.d, o.b, !CrDeadNote(e, 0)); return 1;
+    case K::OrRc:
+        if (const uint32_t n = EmitCompareBranch(e, e.index)) return n;
+        EmitLogicReg(e, Logic::Or, o.a, o.d, o.b, !CrDeadNote(e, 0));
+        return 1;
     case K::And: EmitLogicReg(e, Logic::And, o.a, o.d, o.b, false); return 1;
-    case K::AndRc: EmitLogicReg(e, Logic::And, o.a, o.d, o.b, !CrDeadNote(e, 0)); return 1;
+    case K::AndRc:
+        if (const uint32_t n = EmitCompareBranch(e, e.index)) return n;
+        EmitLogicReg(e, Logic::And, o.a, o.d, o.b, !CrDeadNote(e, 0));
+        return 1;
     case K::Xor: EmitLogicReg(e, Logic::Xor, o.a, o.d, o.b, false); return 1;
     case K::Andc: {  // r[a] = r[d] & ~r[b]
         if (o.d == o.b) {
@@ -550,7 +606,20 @@ uint32_t EmitIntOp(BlockEmitter& e, const Op& o) {
     case K::Mtspr: {
         Xbyak::Address word = e.Lr();
         if (!SprWord(e, o.imm, word)) return 1;  // WriteSpr ignores the rest (decrementer, performance monitors, BATs)
-        c.mov(word, e.ReadGpr(o.d));
+        const Xbyak::Reg32& s = e.ReadGpr(o.d);
+        c.mov(word, s);
+        if (o.imm == 1 && !MKW_LEAN_FLAGS) {  // mtxer with SO set: the dispatcher goes on (BlockEmitter::JumpIfSo)
+            Xbyak::Label& so = e.NewLabel();
+            c.test(s, s);
+            c.js(so, Xbyak::CodeGenerator::T_NEAR);
+            const BlockEmitter::GprSnapshot snap = e.SnapshotGprs();
+            const uint32_t next = e.PcAfter(e.index);
+            e.Cold([&so, snap, next](BlockEmitter& cold) {
+                cold.a.L(so);
+                cold.EmitFlushSnapshot(snap);
+                cold.ExitTo(next);
+            });
+        }
         return 1;
     }
     default: break;

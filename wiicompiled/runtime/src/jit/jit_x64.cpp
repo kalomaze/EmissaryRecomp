@@ -15,8 +15,10 @@
 #include <string>
 
 #include "brawl_dirty_memory.h"
+#include "isa/ppc_isa_crv.h"  // MKW_LEAN_FLAGS
 #include "jit/jit_exec_memory.h"
 #include "memory_access.h"
+#include "../ppc_interpreter_diag.h"
 
 #if defined(__linux__)
 #include <unistd.h>
@@ -55,6 +57,7 @@ struct Options {
     uint32_t staleThreshold = 32;  // BRAWL_JIT_STALE_STUB=<n>: stale paths of a block before it gets a stub; 0 never
     uint32_t dumpPcs[16] = {};
     unsigned dumpCount = 0;
+    std::string dumpDir;  // BRAWL_JIT_DUMP_DIR=<dir>: every block's code and its op/region side table (jit-<pid>.code/.idx)
     bool forced[kKinds] = {};  // kinds that always take the fallback call
     Group group[kKinds] = {};
 
@@ -76,6 +79,7 @@ struct Options {
             }
         }
         if (const char* list = std::getenv("BRAWL_JIT_FALLBACK")) ParseFallback(list);
+        if (const char* dir = std::getenv("BRAWL_JIT_DUMP_DIR")) dumpDir = dir;
     }
 
     static bool EqualsNoCase(const std::string& a, const char* b) {
@@ -125,9 +129,16 @@ const Options& Opts() {
     return options;
 }
 
+}  // namespace
+
+bool KindForced(K kind) { return Opts().forced[static_cast<unsigned>(kind)]; }
+
+namespace {
+
 struct Counters {
     std::atomic<uint64_t> compiled{0}, compileFailed{0}, codeBytes{0}, links{0}, retires{0}, enters{0}, cachesCreated{0},
-        cachesDestroyed{0}, compiledOps{0}, compileNanos{0}, cacheHits{0}, cacheMisses{0}, staleStubs{0}, staleStubFailures{0};
+        cachesDestroyed{0}, compiledOps{0}, compileNanos{0}, cacheHits{0}, cacheMisses{0}, staleStubs{0}, staleStubFailures{0},
+        selfLoops{0};
 };
 Counters g_counters;
 // Ops compiled, per kind: [0] with native code, [1] as a call to the interpreter's handler (a fused pair counts once, at
@@ -195,17 +206,95 @@ void DumpBlock(const Block& b, const void* at, size_t size) {
     }
 }
 
+// BRAWL_JIT_DUMP_DIR: the code of everything the backend makes, appended to <dir>/jit-<pid>.code, and a text index of it in
+// <dir>/jit-<pid>.idx: one record per piece of code, its host address, size and offset in the .code file, and for a block its
+// ops (kind, pc, word) and code regions (BlockEmitter::Region; begin offset, op). A diagnostic for code-quality work: it
+// changes no generated code.
+struct CodeDump {
+    std::mutex mutex;
+    FILE* code = nullptr;
+    FILE* index = nullptr;
+    uint64_t offset = 0, serial = 0;
+    bool tried = false;
+    bool Open() {
+        if (tried) return code != nullptr && index != nullptr;
+        tried = true;
+#if defined(__linux__)
+        const int pid = static_cast<int>(getpid());
+#else
+        const int pid = 0;
+#endif
+        const std::string base = Opts().dumpDir + "/jit-" + std::to_string(pid);
+        code = std::fopen((base + ".code").c_str(), "wb");
+        index = std::fopen((base + ".idx").c_str(), "w");
+        return code != nullptr && index != nullptr;
+    }
+    // Writes the bytes and the record's header line; the caller adds its own lines under the same lock.
+    bool Begin(char tag, const char* name, const void* at, size_t size, uint32_t pc) {
+        if (!Open()) return false;
+        std::fwrite(at, 1, size, code);
+        std::fprintf(index, "%c %llu %s %llx %zx %08X %llu\n", tag, static_cast<unsigned long long>(serial++), name,
+                     static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(at)), size, pc, static_cast<unsigned long long>(offset));
+        offset += size;
+        return true;
+    }
+};
+CodeDump& Dump() {
+    static CodeDump dump;
+    return dump;
+}
+
+void DumpCode(const char* name, const void* at, size_t size, uint32_t pc) {
+    if (Opts().dumpDir.empty() || size == 0) return;
+    CodeDump& d = Dump();
+    std::lock_guard<std::mutex> lock(d.mutex);
+    if (d.Begin('S', name, at, size, pc)) std::fflush(d.index);
+}
+
+// A block is two records with the same ops: its hot code (at `hot`) and its far code (at `far`), each with the regions that lie in
+// it (offsets from the record's own address).
+void DumpBlockTable(const BlockEmitter& e, const uint8_t* hot, const uint8_t* far) {
+    if (Opts().dumpDir.empty()) return;
+    static const char* const kRegionNames[] = {"stale", "check", "entry", "op", "cold", "end", "fallback_exit", "miss", "stub", "epoch"};
+    const Block& b = e.block;
+    CodeDump& d = Dump();
+    std::lock_guard<std::mutex> lock(d.mutex);
+    const size_t farStart = e.Layout().farStart;
+    for (int part = 0; part < 2; ++part) {
+        const uint8_t* const at = part == 0 ? hot : far;
+        const size_t size = part == 0 ? e.HotBytes() : e.FarBytes();
+        if (size == 0 || !d.Begin('B', "jit", at, size, b.start)) continue;
+        for (uint32_t i = 0; i < b.count; ++i)
+            std::fprintf(d.index, "O %u %s %08X %08X\n", i, kKindNames[static_cast<unsigned>(b.ops[i].kind)], b.pcs[i], b.words[i]);
+        for (uint32_t i = 0; i < e.RegionCount(); ++i) {
+            const BlockEmitter::RegionMark& r = e.RegionAt(i);
+            const bool inFar = r.begin >= farStart;
+            if (inFar != (part == 1)) continue;
+            std::fprintf(d.index, "R %u %s %u\n", inFar ? static_cast<unsigned>(r.begin - farStart) : r.begin,
+                         kRegionNames[static_cast<unsigned>(r.kind)], r.op);
+        }
+        std::fprintf(d.index, "E\n");
+    }
+    std::fflush(d.index);
+}
+
 // --- the host ABI ------------------------------------------------------------------------------------------------------
 
-// Frame layout shared identically by jit_enter and jit_enter_direct so one constant DWARF FDE describes every JIT block
-// and direct-enter continuation:
+// Frame layout shared identically by jit_enter, jit_enter_direct and the subcall frames (BlockEmitter::CallSubFrame,
+// jit_subcall) so one constant DWARF FDE describes every JIT block and direct-enter continuation:
 //   [rsp +  0..31]: Win64 shadow space
-//   [rsp + 32..39]: out-parameter slot (jit_enter: JitLink**) or DirectEnterState* (jit_enter_direct)
-//   [rsp + 40..87]: in-place Frame (48 bytes, used by jit_enter_direct)
+//   [rsp + 32..39]: out-parameter slot (jit_enter: JitLink**) or DirectEnterState* (jit_enter_direct; a subcall frame
+//                   leaves it unset: its continuation takes the thread's state)
+//   [rsp + 40..87]: in-place Frame (48 bytes, used by jit_enter_direct and subcall frames)
+//   [rsp + 88..135]: the callee-saved registers (r15 ... rbp); a subcall frame stores only r13 (the others are the same in
+//                   the callee, or not live in the caller across a call: the unwinder may restore anything into a JIT frame,
+//                   which has no landing pad, as long as the outermost trampoline's slots are right)
 // 88 == 8 mod 16, so rsp is 16-byte aligned throughout every block.
 constexpr int kTrampolineFrame = 88;
 constexpr int kOutLinkSlot = 32;
 constexpr int kDirectFrameOffset = 40;
+constexpr int kSavedR13 = kTrampolineFrame + 16;            // CFA - 40
+constexpr int kSubFrameBytes = kTrampolineFrame + 6 * 8;   // below the return address: 136
 static_assert(sizeof(Frame) == 48, "kTrampolineFrame assumes 48-byte Frame");
 static_assert(kDirectFrameOffset + static_cast<int>(sizeof(Frame)) == kTrampolineFrame);
 static_assert(offsetof(Frame, flags) == offsetof(Frame, pairedMask) + 4, "pairedMask and flags packed for one 8-byte store");
@@ -279,6 +368,11 @@ struct Shared {
     const void* exitDynamic = nullptr;  // eax = the next pc
     const void* exitSlot = nullptr;     // eax = the next pc, rdx = the link slot
     const void* exitReturn = nullptr;
+    const void* exitReturnNoSub = nullptr;  // exitReturn for a frame known not to be a subcall frame
+    const void* subReturn = nullptr;        // exitReturn for a subcall frame (Linux x86-64)
+    const void* callArgs = nullptr;         // JitTargetCell::fast routines (Linux x86-64): float arguments, then the entry
+    const void* callGuarded = nullptr;      //   JitThinCall
+    const void* cellPromote = nullptr;      // a call cell's entry to the front (Linux x86-64)
     const void* exitPending = nullptr;
     const void* staleCount = nullptr;   // rcx = a block's StaleCell: counts the failure, at the threshold asks for the block's stub
 #if defined(__linux__) && defined(__x86_64__)
@@ -289,14 +383,52 @@ struct Shared {
 Shared g_shared;
 EnterFn g_enter = nullptr;  // g_shared.enter, as a plain global: read on every enter
 
+// A call or jump from the shared code to a fixed address: rel32 when in reach, else through rax (which the caller gives up).
+void CallFar(Xbyak::CodeGenerator& a, const void* fn) {
+    const int64_t distance = reinterpret_cast<const uint8_t*>(fn) - (a.getCurr() + 5);
+    if (distance >= INT32_MIN && distance <= INT32_MAX) {
+        a.call(fn);
+        return;
+    }
+    a.mov(rax, reinterpret_cast<uint64_t>(fn));
+    a.call(rax);
+}
+
+}  // namespace
+
+Xbyak::Address AbsMem(Xbyak::CodeGenerator& a, const void* p, const Xbyak::Reg64& scratch, int bits) {
+    const uint64_t v = reinterpret_cast<uintptr_t>(p);
+    Xbyak::RegExp e;
+    if (v <= 0x7FFFFFFFu) {  // statics of a non-PIE executable: [disp32]
+        e = Xbyak::RegExp(static_cast<size_t>(v));
+    } else {
+        a.mov(scratch, v);
+        e = Xbyak::RegExp(scratch);
+    }
+    switch (bits) {
+    case 8: return a.byte[e];
+    case 16: return a.word[e];
+    case 32: return a.dword[e];
+    default: return a.qword[e];
+    }
+}
+
+namespace {
+
 bool BuildShared() {
     Shared& s = g_shared;
-    s.region = JitExecMemory::Allocate(4096);
+    s.region = JitExecMemory::Allocate(8192);
     if (!s.region) return false;
     try {
         Xbyak::CodeGenerator a(s.region.size, s.region.base);
         Xbyak::Label epilogue, directEpilogue, directContinue, exitReturnSlow, exitSlotSlow;
         Xbyak::Label subCallReturn, subCallDone, subCallSync;
+        // the perf map's names of the pieces of this code (BRAWL_JIT_PERF_MAP), each from its mark to the next
+        const uint8_t* markAt[16];
+        const char* markName[16];
+        unsigned marks = 0;
+        const auto mark = [&](const char* name) { markAt[marks] = a.getCurr(); markName[marks++] = name; };
+        mark("jit_enter");
         const uint8_t* const enterAt = a.getCurr();
         // One frame for every block: the callee-saved registers, then the shadow space, out slot, and direct Frame area.
         a.push(rbp);
@@ -316,13 +448,13 @@ bool BuildShared() {
         a.add(kCtxBase, kCtxBias);
         a.mov(kEpochCell, reinterpret_cast<uint64_t>(&BrawlDirtyMemory::markEpoch));
         // The window base is read at every enter: tests re-initialise memory, so it is no constant of the code.
-        a.mov(kLean, reinterpret_cast<uint64_t>(&MemoryInline::g_leanBase));
-        a.mov(kLean, a.qword[kLean]);
+        a.mov(kLean, AbsMem(a, &MemoryInline::g_leanBase, kLean, 64));
         a.xor_(kExecCount.cvt32(), kExecCount.cvt32());  // the guest instructions counted so far this enter (see kExecCount)
         a.jmp(ArgReg(1));
 
         // Fast AOT->JIT entry: void enterDirect(CpuContext* ctx, uint32_t entry, const void* jitChecked, DirectEnterState* state).
         // Uses the exact same stack frame layout as jit_enter so chunk FDEs unwind both identically.
+        mark("jit_enter_direct");
         const uint8_t* const enterDirectAt = a.getCurr();
         a.push(rbp);
         a.push(rbx);
@@ -343,37 +475,47 @@ bool BuildShared() {
         a.mov(a.qword[kFrame + static_cast<int>(offsetof(Frame, pairedMask))], rax);
         a.mov(a.dword[kFrame + static_cast<int>(offsetof(Frame, pc))], ArgReg(1).cvt32());
         a.mov(eax, a.dword[ArgReg(0) + static_cast<int>(offsetof(CpuContext, lr))]);
+        a.and_(eax, ~3u);  // every user compares it with a word address (blr: kept so, it compares without masking)
         a.mov(a.dword[kFrame + static_cast<int>(offsetof(Frame, returnAddress))], eax);
         a.mov(a.dword[kFrame + static_cast<int>(offsetof(Frame, entry))], ArgReg(1).cvt32());
-        a.mov(a.qword[kFrame + static_cast<int>(offsetof(Frame, executed))], 0);
+        if (!kDirectCalls || Opts().execInMemory) a.mov(a.qword[kFrame + static_cast<int>(offsetof(Frame, executed))], 0);  // else jit_direct_continue stores it
         a.mov(a.qword[kFrame + static_cast<int>(offsetof(Frame, pending))], 0);
         a.lea(kCtxBase, a.ptr[ArgReg(0) + kCtxBias]);
         a.mov(a.dword[kCtxBase + CtxDisp(offsetof(CpuContext, pc))], ArgReg(1).cvt32());
         a.mov(kEpochCell, reinterpret_cast<uint64_t>(&BrawlDirtyMemory::markEpoch));
-        a.mov(kLean, reinterpret_cast<uint64_t>(&MemoryInline::g_leanBase));
-        a.mov(kLean, a.qword[kLean]);
+        a.mov(kLean, AbsMem(a, &MemoryInline::g_leanBase, kLean, 64));
         a.xor_(kExecCount.cvt32(), kExecCount.cvt32());
         a.jmp(ArgReg(2));
 
-        // Fast JIT->patched-JIT direct subcall (Linux x86-64 only): bypasses AOT wrapper, RunPatched, RunCompiledEntry,
-        // and reloading kCtxBase/kLean/kEpochCell, while keeping the exact 144-byte trampoline frame for chunk FDE unwind
-        // and preserving hardware RSB via host call/ret. Inputs: eax = target, rdx = const JitCallTarget*.
+        // JIT->patched-JIT subcall for a target known only at run time (a bctrl's; a bl's subcall is BlockEmitter::CallSubFrame,
+        // which links straight to the callee's block): what GuestCodePatch::RunPatched and RunCompiledEntry would do for the
+        // target, without them. Inputs: eax = target, rdx = the cell entry (JitTargetCell), lr set, the rollback loop frame ruled
+        // out. Called from a block. The callee runs in a frame of its own (a subcall frame, see kTrampolineFrame) found through the
+        // thread's fast-entry table; a target that table does not hold is a call of the target's wrapper.
+        Xbyak::Label exitPendingAt;
         if (kDirectCalls) {
             Xbyak::Label fallbackEntry;
+            mark("jit_subcall");
             s.subCall = a.getCurr();
-            a.test(a.dword[kFrame + static_cast<int>(offsetof(Frame, flags))], kFrameFlagDirectEnter | kFrameFlagSubCall);
-            a.jz(fallbackEntry, Xbyak::CodeGenerator::T_NEAR);
+            a.mov(rdx, a.qword[rdx + static_cast<int>(offsetof(JitTargetCell, record))]);
             a.mov(rcx, a.qword[rdx + static_cast<int>(offsetof(JitCallTarget, patchedByte))]);
             a.test(rcx, rcx);
             a.jz(fallbackEntry, Xbyak::CodeGenerator::T_NEAR);
             a.cmp(a.byte[rcx], 0);
             a.je(fallbackEntry, Xbyak::CodeGenerator::T_NEAR);
-            a.mov(r9, reinterpret_cast<uint64_t>(&GetPatchedHooks()));
-            a.mov(rcx, a.qword[r9 + static_cast<int>(offsetof(PatchedHooks, lowestRedirect))]);
+            a.mov(rcx, AbsMem(a, &GetPatchedHooks().lowestRedirect, rcx, 64));
             a.cmp(eax, a.dword[rcx]);
             a.jae(fallbackEntry, Xbyak::CodeGenerator::T_NEAR);
-            a.mov(rsi, a.qword[rsp + 8 + kOutLinkSlot]);  // caller's DirectEnterState*
-            a.mov(rdi, a.qword[rsi + static_cast<int>(offsetof(DirectEnterState, fastEntries))]);
+            a.push(rax);  // the target and the record across the call; with the return address, the stack aligned for it
+            a.push(rdx);
+            a.sub(rsp, 8);
+            CallFar(a, reinterpret_cast<const void*>(&JitThreadFastEntries));
+            a.add(rsp, 8);
+            a.mov(rdi, rax);
+            a.pop(rdx);
+            a.pop(rax);
+            a.test(rdi, rdi);  // none (a build whose dispatcher keeps no table)
+            a.jz(fallbackEntry, Xbyak::CodeGenerator::T_NEAR);
             a.mov(ecx, eax);
             a.shr(ecx, 2);
             a.imul(ecx, ecx, 0x9E3779B1u);
@@ -384,43 +526,93 @@ bool BuildShared() {
             a.mov(r8, a.qword[rdi + rcx + 8]);
             a.test(r8, r8);
             a.jz(fallbackEntry, Xbyak::CodeGenerator::T_NEAR);
-            // Hit: build identical 144-byte trampoline frame so chunk FDEs unwind arbitrarily nested subcalls.
-            a.push(rbp);
-            a.push(rbx);
-            a.push(r12);
-            a.push(r13);
-            a.push(r14);
-            a.push(r15);
-            a.sub(rsp, kTrampolineFrame);
-            a.mov(a.qword[rsp + kOutLinkSlot], rsi);
+            // the subcall frame, as BlockEmitter::CallSubFrame makes it
+            a.sub(rsp, kSubFrameBytes);
+            a.mov(a.qword[rsp + kSavedR13], kFrame);
             a.lea(kFrame, a.ptr[rsp + kDirectFrameOffset]);
             a.lea(rcx, a.ptr[kCtxBase - kCtxBias]);
             a.mov(a.qword[kFrame + static_cast<int>(offsetof(Frame, ctx))], rcx);
-            a.mov(r9, static_cast<uint64_t>(kFrameFlagSubCall) << 32);
-            a.mov(a.qword[kFrame + static_cast<int>(offsetof(Frame, pairedMask))], r9);
+            a.mov(rcx, static_cast<uint64_t>(kFrameFlagSubCall) << 32);
+            a.mov(a.qword[kFrame + static_cast<int>(offsetof(Frame, pairedMask))], rcx);
             a.mov(a.dword[kFrame + static_cast<int>(offsetof(Frame, pc))], eax);
             a.mov(ecx, a.dword[kCtxBase + CtxDisp(offsetof(CpuContext, lr))]);
+            a.and_(ecx, ~3u);
             a.mov(a.dword[kFrame + static_cast<int>(offsetof(Frame, returnAddress))], ecx);
-            a.mov(a.dword[kFrame + static_cast<int>(offsetof(Frame, entry))], eax);
-            a.mov(a.qword[kFrame + static_cast<int>(offsetof(Frame, executed))], 0);
+            if (Opts().execInMemory) a.mov(a.qword[kFrame + static_cast<int>(offsetof(Frame, executed))], 0);
             a.mov(a.qword[kFrame + static_cast<int>(offsetof(Frame, pending))], 0);
             a.mov(a.dword[kCtxBase + CtxDisp(offsetof(CpuContext, pc))], eax);
-            a.xor_(kExecCount.cvt32(), kExecCount.cvt32());
             a.jmp(r8);
             a.L(fallbackEntry);
             a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
             a.jmp(a.qword[rdx + static_cast<int>(offsetof(JitCallTarget, entry))]);
+
+            // The other routines a call site calls through its cell (JitFastCallFor), from a bctrl or bctr site: rdi = the
+            // context, rdx = the cell entry, lr and ctx->pc set, the rollback loop frame ruled out; [rsp] returns to the block.
+            const int record = static_cast<int>(offsetof(JitTargetCell, record));
+            mark("jit_exits");
+            // A callee without guards whose float arguments may be held paired: NormalizeArgs, then the entry.
+            // (The cell entry holds the record's argMask and entry: the record itself, a line of its own, stays out of the way.)
+            const int cellEntry = static_cast<int>(offsetof(JitTargetCell, entry));
+            s.callArgs = a.getCurr();
+            {
+                Xbyak::Label normalize;
+                a.movzx(eax, a.word[rdx + static_cast<int>(offsetof(JitTargetCell, argMask))]);
+                a.test(a.dword[kFrame + static_cast<int>(offsetof(Frame, pairedMask))], eax);
+                a.jnz(normalize, Xbyak::CodeGenerator::T_SHORT);
+                a.jmp(a.qword[rdx + cellEntry]);
+                a.L(normalize);
+                a.push(rdx);  // the cell entry, and the stack aligned for the call
+                a.mov(rdi, kFrame);
+                a.mov(rsi, a.qword[rdx + record]);
+                CallFar(a, reinterpret_cast<const void*>(&JitNormalizeArgs));
+                a.pop(rdx);
+                a.lea(rdi, a.ptr[kCtxBase - kCtxBias]);
+                a.jmp(a.qword[rdx + cellEntry]);
+            }
+            // A cell entry that is not the first was hit 8 times: it becomes the first (rcx = the cell, rdx = the entry; the two
+            // entries swap). Answers rdx = the cell's first entry. Clobbers xmm0-xmm3.
+            s.cellPromote = a.getCurr();
+            static_assert(sizeof(JitTargetCell) == 32);
+            a.movups(xmm0, a.ptr[rcx]);
+            a.movups(xmm1, a.ptr[rcx + 16]);
+            a.movups(xmm2, a.ptr[rdx]);
+            a.movups(xmm3, a.ptr[rdx + 16]);
+            a.movups(a.ptr[rcx], xmm2);
+            a.movups(a.ptr[rcx + 16], xmm3);
+            a.movups(a.ptr[rdx], xmm0);
+            a.movups(a.ptr[rdx + 16], xmm1);
+            a.mov(rdx, rcx);
+            a.ret();
+            // Any other callee: JitThinCall; an exception it stored leaves the block (the return address is dropped: rsp is the
+            // frame's again, as in a block).
+            s.callGuarded = a.getCurr();
+            {
+                Xbyak::Label pending;
+                a.sub(rsp, 8);
+                a.mov(rdi, kFrame);
+                a.mov(rsi, a.qword[rdx + record]);
+                CallFar(a, reinterpret_cast<const void*>(&JitThinCall));
+                a.add(rsp, 8);
+                a.test(rax, rax);
+                a.jnz(pending, Xbyak::CodeGenerator::T_SHORT);
+                a.ret();
+                a.L(pending);
+                a.add(rsp, 8);
+                a.jmp(exitPendingAt, Xbyak::CodeGenerator::T_NEAR);
+            }
         }
 
         // Everything from here to fdeEnd runs with the trampoline frame active (covered by shared FDE).
         const uint8_t* const fdeStart = a.getCurr();
 
+        mark("jit_exit_return");
         s.exitReturn = a.getCurr();
         if (kDirectCalls) {
-            a.test(a.dword[kFrame + static_cast<int>(offsetof(Frame, flags))], kFrameFlagSubCall);
+            a.test(a.byte[kFrame + static_cast<int>(offsetof(Frame, flags))], kFrameFlagSubCall);
             a.jnz(subCallReturn, Xbyak::CodeGenerator::T_SHORT);
         }
-        a.test(a.dword[kFrame + static_cast<int>(offsetof(Frame, flags))], kFrameFlagDirectEnter);
+        s.exitReturnNoSub = a.getCurr();
+        a.test(a.byte[kFrame + static_cast<int>(offsetof(Frame, flags))], kFrameFlagDirectEnter);
         a.jz(exitReturnSlow, Xbyak::CodeGenerator::T_SHORT);
         // Hot direct-enter return: count instructions directly into ThreadState's counter, tear down frame, return.
         a.mov(rcx, a.qword[rsp + kOutLinkSlot]);
@@ -441,33 +633,33 @@ bool BuildShared() {
         a.ret();
 
         if (kDirectCalls) {
+            // A subcall frame's function returned: RunPatched's Sync test, then back to the caller's block (its frame in r13).
+            // The instruction count in r15 goes on: the callee's blocks counted on top of the caller's.
+            mark("jit_subcall_return");
             a.L(subCallReturn);
-            a.mov(r9, reinterpret_cast<uint64_t>(&GetPatchedHooks()));
-            a.mov(rcx, a.qword[r9 + static_cast<int>(offsetof(PatchedHooks, pendingFast))]);
+            s.subReturn = a.getCurr();
+            const PatchedHooks& hooks = GetPatchedHooks();
+            a.mov(rcx, AbsMem(a, &hooks.pendingFast, rcx, 64));
             a.cmp(a.qword[rcx], 0);
             a.jne(subCallSync, Xbyak::CodeGenerator::T_SHORT);
-            a.mov(rcx, a.qword[r9 + static_cast<int>(offsetof(PatchedHooks, anyDirty))]);
+            a.mov(rcx, AbsMem(a, &hooks.anyDirty, rcx, 64));
             a.cmp(a.byte[rcx], 0);
             a.jne(subCallSync, Xbyak::CodeGenerator::T_SHORT);
             a.L(subCallDone);
-            // Merge callee's instruction count (kExecCount) with caller's saved count at [rsp + kTrampolineFrame].
-            a.add(kExecCount, a.qword[rsp + kTrampolineFrame]);
-            a.add(rsp, kTrampolineFrame + 8);
-            a.pop(r14);
-            a.pop(r13);
-            a.pop(r12);
-            a.pop(rbx);
-            a.pop(rbp);
+            a.mov(kFrame, a.qword[rsp + kSavedR13]);
+            a.add(rsp, kSubFrameBytes);
             a.ret();
             a.L(subCallSync);
-            a.call(a.qword[r9 + static_cast<int>(offsetof(PatchedHooks, sync))]);
+            a.call(AbsMem(a, &hooks.sync, rcx, 64));
             a.jmp(subCallDone, Xbyak::CodeGenerator::T_SHORT);
         }
 
+        mark("jit_exit_return_slow");
         a.L(exitReturnSlow);
         a.mov(rax, static_cast<uint64_t>(JitStatus::Return) << 32);
         a.jmp(epilogue);
 
+        mark("jit_exit_dynamic");
         s.exitDynamic = a.getCurr();
         a.mov(eax, eax);
         a.xor_(edx, edx);
@@ -475,6 +667,7 @@ bool BuildShared() {
         a.jnz(directContinue);
         a.jmp(epilogue);
 
+        mark("jit_exit_slot");
         s.exitSlot = a.getCurr();
         a.mov(eax, eax);
         a.test(a.dword[kFrame + static_cast<int>(offsetof(Frame, flags))], kFrameFlagDirectEnter | kFrameFlagSubCall);
@@ -484,12 +677,15 @@ bool BuildShared() {
         a.mov(a.qword[rcx], rdx);
         a.jmp(epilogue);
 
+        mark("jit_exit_pending");
+        a.L(exitPendingAt);
         s.exitPending = a.getCurr();
         a.mov(rax, static_cast<uint64_t>(JitStatus::Pending) << 32);
         a.xor_(edx, edx);
         a.test(a.dword[kFrame + static_cast<int>(offsetof(Frame, flags))], kFrameFlagDirectEnter | kFrameFlagSubCall);
         a.jnz(directContinue);
 
+        mark("jit_epilogue");
         a.L(epilogue);
         a.add(a.qword[kFrame + static_cast<int>(offsetof(Frame, executed))], kExecCount);  // hand the count to the dispatcher
         a.add(rsp, kTrampolineFrame);
@@ -505,31 +701,63 @@ bool BuildShared() {
         a.pop(rbp);
         a.ret();
 
-        // Direct-enter slow continuation: rax = status << 32 | next, rdx = link (or null).
+        // Direct-enter and subcall slow continuation: rax = status << 32 | next, rdx = link (or null).
         // Calls JitDirectContinue(DirectEnterState*, Frame*, uint64_t statusAndNext, JitLink* link).
+        mark("jit_direct_continue");
         a.L(directContinue);
-        a.add(a.qword[kFrame + static_cast<int>(offsetof(Frame, executed))], kExecCount);
+        // The frame's first exit (JitDirectContinue clears the flags that lead here): executed is still the 0 the frame was
+        // made with, which a subcall frame does not store (except BRAWL_JIT_EXEC_MEM=1, where blocks add to it).
+        if (kDirectCalls && !Opts().execInMemory) a.mov(a.qword[kFrame + static_cast<int>(offsetof(Frame, executed))], kExecCount);
+        else a.add(a.qword[kFrame + static_cast<int>(offsetof(Frame, executed))], kExecCount);
         if (kWin64) {
             a.mov(r9, rdx);
             a.mov(r8, rax);
             a.mov(rdx, kFrame);
             a.mov(rcx, a.qword[rsp + kOutLinkSlot]);
+        } else if (kDirectCalls) {
+            // a jit_enter_direct frame's DirectEnterState; a subcall frame passes none (JitDirectContinue takes the thread's)
+            Xbyak::Label sub;
+            a.mov(ebp, a.dword[kFrame + static_cast<int>(offsetof(Frame, flags))]);  // kept across the call: which epilogue
+            a.xor_(edi, edi);
+            a.test(ebp, kFrameFlagSubCall);
+            a.jnz(sub, Xbyak::CodeGenerator::T_SHORT);
+            a.mov(rdi, a.qword[rsp + kOutLinkSlot]);
+            a.L(sub);
+            a.mov(rcx, rdx);
+            a.mov(rdx, rax);
+            a.mov(rsi, kFrame);
         } else {
             a.mov(rcx, rdx);
             a.mov(rdx, rax);
             a.mov(rsi, kFrame);
             a.mov(rdi, a.qword[rsp + kOutLinkSlot]);
         }
-        a.mov(rax, reinterpret_cast<uint64_t>(&JitDirectContinue));
-        a.call(rax);
+        CallFar(a, reinterpret_cast<const void*>(&JitDirectContinue));
+        if (kDirectCalls) {
+            // A subcall frame: back to the caller's block. JitDirectContinue counted every instruction r15 held (the callers'
+            // since their trampoline began too), so the count starts again.
+            Xbyak::Label notSub;
+            a.test(ebp, kFrameFlagSubCall);
+            a.jz(notSub, Xbyak::CodeGenerator::T_SHORT);
+            a.mov(kFrame, a.qword[rsp + kSavedR13]);
+            a.xor_(kExecCount.cvt32(), kExecCount.cvt32());
+            a.add(rsp, kSubFrameBytes);
+            a.ret();
+            a.L(notSub);
+        }
         a.jmp(directEpilogue);
 
         const uint8_t* const fdeEnd = a.getCurr();
 
         // The stale paths' counting code (StaleCell): shared, so a block holds only its cell and a jump through it.
+        mark("jit_stale_count");
         s.staleCount = a.getCurr();
         if (Opts().staleThreshold != 0) {
             Xbyak::Label toPlain;
+            if (diag::ChurnOn()) {  // BRAWL_JIT_CHURN: count it
+                a.mov(rax, reinterpret_cast<uint64_t>(diag::CounterCell(diag::kJitStalePaths)));
+                a.inc(a.qword[rax]);
+            }
             a.add(a.dword[rcx + static_cast<int>(offsetof(StaleCell, failures))], 1);
             a.mov(eax, a.dword[rcx + static_cast<int>(offsetof(StaleCell, failures))]);
             a.cmp(eax, Opts().staleThreshold);
@@ -552,8 +780,13 @@ bool BuildShared() {
         (void)fdeStart;
         (void)fdeEnd;
 #endif
-        PerfMapAdd(enterAt, static_cast<size_t>(static_cast<const uint8_t*>(s.exitReturn) - enterAt), "jit_enter", 0);
-        PerfMapAdd(s.exitReturn, static_cast<size_t>(a.getCurr() - static_cast<const uint8_t*>(s.exitReturn)), "jit_exits", 0);
+        markAt[marks] = a.getCurr();
+        for (unsigned i = 0; i < marks; ++i) {
+            const size_t size = static_cast<size_t>(markAt[i + 1] - markAt[i]);
+            if (size == 0) continue;
+            PerfMapAdd(markAt[i], size, markName[i], 0);
+            DumpCode(markName[i], markAt[i], size, 0);
+        }
     } catch (...) {
         JitExecMemory::Free(s.region);
         s.region = {};
@@ -571,6 +804,27 @@ const Xbyak::Reg64& ArgReg(unsigned i) {
     static const Xbyak::Reg64* const win[] = {&rcx, &rdx, &r8, &r9};
     if (kWin64) return *win[i < 4 ? i : 3];
     return *sysv[i < 6 ? i : 5];
+}
+
+void Jcc(Xbyak::CodeGenerator& a, Cc cc, const Xbyak::Label& target, Xbyak::CodeGenerator::LabelType type) {
+    switch (cc) {
+    case Cc::O: a.jo(target, type); break;
+    case Cc::NO: a.jno(target, type); break;
+    case Cc::B: a.jb(target, type); break;
+    case Cc::AE: a.jae(target, type); break;
+    case Cc::E: a.je(target, type); break;
+    case Cc::NE: a.jne(target, type); break;
+    case Cc::BE: a.jbe(target, type); break;
+    case Cc::A: a.ja(target, type); break;
+    case Cc::S: a.js(target, type); break;
+    case Cc::NS: a.jns(target, type); break;
+    case Cc::P: a.jp(target, type); break;
+    case Cc::NP: a.jnp(target, type); break;
+    case Cc::L: a.jl(target, type); break;
+    case Cc::GE: a.jge(target, type); break;
+    case Cc::LE: a.jle(target, type); break;
+    case Cc::G: a.jg(target, type); break;
+    }
 }
 
 Group GroupOf(K k) {
@@ -593,8 +847,10 @@ uint32_t FallbackSpan(K k) {
 
 // --- BlockEmitter --------------------------------------------------------------------------------------------------------
 
-BlockEmitter::BlockEmitter(const Block& b, void* buffer, size_t size) : a(size, buffer), block(b) {
+BlockEmitter::BlockEmitter(const Block& b, void* buffer, size_t size, const BlockLayout& layout)
+    : a(size, buffer), block(b), layout_(layout) {
     a.setDefaultJmpNEAR(true);  // a forward jump to a label not yet defined is a 32-bit displacement unless T_SHORT is asked
+    a.SetLimit(layout.hotLimit);  // the main path first: it may not run into the far code
 }
 BlockEmitter::~BlockEmitter() = default;
 
@@ -720,6 +976,7 @@ void BlockEmitter::FlushDirtyGprs() {
             gprSlots_[s].dirty = false;
         }
     }
+    FlushDirtyFprs();  // memory current for the FPR cache too (a cold path may reload a snapshot it does not store first)
 }
 
 void BlockEmitter::FlushVolatileGprs() {
@@ -729,6 +986,7 @@ void BlockEmitter::FlushVolatileGprs() {
             gprSlots_[s] = GprSlot{};
         }
     }
+    FlushAllFprs();  // every FPR cache slot is volatile too
 }
 
 void BlockEmitter::FlushAllGprs() {
@@ -738,6 +996,7 @@ void BlockEmitter::FlushAllGprs() {
             gprSlots_[s] = GprSlot{};
         }
     }
+    FlushAllFprs();
 }
 
 BlockEmitter::GprSnapshot BlockEmitter::SnapshotGprs() const {
@@ -746,6 +1005,7 @@ BlockEmitter::GprSnapshot BlockEmitter::SnapshotGprs() const {
         snap.guest[s] = gprSlots_[s].guest;
         if (gprSlots_[s].guest >= 0 && gprSlots_[s].dirty) snap.dirtyMask |= static_cast<uint8_t>(1u << s);
     }
+    SnapshotFprs(snap);
     return snap;
 }
 
@@ -755,6 +1015,7 @@ void BlockEmitter::EmitFlushSnapshot(const GprSnapshot& snap) {
             a.mov(Gpr(static_cast<uint32_t>(snap.guest[s])), GprCacheReg(s));
         }
     }
+    EmitFlushFprSnapshot(snap);
 }
 
 void BlockEmitter::EmitReloadSnapshotVolatile(const GprSnapshot& snap) {
@@ -763,6 +1024,7 @@ void BlockEmitter::EmitReloadSnapshotVolatile(const GprSnapshot& snap) {
             a.mov(GprCacheReg(s), Gpr(static_cast<uint32_t>(snap.guest[s])));
         }
     }
+    EmitReloadFprSnapshot(snap);
 }
 
 Xbyak::Label& BlockEmitter::NewLabel() {
@@ -772,6 +1034,7 @@ Xbyak::Label& BlockEmitter::NewLabel() {
 
 BlockEmitter::ColdItem& BlockEmitter::NewCold() {
     if (coldCount_ == kMaxCold) throw EmitError{"cold paths"};
+    cold_[coldCount_].op = index;
     return cold_[coldCount_++];
 }
 
@@ -782,7 +1045,7 @@ Xbyak::Label& BlockEmitter::NewCell() {
     return cells_[cellCount_++];
 }
 
-static_assert(sizeof(JitTargetCell) == 16);
+static_assert(sizeof(JitTargetCell) == 32 && offsetof(JitTargetCell, target) == 0);
 
 void BlockEmitter::CellProbe(Xbyak::Label& cell, const Xbyak::Label& miss) {
     const int key = static_cast<int>(offsetof(JitTargetCell, target)), record = static_cast<int>(offsetof(JitTargetCell, record));
@@ -792,7 +1055,7 @@ void BlockEmitter::CellProbe(Xbyak::Label& cell, const Xbyak::Label& miss) {
         const int at = static_cast<int>(i * sizeof(JitTargetCell));
         a.cmp(eax, a.dword[rcx + at + key]);
         a.mov(rdx, a.qword[rcx + at + record]);  // mov leaves the flags
-        if (i + 1 < kCellWays) a.je(hit, Xbyak::CodeGenerator::T_SHORT);
+        if (i + 1 < kCellWays) a.je(hit, Xbyak::CodeGenerator::T_NEAR);
         else a.jne(miss, Xbyak::CodeGenerator::T_NEAR);
     }
     a.L(hit);
@@ -813,7 +1076,25 @@ void BlockEmitter::JmpAbs(const void* target) {
 }
 
 void BlockEmitter::ExitDynamic() { JmpAbs(g_shared.exitDynamic); }
-void BlockEmitter::ExitReturn() { JmpAbs(g_shared.exitReturn); }
+void BlockEmitter::ExitReturn() {
+    // A subcall frame's return goes straight to its own exit (one taken jump, not two); any other to the rest of exitReturn.
+    if (kDirectCalls && g_shared.subReturn != nullptr) {
+        static const bool alwaysLong = EnvOn("BRAWL_JIT_FAR_JUMPS");
+        a.test(a.byte[kFrame + static_cast<int>(offsetof(Frame, flags))], kFrameFlagSubCall);
+        const int64_t distance = reinterpret_cast<const uint8_t*>(g_shared.subReturn) - (a.getCurr() + 6);
+        if (!alwaysLong && distance >= INT32_MIN && distance <= INT32_MAX) {
+            a.jnz(g_shared.subReturn);
+        } else {
+            Xbyak::Label notSub;
+            a.jz(notSub, Xbyak::CodeGenerator::T_SHORT);
+            JmpAbs(g_shared.subReturn);
+            a.L(notSub);
+        }
+        JmpAbs(g_shared.exitReturnNoSub);
+        return;
+    }
+    JmpAbs(g_shared.exitReturn);
+}
 void BlockEmitter::ExitPending() { JmpAbs(g_shared.exitPending); }
 void BlockEmitter::ExitTo(uint32_t targetPc) {
     a.mov(eax, targetPc);
@@ -823,6 +1104,13 @@ void BlockEmitter::ExitTo(uint32_t targetPc) {
 void BlockEmitter::ExitLinked(uint32_t targetPc) {
     if (IsHookPc(targetPc)) {  // a hook pc is handled in the dispatcher's loop: never linked
         ExitTo(targetPc);
+        return;
+    }
+    // A loop back to the block's own start, in a block whose code cannot have changed since its entry passed a validity test
+    // (every way in compares its words or tests its marks): straight to the entry (the count), no slot, no test.
+    if (targetPc == block.start && (inCold_ ? coldOp_ : index) < selfLoopPrefix_) {
+        a.jmp(entry_, Xbyak::CodeGenerator::T_NEAR);
+        Bump(g_counters.selfLoops);
         return;
     }
     static const bool alwaysLong = EnvOn("BRAWL_JIT_FAR_JUMPS");
@@ -842,6 +1130,35 @@ void BlockEmitter::ExitLinked(uint32_t targetPc) {
     exits_[i].pc = targetPc;
     exits_[i].patchOffset = static_cast<uint32_t>(a.getSize());
     a.jmp(exits_[i].stub, Xbyak::CodeGenerator::T_NEAR);
+}
+
+void BlockEmitter::ExitLinkedIf(Cc cc, uint32_t targetPc) {
+    static const bool alwaysLong = EnvOn("BRAWL_JIT_FAR_JUMPS");
+    if (IsHookPc(targetPc) || alwaysLong) {  // nothing to patch: over the unconditional exit
+        Xbyak::Label skip;
+        Jcc(a, Invert(cc), skip, Xbyak::CodeGenerator::T_NEAR);
+        ExitLinked(targetPc);
+        a.L(skip);
+        return;
+    }
+    // a conditional loop back to the block's own start (the usual loop form), as ExitLinked's: straight to the entry
+    if (targetPc == block.start && (inCold_ ? coldOp_ : index) < selfLoopPrefix_) {
+        Jcc(a, cc, entry_, Xbyak::CodeGenerator::T_NEAR);
+        Bump(g_counters.selfLoops);
+        return;
+    }
+    if (exitCount_ == kMaxExits) throw EmitError{"link slots"};
+    const uint32_t i = exitCount_++;
+    exits_[i].pc = targetPc;
+    exits_[i].patchOffset = static_cast<uint32_t>(a.getSize()) + 1;  // 0F 8x rel32: patchSite + 1 is the rel32 (see ExitLinkedIf)
+    exits_[i].conditional = true;
+    Jcc(a, cc, exits_[i].stub, Xbyak::CodeGenerator::T_NEAR);
+}
+
+void BlockEmitter::JumpIfSo(const Xbyak::Label& target) {
+    if (MKW_LEAN_FLAGS) return;  // compares do not copy SO: nothing depends on it
+    a.test(a.byte[kCtxBase + CtxDisp(offsetof(CpuContext, xer) + 3)], 0x80);
+    a.jnz(target, Xbyak::CodeGenerator::T_NEAR);
 }
 
 // A stats-only increment of one of the process counters (BRAWL_JIT_STATS): clobbers r8 and the flags.
@@ -879,6 +1196,10 @@ void BlockEmitter::ExitDynamicMiss(uint32_t which) {
     c.missEmitted = true;
     a.L(c.miss);
     if (Opts().stats) EmitCount(a, g_counters.cacheMisses);
+    if (diag::ChurnOn()) {  // BRAWL_JIT_CHURN
+        a.mov(r8, reinterpret_cast<uint64_t>(diag::CounterCell(diag::kJitCacheMisses)));
+        a.inc(a.qword[r8]);
+    }
     a.lea(rdx, a.ptr[a.rip + c.slots]);
     JmpAbs(g_shared.exitSlot);
 }
@@ -886,6 +1207,20 @@ void BlockEmitter::ExitDynamicMiss(uint32_t which) {
 void BlockEmitter::ExitDynamicCached(uint32_t which) {
     CacheProbe(which);
     ExitDynamicMiss(which);
+}
+
+void BlockEmitter::ExitDynamicAfterCall(uint32_t which) {
+    Xbyak::Label stale;
+    JumpIfSo(stale);  // the callee set XER[SO]: through the dispatcher, which does not enter compiled code while it is set
+    if (g_jitEpochFault != 3) {  // 3: a test aid, the epoch guard left out on purpose
+        a.mov(rcx, reinterpret_cast<uint64_t>(JitLinkEpochCell()));
+        a.mov(ecx, a.dword[rcx]);
+        a.cmp(ecx, a.dword[kEpochCell]);
+        a.jne(stale, Xbyak::CodeGenerator::T_NEAR);
+    }
+    ExitDynamicCached(which);
+    a.L(stale);
+    ExitDynamic();
 }
 
 void BlockEmitter::CallRaw(const void* fn) {
@@ -910,6 +1245,31 @@ void BlockEmitter::CallSubCall() {
     // eax holds target and rdx holds JitCallTarget*: use r10 for far call.
     a.mov(r10, reinterpret_cast<uint64_t>(fn));
     a.call(r10);
+}
+
+static_assert(offsetof(Frame, returnAddress) == offsetof(Frame, pc) + 4, "pc and returnAddress: one 8-byte store");
+
+void BlockEmitter::CallSubFrame(uint32_t target, uint32_t returnAddress) {
+    Xbyak::Label& stub = NewLabel();
+    a.call(stub);
+    Cold([&stub, target, returnAddress](BlockEmitter& e) {
+        Xbyak::CodeGenerator& c = e.a;
+        const auto field = [](size_t offset) { return static_cast<int>(offset); };
+        c.L(stub);
+        c.sub(rsp, kSubFrameBytes);
+        c.mov(c.qword[rsp + kSavedR13], kFrame);
+        c.lea(kFrame, c.ptr[rsp + kDirectFrameOffset]);
+        c.lea(rax, c.ptr[kCtxBase - kCtxBias]);
+        c.mov(c.qword[kFrame + field(offsetof(Frame, ctx))], rax);
+        c.mov(rax, static_cast<uint64_t>(kFrameFlagSubCall) << 32);  // pairedMask 0: the callee starts with every FPR scalar
+        c.mov(c.qword[kFrame + field(offsetof(Frame, pairedMask))], rax);
+        c.mov(rax, (static_cast<uint64_t>(returnAddress & ~3u) << 32) | target);
+        c.mov(c.qword[kFrame + field(offsetof(Frame, pc))], rax);  // entry: JitDirectContinue sets it from pc (the frame's only reader)
+        if (Opts().execInMemory) c.mov(c.qword[kFrame + field(offsetof(Frame, executed))], 0);  // else jit_direct_continue stores it
+        c.mov(c.qword[kFrame + field(offsetof(Frame, pending))], 0);
+        c.mov(e.Pc(), target);
+        e.ExitLinked(target);
+    });
 }
 
 void BlockEmitter::CallHelperImpl(const void* fn, std::initializer_list<CallArg> list) {
@@ -979,7 +1339,19 @@ void BlockEmitter::CallHelperImpl(const void* fn, std::initializer_list<CallArg>
 
 uint32_t BlockEmitter::EmitFallback(uint32_t i) {
     ++fallbackCalls_;
-    return EmitSlowPath(i);
+    const uint32_t span = EmitSlowPath(i);
+    // The interpreter's handler may have set XER[SO] (an OE form, mtxer, a call): then the dispatcher goes on (JumpIfSo). Every
+    // caller has flushed the GPR cache.
+    if (!MKW_LEAN_FLAGS) {
+        Xbyak::Label& so = NewLabel();
+        JumpIfSo(so);
+        const uint32_t next = PcAfter(i, span);
+        Cold([&so, next](BlockEmitter& e) {
+            e.a.L(so);
+            e.ExitTo(next);
+        });
+    }
+    return span;
 }
 
 uint32_t BlockEmitter::EmitSlowPath(uint32_t i) {
@@ -1025,15 +1397,23 @@ void BlockEmitter::EmitMarkTest(const MarkCheck& m, const Xbyak::Label& fail, bo
     a.jnz(fail, T);
 }
 
-void BlockEmitter::EmitValidityTest(const Xbyak::Label& fail, bool shortJump) {
+// epoch == markEpoch, the block's epoch an immediate the core rewrites whenever the block cache changes it (Block::jitEpoch,
+// JitBackend::setEpoch): `cmp dword [r14], imm32`, the immediate 4-byte aligned (one store rewrites it). Clobbers nothing.
+void BlockEmitter::EmitEpochTest(const Xbyak::Label& fail, bool shortJump) {
     const auto T = shortJump ? Xbyak::CodeGenerator::T_SHORT : Xbyak::CodeGenerator::T_NEAR;
-    // epoch == markEpoch (b.epoch is read from memory: Refresh rewrites it) ...
-    a.mov(rcx, reinterpret_cast<uint64_t>(&block.epoch));
-    a.mov(eax, a.dword[rcx]);
-    a.cmp(eax, a.dword[kEpochCell]);
+    const size_t misalign = (reinterpret_cast<uintptr_t>(a.getCurr()) + 3) & 3;
+    if (misalign != 0) a.nop(4 - misalign);
+    if (epochSiteCount_ == kMaxEpochSites) throw EmitError{"epoch tests"};
+    a.db(0x41);  // REX.B (kEpochCell is r14)
+    a.db(0x81);  // cmp r/m32, imm32 (never the imm8 form: the value is rewritten)
+    a.db(0x3E);  // ModRM: /7, [r14]
+    epochSites_[epochSiteCount_++] = static_cast<uint32_t>(a.getSize());
+    a.dd(block.epoch);
     a.jne(fail, T);
-    // ... and every mark the block's check[] names is clear (BlockCache::Current always tests the first two; an unused one
-    // has no mask)
+}
+
+// Every mark the block's check[] names is clear (BlockCache::Current always tests the first two; an unused one has no mask).
+void BlockEmitter::EmitMarksTest(const Xbyak::Label& fail, bool shortJump) {
     const uint32_t checks = block.checks > 2 ? block.checks : 2;
     for (uint32_t k = 0; k < checks; ++k)
         if (block.check[k].mask != 0) EmitMarkTest(block.check[k], fail, shortJump);
@@ -1041,7 +1421,9 @@ void BlockEmitter::EmitValidityTest(const Xbyak::Label& fail, bool shortJump) {
 
 void BlockEmitter::EmitRecheck(uint32_t nextPc) {
     Xbyak::Label& fail = NewLabel();
-    EmitValidityTest(fail, false);
+    JumpIfSo(fail);  // the callee set XER[SO]: the dispatcher goes on (see JumpIfSo)
+    EmitEpochTest(fail, false);
+    EmitMarksTest(fail, false);
     Cold([&fail, nextPc](BlockEmitter& e) {
         e.a.L(fail);
         e.ExitTo(nextPc);
@@ -1122,23 +1504,50 @@ void BlockEmitter::AnalyseGprUses() {
     }
 }
 
+// How many of block b's first ops cannot write guest memory, move the epoch or retire a block: none of them stores, calls, jumps
+// through a register or runs C++ that could (Generic ops, special registers, the quantized loads' helper, ops forced to the fallback
+// call). A jump back to b's own start from op k < that number may skip the validity test: b's words matched guest memory when it
+// was entered, and nothing since can have changed them.
+uint32_t BlockEmitter::SelfLoopPrefix(const Block& b) {
+    for (uint32_t i = 0; i < b.count; ++i) {
+        const Op& o = b.ops[i];
+        if (Opts().forced[static_cast<unsigned>(o.kind)]) return i;
+        switch (o.kind) {
+        case K::Mfspr: case K::Mtspr: case K::PsqL: case K::PsqLu: return i;
+        case K::B:
+            // a tail call, not decided at decode, or a jump a code variant may continue (EmitB's fallback call)
+            if (o.b != 2 || JitContinuationsPossible() || JitContinuationAt(o.imm)) return i;
+            continue;
+        case K::Bc: case K::CmpwiBc: case K::CmplwiBc: case K::CmpwBc: case K::CmplwBc: case K::RlwinmRcBc: case K::Jmp:
+            continue;
+        default:
+            break;
+        }
+        const Group g = GroupOf(o.kind);
+        const bool load = (o.kind >= K::Lwz && o.kind <= K::Lha) || o.kind == K::Lmw || (o.kind >= K::Lwzx && o.kind <= K::Lhzx) ||
+                          (o.kind >= K::Lfs && o.kind <= K::Lfdu) || o.kind == K::Lfsx;
+        if (g == Group::Int || g == Group::Fp || load) continue;
+        return i;
+    }
+    return b.count;
+}
+
 void BlockEmitter::EmitPrologue() {
-    // The stale exit comes first, so the check's jumps to it are short; nothing falls into it (blocks are entered at their
-    // `checked` or `entry` address).
     AnalyseCr();
     AnalyseForms();
     AnalyseGprUses();
+    AnalyseFprUses();
     staleStub_ = Opts().staleThreshold != 0 && owner_ != nullptr;
-    a.L(stale_);
-    if (staleStub_) {  // through the block's StaleCell (rcx its address): the shared counting code, later a stub
-        a.lea(rcx, a.ptr[a.rip + staleCell_]);
-        a.jmp(a.ptr[rcx]);
-    }
-    a.L(plainStale_);
-    ExitTo(block.start);
-    checkedAt_ = a.getCurr();
-    EmitValidityTest(stale_, true);
+    selfLoopPrefix_ = SelfLoopPrefix(block);
+    // The hot code starts with the entry link slots and inline caches aim at (Block::jitLinked): the marks only, as a slot is
+    // aimed at a block only while its epoch is the current one. Set marks go to the stale exit (far code, Finish).
+    linkedAt_ = a.getCurr();
+    a.L(linked_);
+    MarkRegion(Region::Check, 0);
+    EmitMarksTest(stale_, false);
     entryAt_ = a.getCurr();
+    a.L(entry_);
+    MarkRegion(Region::Entry, 0);
     // The block's instruction count goes to a register the trampoline's epilogue adds to frame.executed (one add, not a
     // read-modify-write of memory per block); BRAWL_JIT_EXEC_MEM=1 (a test switch) adds it to frame.executed in memory per block.
     if (Opts().execInMemory) a.add(Executed(), block.count);
@@ -1149,8 +1558,35 @@ void BlockEmitter::EmitPrologue() {
 }
 
 void BlockEmitter::Finish() {
-    if (fallbackUsed_) {  // ecx: what (1 leave for eax, 2 return, 3 pending)
+    hotBytes_ = a.getSize();
+    // --- the far code ---
+    a.SetLimit(layout_.farLimit);
+    a.setSize(layout_.farStart);
+    // The entry from outside compiled code (the dispatcher's fast entries, jit_subcall): the epoch, then the linked entry's
+    // marks. A stale epoch goes to the dispatcher (its Refresh compares the words and starts the slots' new epoch); set marks go
+    // through the stale cell, whose stub, once made, compares the words in place: the epoch is current there.
+    checkedAt_ = a.getCurr();
+    MarkRegion(Region::Epoch, 0);
+    EmitEpochTest(plainStale_, true);
+    a.jmp(linked_, Xbyak::CodeGenerator::T_NEAR);
+    MarkRegion(Region::Stale, 0);
+    a.L(stale_);
+    if (staleStub_) {  // through the block's StaleCell (rcx its address): the shared counting code, later a stub
+        a.lea(rcx, a.ptr[a.rip + staleCell_]);
+        a.jmp(a.ptr[rcx]);
+    }
+    a.L(plainStale_);
+    ExitTo(block.start);
+    inCold_ = true;
+    for (uint32_t i = 0; i < coldCount_; ++i) {
+        MarkRegion(Region::Cold, cold_[i].op);
+        coldOp_ = cold_[i].op;
+        cold_[i].run(cold_[i].storage, *this);
+    }
+    inCold_ = false;
+    if (fallbackUsed_) {  // ecx: what (1 leave for eax, 2 return, 3 pending); after the cold code, whose slow paths may use it
         Xbyak::Label returned, pending;
+        MarkRegion(Region::FallbackExit, 0);
         a.L(fallbackExit_);
         a.cmp(ecx, static_cast<uint32_t>(JitStatus::Pending) + 1);
         a.je(pending);
@@ -1162,16 +1598,15 @@ void BlockEmitter::Finish() {
         a.L(pending);
         ExitPending();
     }
-    inCold_ = true;
-    for (uint32_t i = 0; i < coldCount_; ++i) cold_[i].run(cold_[i].storage, *this);
-    inCold_ = false;
     for (DynCache& c : caches_) {  // a probe whose miss path was never emitted (its caller decided against the dispatcher)
         if (!c.probed || c.missEmitted) continue;
         c.missEmitted = true;
+        MarkRegion(Region::Miss, 0);
         a.L(c.miss);
         a.lea(rdx, a.ptr[a.rip + c.slots]);
         JmpAbs(g_shared.exitSlot);
     }
+    MarkRegion(Region::Stub, 0);
     for (uint32_t i = 0; i < exitCount_; ++i) {  // each slot's unlinked stub (and far fallback if >2 GiB)
         a.L(exits_[i].stub);
         a.mov(eax, exits_[i].pc);
@@ -1182,28 +1617,38 @@ void BlockEmitter::Finish() {
             a.jmp(a.ptr[a.rip + exits_[i].slot]);
         }
     }
-    codeBytes_ = a.getSize();
-    a.align(8);
-    for (uint32_t i = 0; i < exitCount_; ++i) {  // the slots (data), filled in below
+    farBytes_ = a.getSize() - layout_.farStart;
+    // --- the data, written at run time (the dispatcher's links, the call sites' cells, the stale cell's count) ---
+    a.SetLimit(layout_.dataLimit);
+    a.setSize(layout_.dataStart);
+    for (uint32_t i = 0; i < exitCount_; ++i) {  // the slots, filled in below
         a.L(exits_[i].slot);
         for (unsigned w = 0; w < sizeof(JitLink) / 8; ++w) a.dq(0);
     }
-    if (staleStub_) {  // the stale path's cell (data): filled in below
+    if (staleStub_) {  // the stale path's cell: filled in below
         a.L(staleCell_);
         for (unsigned w = 0; w < sizeof(StaleCell) / 8; ++w) a.dq(0);
-    }
-    for (DynCache& c : caches_) {  // the inline caches' entries
-        if (!c.probed) continue;
-        a.L(c.slots);
-        for (unsigned w = 0; w < kCacheEntries[&c - caches_] * sizeof(JitLink) / 8; ++w) a.dq(0);
     }
     for (uint32_t i = 0; i < cellCount_; ++i) {  // the call sites' cells: no key, no record, kCellWays entries each
         a.L(cells_[i]);
         for (uint32_t w = 0; w < kCellWays; ++w) {
             a.dq(JitTargetCell::kNoKey);
             a.dq(0);
+            a.dq(0);
+            a.dq(0);
         }
     }
+    a.L(epochRecord_);  // the epoch tests' immediates (Block::jitEpoch): their count, then their addresses, filled in below
+    a.dq(epochSiteCount_);
+    for (uint32_t i = 0; i < epochSiteCount_; ++i) a.dq(0);
+    EmitConsts();  // the float code's constants (BlockEmitter::Const128): read only, 16-byte aligned
+    for (DynCache& c : caches_) {  // the inline caches' entries, one line each (a probe reads an entry's key and target)
+        if (!c.probed) continue;
+        a.align(64);
+        a.L(c.slots);
+        for (unsigned w = 0; w < kCacheEntries[&c - caches_] * sizeof(JitLink) / 8; ++w) a.dq(0);
+    }
+    dataBytes_ = a.getSize() - layout_.dataStart;
     a.ready();
     if (staleStub_) {
         StaleCell* const cell = reinterpret_cast<StaleCell*>(const_cast<uint8_t*>(staleCell_.getAddress()));
@@ -1215,6 +1660,8 @@ void BlockEmitter::Finish() {
         cell->stubbed = 0;
     }
     uint8_t* const codeBase = const_cast<uint8_t*>(a.getCode());
+    uint64_t* const record = reinterpret_cast<uint64_t*>(const_cast<uint8_t*>(epochRecord_.getAddress()));
+    for (uint32_t i = 0; i < epochSiteCount_; ++i) record[1 + i] = reinterpret_cast<uintptr_t>(codeBase + epochSites_[i]);
     for (uint32_t i = 0; i < exitCount_; ++i) {
         JitLink* const slot = reinterpret_cast<JitLink*>(const_cast<uint8_t*>(exits_[i].slot.getAddress()));
         slot->target = slot->unlinked = exits_[i].stub.getAddress();
@@ -1223,7 +1670,10 @@ void BlockEmitter::Finish() {
         slot->to = nullptr;
         slot->key = JitLink::kNoKey;
         slot->group = 0;
-        if (exits_[i].patchOffset != Exit::kNoPatch && codeBase[exits_[i].patchOffset] == 0xE9u) {
+        const uint32_t at = exits_[i].patchOffset;
+        const bool patchable = at != Exit::kNoPatch &&
+                               (exits_[i].conditional ? codeBase[at - 1] == 0x0Fu && (codeBase[at] & 0xF0u) == 0x80u : codeBase[at] == 0xE9u);
+        if (patchable) {
             slot->patchSite = codeBase + exits_[i].patchOffset;
             slot->farTramp = exits_[i].far.getAddress();
         } else {
@@ -1254,6 +1704,27 @@ void BlockEmitter::Finish() {
 struct JitCodeCache {
     JitExecMemory::Arena arena;
     uint64_t compiled = 0;
+    // The chunk being filled (null: none yet), in three parts each filled upwards (BlockLayout): hot code [0, hotEnd), far
+    // code [hotEnd, farEnd) (stale stubs too), data [farEnd, size). A block whose parts do not all fit starts a new chunk; the
+    // room left in the old one is not used again.
+    static constexpr size_t kChunk = JitExecMemory::Arena::kDefaultChunkBytes;
+    static constexpr size_t kHotEnd = kChunk / 32 * 13, kFarEnd = kChunk / 32 * 23;
+    uint8_t* chunk = nullptr;
+    size_t hot = 0, far = 0, data = 0;
+    size_t used = 0;  // bytes of all parts of all blocks and stubs (the code limit's measure)
+    // Room for hotBytes, farBytes and dataBytes in the parts of the chunk being filled, or a new chunk; false when no memory.
+    bool Room(size_t hotBytes, size_t farBytes, size_t dataBytes) {
+        if (chunk != nullptr && kHotEnd - hot >= hotBytes && kFarEnd - far >= farBytes && kChunk - data >= dataBytes) return true;
+        if (hotBytes > kHotEnd || farBytes > kFarEnd - kHotEnd || dataBytes > kChunk - kFarEnd) return false;
+        void* const fresh = arena.Allocate(kChunk, 4096);
+        if (fresh == nullptr) return false;
+        chunk = static_cast<uint8_t*>(fresh);
+        hot = 0;
+        far = kHotEnd;
+        data = kFarEnd;
+        SyncUnwind();
+        return true;
+    }
 #if defined(__linux__) && defined(__x86_64__)
     std::vector<std::unique_ptr<x64::EhFrameRecord>> ehFrames;
     void SyncUnwind() {
@@ -1287,6 +1758,13 @@ void EmitOps(BlockEmitter& e) {
             continue;
         }
         e.index = i;
+        e.MarkRegion(BlockEmitter::Region::Op, i);
+        if (diag::ProbeAt(b.pcs[i])) {  // BRAWL_JIT_PROBE: log the state before this op
+            e.FlushAllGprs();
+            e.StorePc(i);
+            e.a.lea(rax, e.a.ptr[kCtxBase - kCtxBias]);
+            e.CallHelper(&diag::ProbeHit, rax, e.PairedMask());
+        }
         const uint32_t fallbacksBefore = e.FallbackCount();
         uint32_t used = 0;
         if (kind == K::Generic && GenericStatsOn()) {  // the execution count of this word's (primary opcode, xo)
@@ -1297,14 +1775,16 @@ void EmitOps(BlockEmitter& e) {
         if (o.forced[static_cast<unsigned>(kind)] || kind == K::Generic) {
             e.FlushAllGprs();
         } else if (o.group[static_cast<unsigned>(kind)] == Group::Fp) {
-            // FP ops never read/write GPRs, so ebp stays live across them; volatile r8-r11 are flushed in case of slow paths.
-            e.FlushVolatileGprs();
+            // FP ops never read/write GPRs and keep both caches: their slow paths store and reload snapshots, and a helper
+            // call in the main path flushes the volatile slots itself (jit_x64_fp.cpp).
         } else if (o.group[static_cast<unsigned>(kind)] == Group::Branch) {
             // Bc and fused compare+bc preserve the GPR cache on fall-through and flush dirty regs on their taken paths;
-            // all other branches/calls flush before running.
+            // all other branches/calls flush before running. The FPR cache's dirty slots are stored before any branch
+            // (the clean ones stay for the fall-through path).
             const bool keepGprs = kind == K::Bc || kind == K::CmpwiBc || kind == K::CmplwiBc || kind == K::CmpwBc ||
                                   kind == K::CmplwBc || kind == K::RlwinmRcBc;
             if (!keepGprs) e.FlushAllGprs();
+            else e.FlushDirtyFprs();
         }
         if (!o.forced[static_cast<unsigned>(kind)]) {
             if (kind == K::Generic) used = EmitGeneric(e, i);  // the instructions with no kind of their own
@@ -1327,6 +1807,7 @@ void EmitOps(BlockEmitter& e) {
         i += used;
     }
     // the code after the last op goes on at End's target
+    e.MarkRegion(BlockEmitter::Region::End, b.count);
     e.FlushAllGprs();
     e.index = b.count;
     e.ExitLinked(b.ops[b.count].imm);
@@ -1345,7 +1826,7 @@ void DestroyCache(JitCodeCache* cache) {
     delete cache;
 }
 
-size_t CodeBytes(const JitCodeCache& cache) { return cache.arena.BytesUsed(); }
+size_t CodeBytes(const JitCodeCache& cache) { return cache.used; }
 
 bool CompileBlock(JitCodeCache& cache, Block& b);
 
@@ -1364,30 +1845,49 @@ bool CompileBlock(JitCodeCache& cache, Block& b) {
     // The block's validity test reads the marks through the window base: they must be where the interpreter reads them.
     if (BrawlDirtyMemory::leanBlocks != MemoryInline::g_leanBase + MemoryInline::kLeanDirtyOffset) return false;
 #endif
-    size_t reserve = 2048 + static_cast<size_t>(b.count) * kMaxBytesPerOp;
-    for (int attempt = 0; attempt < 2; ++attempt, reserve *= 8) {
-        // A block starts on a cache line of its own: the link slots and cache entries at the end of the block before it are
-        // written at run time (Link), and a store into a line that is executing makes the core flush its pipeline (~50 ns).
-        void* const memory = cache.arena.Allocate(reserve, 64);
-        if (memory == nullptr) break;
+    // Room asked of each part: a worst case from the op count (kMaxBytesPerOp covers an op's main path and its cold code), and
+    // for the data every slot, cell and cache a block can have. A part that outgrows its room throws (JitAsm's limit); the block
+    // is then emitted again in a new chunk, where every part has all its room.
+    const size_t code = 256 + static_cast<size_t>(b.count) * kMaxBytesPerOp;
+    const size_t data = 64 + 8 * (1 + BlockEmitter::kMaxEpochSites) + BlockEmitter::kMaxExits * sizeof(JitLink) + sizeof(StaleCell) +
+                        BlockEmitter::kMaxCells * kCellWays * sizeof(JitTargetCell) +
+                        (BlockEmitter::kCacheEntries[0] + BlockEmitter::kCacheEntries[1]) * sizeof(JitLink) + 64 * BlockEmitter::kCaches +
+                        16 * (BlockEmitter::kMaxConsts + 1);  // the float constants (Const128), 16-byte aligned
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const bool fresh = attempt != 0;
+        if (fresh) cache.chunk = nullptr;  // a new chunk: the parts of the old one were too small for this block
+        if (!cache.Room(code, code, data)) break;
+        uint8_t* const memory = cache.chunk + cache.hot;
+        const BlockLayout layout{JitCodeCache::kHotEnd - cache.hot, cache.far - cache.hot, JitCodeCache::kFarEnd - cache.hot,
+                                 cache.data - cache.hot, JitCodeCache::kChunk - cache.hot};
         bool tooBig = false;
         try {
-            BlockEmitter e(b, memory, reserve);
+            BlockEmitter e(b, memory, layout.dataLimit, layout);
             e.SetOwner(&cache);
+            if (!Opts().dumpDir.empty()) e.EnableRegions();
             e.EmitPrologue();
             EmitOps(e);
             e.Finish();
-            const size_t total = e.a.getSize();
-            cache.arena.Shrink(memory, reserve, total);
-            cache.SyncUnwind();
+            // The hot code of the next block starts on a 16-byte boundary (the fetch window of a jump to it).
+            cache.hot += (e.HotBytes() + 15) & ~size_t{15};
+            cache.far += (e.FarBytes() + 15) & ~size_t{15};
+            cache.data += (e.DataBytes() + 7) & ~size_t{7};
+            const size_t total = e.HotBytes() + e.FarBytes() + e.DataBytes();
+            cache.used += total;
             b.jitChecked = e.Checked();
+            b.jitLinked = e.Linked();
             b.jitEntry = e.Entry();
+            b.jitEpoch = e.EpochRecord();
             ++cache.compiled;
             Bump(g_counters.compiled);
+            diag::Add(diag::kJitCompiled);
             Bump(g_counters.codeBytes, total);
             Bump(g_counters.compiledOps, b.count);
-            PerfMapAdd(memory, e.CodeBytes(), "jit", b.start);
-            DumpBlock(b, memory, e.CodeBytes());
+            uint8_t* const farAt = memory + layout.farStart;
+            PerfMapAdd(memory, e.HotBytes(), "jit", b.start);
+            PerfMapAdd(farAt, e.FarBytes(), "jit", b.start);
+            DumpBlock(b, memory, e.HotBytes());
+            DumpBlockTable(e, memory, farAt);
             if (Opts().stats && (g_counters.compiled.load(std::memory_order_relaxed) & 0x3FFF) == 0) LogStats("running");
             return true;
         } catch (const Xbyak::Error& error) {
@@ -1397,10 +1897,10 @@ bool CompileBlock(JitCodeCache& cache, Block& b) {
             std::fprintf(stderr, "jit: block %08X not compiled: out of %s\n", b.start, error.what);
         } catch (...) {
         }
-        cache.arena.Shrink(memory, reserve, 0);
-        if (!tooBig) break;
+        if (!tooBig || fresh) break;
     }
     Bump(g_counters.compileFailed);
+    diag::Add(diag::kJitCompileFailed);
     return false;
 }
 
@@ -1415,28 +1915,28 @@ void JumpTo(Xbyak::CodeGenerator& g, const void* target) {
     g.jmp(rax);
 }
 
-// The stale stub of a block (see StaleCell): epoch == markEpoch, then each guest word of the block compared in place with
-// the word the block was decoded from (all its segments; the words as guest memory holds them), then the block's entry; any
-// difference leaves through the plain stale exit. Null when it cannot be made.
+// The stale stub of a block (see StaleCell): each guest word of the block compared in place with the word the block was decoded
+// from (all its segments; the words as guest memory holds them), then the block's entry; any difference leaves through the plain
+// stale exit. Null when it cannot be made. Only a failed mark test leads here, and only with the block's epoch current: a linked
+// entry is reached only then (Block::jitLinked), and the full entry sends a stale epoch to the plain exit.
 const void* MakeStaleStub(JitCodeCache& cache, const StaleCell& cell) {
     const Block& b = *cell.block;
     uint32_t words = 0;
     for (uint32_t s = 0; s < b.segments; ++s) words += b.segment[s].count;
     const size_t reserve = 256 + 24u * static_cast<size_t>(words);
-    void* const memory = cache.arena.Allocate(reserve, 64);
-    if (memory == nullptr) return nullptr;
+    if (!cache.Room(0, reserve, 0)) return nullptr;
+    uint8_t* const memory = cache.chunk + cache.far;  // far code: it is entered only after a failed mark test
     // BRAWL_JIT_STALE_FAULT=<n> (a test aid: the stub is wrong on purpose so that the tests can show they notice): 1 compares no
-    // words, 2 skips the epoch test, 3 compares the first segment only, 4 skips the first word of each segment, 5 never enters.
+    // words, 3 compares the first segment only, 4 skips the first word of each segment, 5 never enters (2 was an epoch test the
+    // stub no longer has).
     const char* const faultText = std::getenv("BRAWL_JIT_STALE_FAULT");
     const int fault = faultText != nullptr ? std::atoi(faultText) : 0;
     try {
         Xbyak::CodeGenerator g(reserve, memory);
         Xbyak::Label leave;
-        if (fault != 2) {
-            g.mov(rcx, reinterpret_cast<uint64_t>(&b.epoch));
-            g.mov(eax, g.dword[rcx]);
-            g.cmp(eax, g.dword[kEpochCell]);
-            g.jne(leave, Xbyak::CodeGenerator::T_NEAR);
+        if (diag::ChurnOn()) {  // BRAWL_JIT_CHURN
+            g.mov(rax, reinterpret_cast<uint64_t>(diag::CounterCell(diag::kJitStubRuns)));
+            g.inc(g.qword[rax]);
         }
         const uint32_t* raw = b.words + b.count;  // BlockCache::Holds compares the memory against these
         for (uint32_t s = 0; s < b.segments; ++s)
@@ -1448,13 +1948,18 @@ const void* MakeStaleStub(JitCodeCache& cache, const StaleCell& cell) {
             }
         if (fault != 5) JumpTo(g, b.jitEntry);
         g.L(leave);
+        if (diag::ChurnOn()) {
+            g.mov(rax, reinterpret_cast<uint64_t>(diag::CounterCell(diag::kJitStubLeaves)));
+            g.inc(g.qword[rax]);
+        }
         JumpTo(g, cell.plain);
         g.ready();
-        cache.arena.Shrink(memory, reserve, g.getSize());
-        cache.SyncUnwind();
+        PerfMapAdd(memory, g.getSize(), "jit_stale", b.start);
+        DumpCode("jit_stale", memory, g.getSize(), b.start);
+        cache.far += (g.getSize() + 15) & ~size_t{15};
+        cache.used += g.getSize();
         return memory;
     } catch (...) {
-        cache.arena.Shrink(memory, reserve, 0);
         return nullptr;
     }
 }
@@ -1491,8 +1996,8 @@ void PatchDirectJump(JitLink& slot, const void* dest) {
 // block's start: the dispatcher got here with `to` found for exactly that pc.
 void Aim(JitLink& slot, Block& to) {
     Unlink(slot);
-    slot.target = to.jitChecked;
-    PatchDirectJump(slot, to.jitChecked);
+    slot.target = to.jitLinked;
+    PatchDirectJump(slot, to.jitLinked);
     slot.to = &to;
     slot.key = to.start;
     slot.next = to.jitIncoming;
@@ -1505,20 +2010,23 @@ void Aim(JitLink& slot, Block& to) {
 // index from the pc), replacing what was there.
 void LinkCached(JitLink& head, Block& to) {
     JitLink& e = (&head)[(to.start >> 2) & (head.group - 1)];
-    if (e.to == &to && e.target == to.jitChecked && e.key == to.start) return;
+    if (e.to == &to && e.target == to.jitLinked && e.key == to.start) return;
+    if (diag::ChurnOn()) diag::AddKey(diag::kTCacheLink, (uint64_t{e.key} << 32) | to.start);
     Aim(e, to);
     Bump(g_counters.links);
+    diag::Add(diag::kJitLinks);
 }
 
 void Link(JitLink& slot, Block& to) {
-    if (to.jitChecked == nullptr) return;
+    if (to.jitLinked == nullptr) return;
     if (slot.group != 0) {
         LinkCached(slot, to);
         return;
     }
-    if (slot.to == &to && slot.target == to.jitChecked) return;
+    if (slot.to == &to && slot.target == to.jitLinked) return;
     Aim(slot, to);
     Bump(g_counters.links);
+    diag::Add(diag::kJitLinks);
 }
 
 void Retire(Block& b) {
@@ -1531,12 +2039,43 @@ void Retire(Block& b) {
         slot->prev = nullptr;
         slot->to = nullptr;
         slot = next;
+        diag::Add(diag::kJitRetireSlots);
     }
     b.jitIncoming = nullptr;
     Bump(g_counters.retires);
+    if (diag::ChurnOn()) {
+        diag::Add(diag::kJitRetires);
+        diag::AddKey(diag::kTRetire, b.start);
+    }
 }
 
-JitBackend g_backend{CreateCache, DestroyCache, Compile, Enter, Link, Retire, CodeBytes, nullptr};
+// The slots aimed at b leave through their unlinked stubs (the dispatcher then finds b and refreshes it), staying on its list.
+void Suspend(Block& b) {
+    for (JitLink* slot = b.jitIncoming; slot != nullptr; slot = slot->next) {
+        slot->target = slot->unlinked;
+        PatchDirectJump(*slot, slot->unlinked);
+    }
+}
+
+// b's epoch into every epoch test of its code (an aligned 4-byte store each: the code may be on the stack, never running on
+// another thread).
+void SetEpoch(Block& b) {
+    const uint64_t* const record = static_cast<const uint64_t*>(b.jitEpoch);
+    if (record == nullptr || g_jitEpochFault == 4) return;  // 4: a test aid, the copies left as they were
+    for (uint64_t i = 0; i < record[0]; ++i)
+        __atomic_store_n(reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(record[1 + i])), b.epoch, __ATOMIC_RELAXED);
+}
+
+// The slots on b's list aimed at its linked entry again.
+void Resume(Block& b) {
+    if (b.jitLinked == nullptr) return;
+    for (JitLink* slot = b.jitIncoming; slot != nullptr; slot = slot->next) {
+        slot->target = b.jitLinked;
+        PatchDirectJump(*slot, b.jitLinked);
+    }
+}
+
+JitBackend g_backend{CreateCache, DestroyCache, Compile, Enter, Link, Retire, CodeBytes, nullptr, Suspend, Resume, SetEpoch};
 
 }  // namespace
 
@@ -1548,6 +2087,7 @@ const void* x64::InstallStaleStub(StaleCell* cell) noexcept {
             if (stub != nullptr) {
                 cell->target = stub;
                 Bump(x64::g_counters.staleStubs);
+                diag::Add(diag::kJitStaleStubs);
             } else {
                 cell->target = cell->plain;  // no stub: the stale path goes straight to the dispatcher from now on
                 Bump(x64::g_counters.staleStubFailures);
@@ -1557,6 +2097,24 @@ const void* x64::InstallStaleStub(StaleCell* cell) noexcept {
         cell->target = cell->plain;
     }
     return cell->target;
+}
+
+const void* x64::CellPromoteRoutine() { return g_shared.cellPromote; }
+
+bool x64::SubFramesPossible() {
+    const PatchedHooks& h = GetPatchedHooks();
+    return h.lowestRedirect != nullptr && h.pendingFast != nullptr && h.anyDirty != nullptr && h.sync != nullptr;
+}
+
+const void* JitFastCallFor(const JitCallTarget* t, bool tail) noexcept {
+    const x64::Shared& s = x64::g_shared;
+    if (!x64::kDirectCalls || t == nullptr || !s.ok) return nullptr;
+    if (!t->fastDirect) return s.callGuarded;
+    if (t->argMask != 0) return s.callArgs;
+    // a patched callee of a bctrl in a subcall frame (jit_subcall tests the guard byte again at every call); a bctr's tail call
+    // keeps lr in rbp across the call, which a subcall frame does not keep: the wrapper
+    if (!tail && t->patchedByte != nullptr && *t->patchedByte != 0 && x64::SubFramesPossible()) return s.subCall;
+    return reinterpret_cast<const void*>(t->entry);
 }
 
 uint64_t JitX64KindOps(K kind, bool native) {
@@ -1569,7 +2127,7 @@ JitX64Stats JitX64GetStats() {
                        get(g_counters.retires), get(g_counters.enters), get(g_counters.cachesCreated),
                        get(g_counters.cachesDestroyed), get(g_counters.compiledOps), get(g_counters.compileNanos),
                        get(g_counters.cacheHits), get(g_counters.cacheMisses), get(g_counters.staleStubs),
-                       get(g_counters.staleStubFailures)};
+                       get(g_counters.staleStubFailures), get(g_counters.selfLoops)};
 }
 
 // The x86-64 backend, or null when the host does not run generated code, or guest memory is not the lean window with

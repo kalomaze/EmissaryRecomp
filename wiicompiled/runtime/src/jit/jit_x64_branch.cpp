@@ -2,24 +2,27 @@
 // API in jit_x64.h. Each kind does what RunOp does for it (and Exec where RunOp defers to it), with the same side effects in
 // the same order; what the decode or the compile can settle is settled here instead of at every execution.
 //
-//  Bc and the fused compare+bc kinds: native. BO is decoded here: only the ctr decrement and the tests it needs are emitted;
-//      taken goes to ExitLinked. A bc tests one CR field's value in memory as isa/ppc_isa_crv.h defines each bit (EmitJumpIfCrBit).
-//      A fused pair writes the compare's CR field, then branches on the host flags of the compare when the bc tests lt, gt or eq
-//      of the field just written (else it tests the CR bit in memory).
+//  Bc and the fused compare+bc kinds (and a compare or record form whose bc follows past followed b's, EmitCompareBranch):
+//      native. BO is decoded here: only the ctr decrement and the tests it needs are emitted; taken is a direct conditional link
+//      (ExitLinkedIf), every dirty GPR slot and the compare's field stored before it (EmitCondBranch). A bc tests one CR field's
+//      value in memory as isa/ppc_isa_crv.h defines each bit (CrBitTest). A pair branches on the host flags of the compare's
+//      field value when the bc tests lt, gt or eq of the field just written (else it tests the CR bit in memory).
 //  B:  native when its target is no translated function and no code variant can continue there (ExitLinked); a tail call
 //      to a translated function is JitThinTail (JitTailOp in the rollback loop frame); with code variants possible, or the
 //      registry not yet published, the fallback (RunOp asks ContinuationAt on every execution, which a block cannot settle).
 //  Bl: native when the site was resolved at decode, the target is untranslated and runnable: lr and the loop-frame test
 //      inline, then ExitLinked. A translated target with a raw dispatch record: lr, pc and the loop-frame test inline (the
-//      loop frame goes the general way), the callee's float arguments tested in line, then JitThinCall with the target's
-//      JitCallTarget (everything Call and TryDispatchRawCpuTarget look up, settled at compile time), and a validity test.
-//      Otherwise JitCallOp (Call) and a validity test when the call was made.
+//      loop frame goes the general way), the callee's float arguments tested in line, then a direct call of the entry when it
+//      needs no guard, else JitThinCall with the target's JitCallTarget (everything Call and TryDispatchRawCpuTarget look up,
+//      settled at compile time), and a validity test. A patched target (guard byte set at compile time) is called in a subcall
+//      frame linked to its block while it stays patched (EmitSubFrameBl). Otherwise JitCallOp (Call) and a validity test when the
+//      call was made.
 //  Blr, Bclr: native; the frame's return normalises f1, anything else leaves through an inline cache.
-//  Bctr: an inline cache probe (untranslated targets only ever get in it); then a cell holding the last translated targets and
-//      their JitCallTargets: a hit is JitThinTail, a miss JitTailOpCached, which fills the cell; the fallback until the
-//      registry is published.
-//  Bctrl: a cell of its own: a hit is JitThinCall, a miss JitCallOpCached, which fills the cell; the interpret-here answer leaves
-//      through an inline cache.
+//  Bctr: the newest target of its cell, an inline cache probe (untranslated targets only ever get in it), the cell's other targets
+//      (translated targets: each with what JitFastCallFor says to call for it, as a tail call), a miss JitTailOpCached, which fills
+//      the cell; the fallback until the registry is published.
+//  Bctrl: a cell of its own, the same way: a hit calls what the entry says, a miss is JitCallOpCached, which fills the cell; the
+//      interpret-here answer leaves through an inline cache.
 #include "jit_x64.h"
 
 #include <cstddef>
@@ -36,170 +39,48 @@ constexpr uint32_t kReturnPending = 3;  // JitCallOp / JitTailOp: what values (p
 constexpr uint32_t kReturnFrame = 2;
 constexpr uint32_t kJumpHere = 4;
 
-// What a fused compare left in the flags, to branch on them instead of reading the CR field back.
+// What a fused compare compares: r[a] against an immediate, against r[b], or the result a record form wrote to r[a] against 0.
 struct Compare {
-    enum Source : uint8_t { Imm, Reg, Test } source;  // eax against an immediate | against a guest register | against 0 (a record form's result)
+    enum Source : uint8_t { Imm, Reg, Test } source;
     bool isSigned;
     uint32_t field;
     int32_t imm;
-    uint32_t reg;
+    uint32_t a, b;
+    bool nonNegative = false;  // Test: the result is known not negative (its field value is the zero-extended result)
 };
 
-void EmitCompareFlags(BlockEmitter& e, const Compare& c) {
+// Calls f with guest register r as an operand: its cache register (loaded into the cache first when a later op reads it), else its
+// word in memory. In cold code (no cache) always the word, which the code there has flushed.
+template <typename F>
+void WithGpr(BlockEmitter& e, uint32_t r, F&& f) {
+    if (e.WantCacheGpr(r)) f(e.ReadGpr(r));
+    else f(e.Gpr(r));
+}
+
+// rax = the compare's field value as PpcCrvCompare makes it (no SO: BlockEmitter::JumpIfSo). With `flags` the host flags are those of
+// the value against 0, whose signed conditions (l, g, e) are the compare's for both signednesses: the extended operands differ by
+// less than 2^33 in magnitude. `result` (Test): the host register holding the record form's result, or null to read r[a].
+void EmitCompareValue(BlockEmitter& e, const Compare& c, bool flags, const Xbyak::Reg32* result) {
+    CodeGenerator& a = e.a;
+    const auto load = [&](const Xbyak::Operand& op) {
+        if (c.isSigned) a.movsxd(rax, op);
+        else a.mov(eax, op);
+    };
     switch (c.source) {
     case Compare::Imm:
-        if (c.imm == 0) e.a.test(eax, eax);  // the same flags as cmp eax, 0
-        else e.a.cmp(eax, static_cast<uint32_t>(c.imm));
+        WithGpr(e, c.a, load);
+        e.CrDiffImm(c.isSigned, static_cast<uint32_t>(c.imm), flags);
         break;
     case Compare::Reg:
-        if (e.WantCacheGpr(c.reg)) e.a.cmp(eax, e.ReadGpr(c.reg));
-        else e.a.cmp(eax, e.Gpr(c.reg));
+        WithGpr(e, c.a, load);
+        e.CrDiffGpr(c.isSigned, c.b);
         break;
-    case Compare::Test: e.a.test(eax, eax); break;
-    }
-}
-
-// The compare's CR field value in rax, as PpcCrvCompare makes it (before XER[SO]: BlockEmitter::CrStore), from the first operand
-// in eax. With `flags` the host flags are those of the 64-bit difference, whose signed conditions (l, g, e) are the compare's for
-// both signednesses: the extended operands differ by less than 2^33 in magnitude.
-void EmitCompareValue(BlockEmitter& e, const Compare& c, bool flags) {
-    if (c.isSigned) e.a.movsxd(rax, eax);
-    switch (c.source) {
-    case Compare::Imm: e.CrDiffImm(c.isSigned, static_cast<uint32_t>(c.imm), flags); break;
-    case Compare::Reg: e.CrDiffGpr(c.isSigned, c.reg); break;
     case Compare::Test:
-        if (flags) e.a.test(rax, rax);
+        if (result != nullptr) a.movsxd(rax, *result);
+        else WithGpr(e, c.a, [&](const Xbyak::Operand& op) { a.movsxd(rax, op); });
+        if (flags) a.test(rax, rax);
         break;
     }
-}
-
-// Jumps to `target` when CR bit `bi` (as BI numbers it: field bi >> 2, then 0 lt, 1 gt, 2 eq, 3 so) of the field in memory is
-// `want`, by the field value's own tests (isa/ppc_isa_crv.h): lt is bit 62, gt is positive, eq is a zero low word, so is bit 59
-// differing from bit 62. Clobbers the flags, and rcx and rdx for so; eax is kept.
-void EmitJumpIfCrBit(BlockEmitter& e, uint32_t bi, bool want, Xbyak::Label& target, CodeGenerator::LabelType type) {
-    CodeGenerator& a = e.a;
-    const Xbyak::Address field = e.Crv(bi >> 2);
-    switch (bi & 3u) {
-    case 0:
-        a.test(a.byte[field.getRegExp() + 7], 0x40);  // bit 62: bit 6 of the top byte
-        if (want) a.jnz(target, type);
-        else a.jz(target, type);
-        break;
-    case 1:
-        a.cmp(field, 0);
-        if (want) a.jg(target, type);
-        else a.jle(target, type);
-        break;
-    case 2:
-        a.cmp(a.dword[field.getRegExp()], 0);
-        if (want) a.je(target, type);
-        else a.jne(target, type);
-        break;
-    default:
-        a.mov(rcx, field);
-        a.mov(rdx, rcx);
-        a.shr(rdx, 3);  // bit 59 of rdx is bit 62 of the field
-        a.xor_(rcx, rdx);
-        a.bt(rcx, 59);
-        if (want) a.jc(target, type);
-        else a.jnc(target, type);
-        break;
-    }
-}
-
-// Jumps to `taken` when CR bit `bit` (0 lt, 1 gt, 2 eq) of the compare in the flags is `want`.
-void EmitJumpIfBit(BlockEmitter& e, const Compare& c, uint32_t bit, bool want, Xbyak::Label& taken) {
-    CodeGenerator& a = e.a;
-    const auto T = CodeGenerator::T_NEAR;
-    if (want) {
-        switch (bit) {
-        case 0: c.isSigned ? a.jl(taken, T) : a.jb(taken, T); break;
-        case 1: c.isSigned ? a.jg(taken, T) : a.ja(taken, T); break;
-        default: a.je(taken, T); break;
-        }
-    } else {
-        switch (bit) {
-        case 0: c.isSigned ? a.jge(taken, T) : a.jae(taken, T); break;
-        case 1: c.isSigned ? a.jle(taken, T) : a.jbe(taken, T); break;
-        default: a.jne(taken, T); break;
-        }
-    }
-}
-
-// The taken path of a bc: leave for the target. When the bc's compare did not write its CR field (`cmp` and `dead`: nothing
-// in the block reads the field after it, BlockEmitter::CrDead), the field is written here, from the compare made again (eax still
-// holds its first operand), because the block is left with the condition register visible.
-void EmitTaken(BlockEmitter& e, uint32_t target, const Compare* cmp, bool dead, const BlockEmitter::GprSnapshot& snap) {
-    e.EmitFlushSnapshot(snap);
-    if (dead) {
-        EmitCompareValue(e, *cmp, false);
-        e.CrStore(cmp->field);
-    }
-    e.ExitLinked(target);
-}
-
-// A bc (op `bc`, already past the compare of a fused pair): BranchTaken's ctr decrement and tests, then the exit to the
-// target when taken; falls through when not. `dead`: the compare did not write its field (see EmitTaken; `cmp` is then the
-// fused compare, whose flags a test of its own field uses, and eax still holds its first operand); the taken path lies out of
-// line, where the field is written, and the tests branch to it. Without `dead` the tests read the field in memory.
-void EmitBc(BlockEmitter& e, const Op& bc, const Compare* cmp, bool dead) {
-    CodeGenerator& a = e.a;
-    const uint32_t bo = bc.d, bi = bc.a;
-    const auto T = CodeGenerator::T_SHORT;
-    const bool useCtr = (bo & 0x04u) == 0, useCond = (bo & 0x10u) == 0;
-    const bool onFlags = dead && useCond && (bi >> 2) == cmp->field && (bi & 3u) != 3u;
-    const bool want = (bo & 0x08u) != 0;
-    if (!useCtr && !useCond) {
-        const BlockEmitter::GprSnapshot snap = e.SnapshotGprs();
-        EmitTaken(e, bc.imm, cmp, dead, snap);
-        return;
-    }
-    if (dead) {
-        // Pre-warm the second compare operand before any conditional branch (useCtr) so the GPR cache state
-        // is identical on both the ctr-fail skip path and the compare fall-through path.
-        if (onFlags && cmp->source == Compare::Reg && e.WantCacheGpr(cmp->reg)) (void)e.ReadGpr(cmp->reg);
-        Xbyak::Label& taken = e.NewLabel();
-        Xbyak::Label skip;
-        if (useCtr) {  // --ctr, always, even when the condition then fails; ZF is the new ctr == 0
-            a.sub(e.Ctr(), 1);
-            if (useCond) {
-                if ((bo & 0x02u) != 0) a.jnz(skip, T);
-                else a.jz(skip, T);
-            } else if ((bo & 0x02u) != 0) {
-                a.jz(taken, CodeGenerator::T_NEAR);
-            } else {
-                a.jnz(taken, CodeGenerator::T_NEAR);
-            }
-        }
-        if (useCond) {
-            if (onFlags) {
-                EmitCompareFlags(e, *cmp);
-                EmitJumpIfBit(e, *cmp, bi & 3u, want, taken);
-            } else {
-                EmitJumpIfCrBit(e, bi, want, taken, CodeGenerator::T_NEAR);
-            }
-        }
-        a.L(skip);
-        const BlockEmitter::GprSnapshot snap = e.SnapshotGprs();
-        const Compare c = *cmp;
-        const uint32_t target = bc.imm;
-        e.Cold([&taken, c, target, snap](BlockEmitter& cold) {
-            cold.a.L(taken);
-            EmitTaken(cold, target, &c, true, snap);
-        });
-        return;
-    }
-    const BlockEmitter::GprSnapshot snap = e.SnapshotGprs();
-    Xbyak::Label skip;
-    if (useCtr) {  // --ctr, always, even when the condition then fails; ZF is the new ctr == 0
-        a.sub(e.Ctr(), 1);
-        if ((bo & 0x02u) != 0) a.jnz(skip, T);
-        else a.jz(skip, T);
-    }
-    if (useCond) EmitJumpIfCrBit(e, bi, !want, skip, T);
-    e.EmitFlushSnapshot(snap);
-    e.ExitLinked(bc.imm);
-    a.L(skip);
 }
 
 // BRAWL_JIT_NO_FUSED_FLAGS=1 (a test switch): a fused pair whose field is live writes the field first and then branches on the
@@ -209,107 +90,203 @@ bool FusedOnFlagsEnabled() {
     return on;
 }
 
-// A fused compare and bc whose CR field is live and which the bc tests by a bit of the compare's result (not SO): the compare
-// is made once (as the field's 64-bit value, whose flags are the compare's), the branch is on those flags, and the value is stored
-// on both paths. eax holds the compare's first operand. The store (CrStore) comes after the branch, so the jump comes straight
-// after the compare and neither path has to make it again. A bc that also decrements ctr does that first; when the ctr test alone
-// decides "not taken" the compare is made on that path too (cold).
-void EmitBcLive(BlockEmitter& e, const Op& bc, const Compare& c) {
+// The condition "CR bit `bit` (0 lt, 1 gt, 2 eq) of the compare is `want`" on the host flags of a compare of that signedness.
+Cc CompareCc(bool isSigned, uint32_t bit, bool want) {
+    const Cc c = bit == 0 ? (isSigned ? Cc::L : Cc::B) : bit == 1 ? (isSigned ? Cc::G : Cc::A) : Cc::E;
+    return want ? c : Invert(c);
+}
+
+// Sets the host flags for CR bit `bi` (as BI numbers it: field bi >> 2, then 0 lt, 1 gt, 2 eq, 3 so) of the field in memory and
+// answers the condition for "the bit is `want`", by the field value's own tests (isa/ppc_isa_crv.h): lt is bit 62, gt is positive,
+// eq is a zero low word, so is bit 59 differing from bit 62. Clobbers rcx and rdx for so; eax is kept.
+Cc CrBitTest(BlockEmitter& e, uint32_t bi, bool want) {
     CodeGenerator& a = e.a;
-    const uint32_t bo = bc.d, bi = bc.a;
-    const bool useCtr = (bo & 0x04u) == 0;
+    const Xbyak::Address field = e.Crv(bi >> 2);
+    switch (bi & 3u) {
+    case 0:
+        a.test(a.byte[field.getRegExp() + 7], 0x40);  // bit 62: bit 6 of the top byte
+        return want ? Cc::NE : Cc::E;
+    case 1:
+        a.cmp(field, 0);
+        return want ? Cc::G : Cc::LE;
+    case 2:
+        a.cmp(a.dword[field.getRegExp()], 0);
+        return want ? Cc::E : Cc::NE;
+    default:
+        a.mov(rcx, field);
+        a.mov(rdx, rcx);
+        a.shr(rdx, 3);  // bit 59 of rdx is bit 62 of the field
+        a.xor_(rcx, rdx);
+        a.bt(rcx, 59);
+        return want ? Cc::B : Cc::AE;
+    }
+}
+
+// Jumps to `target` when CR bit `bi` of the field in memory is `want` (CrBitTest).
+void EmitJumpIfCrBit(BlockEmitter& e, uint32_t bi, bool want, Xbyak::Label& target, CodeGenerator::LabelType type) {
+    Jcc(e.a, CrBitTest(e, bi, want), target, type);
+}
+
+// A bc, op `bci` (for a fused pair `cmp` is its compare, an op before it, whose code comes first): BranchTaken's ctr decrement and tests,
+// the exit to the target when taken; falls through when not. `result`, `resultFlags`: a record form's result register (Test), and
+// whether the host flags are already those of the result against 0.
+//
+// The taken path leaves the block, so on it every dirty GPR slot is stored and the compare's field is written (the block leaves with
+// the condition register visible). Both happen before the branch, on both paths, so that the taken path is nothing but the jump: a
+// direct conditional link to the target block (ExitLinkedIf). A dirty slot would be stored once anyway, at the block's next flush,
+// unless a later op of the block rewrites it first; and a dead field (CrDead) costs its value and one store on the fall-through
+// path. Measured against keeping that work out of line on the taken path (a jump to cold code, then the jump to the target), this
+// is fewer instructions and taken branches for the game's branches, which are taken about half the time.
+void EmitCondBranch(BlockEmitter& e, uint32_t bci, const Compare* cmp, const Xbyak::Reg32* result, bool resultFlags) {
+    CodeGenerator& a = e.a;
+    const Op& bc = e.block.ops[bci];
+    const uint32_t bo = bc.d, bi = bc.a, target = bc.imm;
+    const bool useCtr = (bo & 0x04u) == 0, useCond = (bo & 0x10u) == 0;
     const bool want = (bo & 0x08u) != 0;
-    if (useCtr && c.source == Compare::Reg) e.FlushGpr(c.reg);  // ctrFail cold path reads Gpr(c.reg) from memory
-    const BlockEmitter::GprSnapshot snap = e.SnapshotGprs();
-    Xbyak::Label& taken = e.NewLabel();
-    Xbyak::Label* ctrFail = nullptr;
-    Xbyak::Label& join = e.NewLabel();
-    if (useCtr) {  // --ctr, always; ZF is the new ctr == 0
-        ctrFail = &e.NewLabel();
+    bool onFlags = false;
+    // Only moves when a record form's flags are live here: the FPR cache's pending forms (an `or` / `and`) were stored before
+    // the record form (EmitOps for the fused kinds, EmitCompareBranch for the pairs).
+    e.FlushDirtyGprs();
+    Xbyak::Reg64 value = rax;  // what holds the field value
+    if (cmp != nullptr) {
+        const bool readsOwn = useCond && (bi >> 2) == cmp->field;
+        onFlags = readsOwn && (bi & 3u) != 3u;  // a test of its SO bit reads the field in memory
+        const bool dead = e.CrDead(bci, cmp->field) && onFlags == readsOwn;
+        if (!dead && onFlags && !FusedOnFlagsEnabled()) onFlags = false;
+        if (dead) BlockEmitter::NoteCr(BlockEmitter::CrEvent::FusedFlagsOnly);
+        else if (onFlags) BlockEmitter::NoteCr(BlockEmitter::CrEvent::FusedLive);
+        const bool flags = onFlags && !useCtr && !(cmp->source == Compare::Test && resultFlags);
+        if (cmp->source == Compare::Test && cmp->nonNegative && result != nullptr) {
+            value = result->cvt64();  // zero-extended: the field value itself
+            if (flags) a.test(*result, *result);
+        } else {
+            EmitCompareValue(e, *cmp, flags, result);
+        }
+        e.CrStore(cmp->field, value);
+    }
+    if (!useCtr && !useCond) {  // always taken
+        e.ExitLinked(target);
+        return;
+    }
+    Xbyak::Label skip;
+    Cc taken = Cc::NE;
+    if (useCtr) {  // --ctr, always, even when the condition then fails; ZF is the new ctr == 0
         a.sub(e.Ctr(), 1);
-        if ((bo & 0x02u) != 0) a.jnz(*ctrFail, CodeGenerator::T_NEAR);
-        else a.jz(*ctrFail, CodeGenerator::T_NEAR);
+        const Cc ctrOk = (bo & 0x02u) != 0 ? Cc::E : Cc::NE;
+        if (useCond) Jcc(a, Invert(ctrOk), skip, CodeGenerator::T_SHORT);
+        else taken = ctrOk;
     }
-    EmitCompareValue(e, c, true);
-    Compare onFlags = c;
-    onFlags.isSigned = true;  // the flags are those of the 64-bit difference
-    EmitJumpIfBit(e, onFlags, bi & 3u, want, taken);
-    e.CrStore(c.field);  // not taken
-    a.L(join);
-    const Compare cmp = c;
-    const uint32_t target = bc.imm;
-    e.Cold([&taken, cmp, target, snap](BlockEmitter& cold) {
-        cold.a.L(taken);
-        cold.EmitFlushSnapshot(snap);
-        cold.CrStore(cmp.field);
-        cold.ExitLinked(target);
-    });
-    if (ctrFail != nullptr) {
-        e.Cold([ctrFail, &join, cmp](BlockEmitter& cold) {
-            cold.a.L(*ctrFail);
-            EmitCompareValue(cold, cmp, false);
-            cold.CrStore(cmp.field);
-            cold.a.jmp(join, CodeGenerator::T_NEAR);
-        });
+    if (useCond) {
+        if (onFlags) {  // the flags of the field value (made again after the ctr test)
+            if (useCtr) a.test(value, value);
+            taken = CompareCc(true, bi & 3u, want);
+        } else {
+            taken = CrBitTest(e, bi, want);
+        }
     }
-    BlockEmitter::NoteCr(BlockEmitter::CrEvent::FusedLive);
+    e.ExitLinkedIf(taken, target);
+    a.L(skip);
+}
+
+// A record form's result (r[a] of RlwinmRc(Bc), AndiRc, AndisRc, AndRc, OrRc): written to r[a] and left in the answered host register
+// (r[a]'s cache register when a later op reads it, else eax); `flags`: the host flags are those of the result against 0. Fills c
+// (Test, cr0). Null for another kind (nothing emitted).
+const Xbyak::Reg32* EmitRecordResult(BlockEmitter& e, const Op& o, Compare& c, bool& flags) {
+    CodeGenerator& a = e.a;
+    uint32_t dst = 0;
+    flags = false;
+    bool nonNegative = false;
+    const Xbyak::Reg32* r = &eax;
+    switch (o.kind) {
+    case K::RlwinmRc:
+    case K::RlwinmRcBc: {  // r[a] = rotl(r[d], b) & mask
+        const uint32_t sh = o.b & 31u, mask = o.imm;
+        dst = o.a;
+        if (e.GprReadLater(o.a) && o.a == o.d) {
+            r = &e.ModifyGpr(o.a);
+            if (sh != 0) a.rol(*r, static_cast<uint8_t>(sh));
+        } else {
+            const auto rotate = [&](const Xbyak::Reg32& d) {
+                WithGpr(e, o.d, [&](const Xbyak::Operand& op) {
+                    if (sh != 0) a.rorx(d, op, static_cast<uint8_t>((32u - sh) & 31u));
+                    else a.mov(d, op);
+                });
+            };
+            if (e.GprReadLater(o.a)) {
+                if (e.WantCacheGpr(o.d)) (void)e.ReadGpr(o.d);
+                r = &e.WriteGpr(o.a, 1u << o.d);
+            }
+            rotate(*r);
+        }
+        if (mask != 0xFFFFFFFFu) {
+            a.and_(*r, mask);
+            flags = true;
+        }
+        nonNegative = (mask & 0x80000000u) == 0;
+        break;
+    }
+    case K::AndiRc:
+    case K::AndisRc:  // r[a] = r[d] & imm
+        dst = o.a;
+        if (e.GprReadLater(o.a)) {
+            if (o.a == o.d) {
+                r = &e.ModifyGpr(o.a);
+            } else {
+                if (e.WantCacheGpr(o.d)) (void)e.ReadGpr(o.d);
+                r = &e.WriteGpr(o.a, 1u << o.d);
+                WithGpr(e, o.d, [&](const Xbyak::Operand& op) { a.mov(*r, op); });
+            }
+        } else {
+            WithGpr(e, o.d, [&](const Xbyak::Operand& op) { a.mov(eax, op); });
+        }
+        a.and_(*r, o.imm);
+        flags = true;
+        nonNegative = (o.imm & 0x80000000u) == 0;
+        break;
+    case K::AndRc:
+    case K::OrRc: {  // r[a] = r[d] op r[b] (or. with d == b: mr.)
+        dst = o.a;
+        const bool isAnd = o.kind == K::AndRc;
+        if (e.GprReadLater(o.a)) {
+            if (e.WantCacheGpr(o.d)) (void)e.ReadGpr(o.d);
+            if (e.WantCacheGpr(o.b)) (void)e.ReadGpr(o.b, 1u << o.d);
+            r = (o.a == o.d || o.a == o.b) ? &e.ModifyGpr(o.a, (1u << o.d) | (1u << o.b)) : &e.WriteGpr(o.a, (1u << o.d) | (1u << o.b));
+        }
+        const uint32_t first = o.a == o.b ? o.b : o.d, second = o.a == o.b ? o.d : o.b;
+        if (!(e.GprReadLater(o.a) && o.a == first)) WithGpr(e, first, [&](const Xbyak::Operand& op) { a.mov(*r, op); });
+        if (second != first) {
+            WithGpr(e, second, [&](const Xbyak::Operand& op) {
+                if (isAnd) a.and_(*r, op);
+                else a.or_(*r, op);
+            });
+            flags = true;
+        }
+        break;
+    }
+    default:
+        return nullptr;
+    }
+    if (r == &eax) {
+        e.DropGpr(dst);
+        a.mov(e.Gpr(dst), eax);
+    }
+    c = Compare{Compare::Test, true, 0, 0, dst, 0, nonNegative};
+    return r;
 }
 
 uint32_t EmitFusedCompare(BlockEmitter& e, uint32_t index) {
     const Op& o = e.block.ops[index];
-    CodeGenerator& a = e.a;
-    const auto loadToEax = [&](uint32_t r) {
-        if (e.WantCacheGpr(r)) a.mov(eax, e.ReadGpr(r));
-        else a.mov(eax, e.Gpr(r));
-    };
     Compare c{};
+    const Xbyak::Reg32* result = nullptr;
+    bool resultFlags = false;
     switch (o.kind) {
-    case K::CmpwiBc:
-        c = {Compare::Imm, true, static_cast<uint32_t>(o.d) >> 2u, static_cast<int32_t>(o.imm), 0};
-        loadToEax(o.a);
-        break;
-    case K::CmplwiBc:
-        c = {Compare::Imm, false, static_cast<uint32_t>(o.d) >> 2u, static_cast<int32_t>(o.imm), 0};
-        loadToEax(o.a);
-        break;
-    case K::CmpwBc:
-        c = {Compare::Reg, true, static_cast<uint32_t>(o.d) >> 2u, 0, o.b};
-        loadToEax(o.a);
-        break;
-    case K::CmplwBc:
-        c = {Compare::Reg, false, static_cast<uint32_t>(o.d) >> 2u, 0, o.b};
-        loadToEax(o.a);
-        break;
-    default:  // RlwinmRcBc: r[a] = rotl(r[d], b) & mask; CR0 from it
-        c = {Compare::Test, true, 0, 0, 0};
-        loadToEax(o.d);
-        if (o.b != 0) a.rol(eax, static_cast<uint8_t>(o.b & 31u));
-        a.and_(eax, o.imm);
-        if (e.GprReadLater(o.a)) {
-            a.mov(e.WriteGpr(o.a), eax);
-        } else {
-            e.DropGpr(o.a);
-            a.mov(e.Gpr(o.a), eax);
-        }
-        break;
+    case K::CmpwiBc: c = {Compare::Imm, true, static_cast<uint32_t>(o.d) >> 2u, static_cast<int32_t>(o.imm), o.a, 0}; break;
+    case K::CmplwiBc: c = {Compare::Imm, false, static_cast<uint32_t>(o.d) >> 2u, static_cast<int32_t>(o.imm), o.a, 0}; break;
+    case K::CmpwBc: c = {Compare::Reg, true, static_cast<uint32_t>(o.d) >> 2u, 0, o.a, o.b}; break;
+    case K::CmplwBc: c = {Compare::Reg, false, static_cast<uint32_t>(o.d) >> 2u, 0, o.a, o.b}; break;
+    default: result = EmitRecordResult(e, o, c, resultFlags); break;  // RlwinmRcBc
     }
-    const Op& bc = e.block.ops[index + 1];
-    // No later op reads the field before it is overwritten: the compare's flags decide the branch and the field is written on
-    // the taken path only. A bc that tests the field's SO bit reads it from the field in memory (the flags have no SO), so that case writes it first.
-    const bool readsOwnSo = (bc.d & 0x10u) == 0 && (bc.a >> 2) == c.field && (bc.a & 3u) == 3u;
-    const bool dead = e.CrDead(index, c.field) && !readsOwnSo;
-    if (dead) {
-        BlockEmitter::NoteCr(BlockEmitter::CrEvent::FusedFlagsOnly);
-    } else if (FusedOnFlagsEnabled() && (bc.d & 0x10u) == 0 && (bc.a >> 2) == c.field && (bc.a & 3u) != 3u) {
-        // The field is live and the bc tests one of its lt, gt, eq bits: branch on the flags of the compare, and store the field
-        // on each path from that same difference (the cold taken path and the code after the branch).
-        EmitBcLive(e, bc, c);
-        return 2;
-    } else {
-        EmitCompareValue(e, c, false);
-        e.CrStore(c.field);
-    }
-    EmitBc(e, bc, dead ? &c : nullptr, dead);
+    EmitCondBranch(e, index + 1, &c, result, resultFlags);
     return 2;
 }
 
@@ -321,11 +298,9 @@ void EmitReturnOrJump(BlockEmitter& e) {
     Xbyak::Label& paired = e.NewLabel();
     a.mov(eax, e.Lr());
     a.and_(eax, ~3u);
-    a.mov(ecx, a.dword[kFrame + static_cast<int>(offsetof(Frame, returnAddress))]);
-    a.and_(ecx, ~3u);
-    a.cmp(eax, ecx);
+    a.cmp(eax, a.dword[kFrame + static_cast<int>(offsetof(Frame, returnAddress))]);  // kept & ~3 (Frame::returnAddress)
     a.jne(notReturn, CodeGenerator::T_SHORT);
-    a.test(e.PairedMask(), 2u);  // bit 1: f1 is Paired
+    a.test(a.byte[kFrame + static_cast<int>(offsetof(Frame, pairedMask))], 2u);  // bit 1: f1 is Paired
     a.jnz(paired);
     e.ExitReturn();
     e.Cold([&paired](BlockEmitter& c) {
@@ -362,14 +337,20 @@ void EmitShimResult(BlockEmitter& e) {
 
 // The answer of JitCallOp other than "the call was made" (rcx = what, rax = what << 32 | the target): pending, or a call
 // to interpret in this frame: leave for the target (Bl: linked; Bctrl: through the inline cache, eax is the target).
+// Emitted in cold code only. Call ran BrawlRollback::LoopCall (the loop frame), which may have run C++ that set XER[SO]: then
+// through the dispatcher, not a link (BlockEmitter::JumpIfSo; the link epoch is JitCallOp's JitNoteEpoch).
 void EmitNotMade(BlockEmitter& e, bool isBl, uint32_t target) {
-    Xbyak::Label pending;
+    Xbyak::Label pending, so;
     e.a.cmp(ecx, kReturnPending);
     e.a.je(pending);
+    e.JumpIfSo(so);
     if (isBl) e.ExitLinked(target);
     else e.ExitDynamicCached(0);
     e.a.L(pending);
     e.ExitPending();
+    e.a.L(so);
+    if (isBl) e.ExitTo(target);
+    else e.ExitDynamic();  // eax: the target
 }
 
 // The call through JitCallOp. Made: the block goes on after its validity test. Not made: `notMade` (cold).
@@ -395,11 +376,17 @@ void EmitLoopFrameTest(BlockEmitter& e, Xbyak::Label& loop) {
 
 // Tests whether any float argument register named in `t.argMask` is currently held in paired form; if so, calls
 // JitNormalizeArgs out of line and rejoins. Always leaves all of t's float arguments in scalar form.
+// The registers the form analysis knows to be scalar here need no test (JitNormalizeArgs leaves a scalar one as it is).
 void EmitStaticArgTest(BlockEmitter& e, const JitCallTarget& t) {
-    if (t.argMask == 0) return;
+    uint32_t mask = t.argMask;
+    for (uint32_t m = mask; m != 0; m &= m - 1u) {
+        const uint32_t r = static_cast<uint32_t>(__builtin_ctz(m));
+        if (e.KnownForm(e.index, r) == Form::Scalar) mask &= ~(1u << r);
+    }
+    if (mask == 0) return;
     Xbyak::Label& convert = e.NewLabel();
     Xbyak::Label& done = e.NewLabel();
-    e.a.test(e.PairedMask(), t.argMask);
+    e.a.test(e.PairedMask(), mask);
     e.a.jnz(convert, CodeGenerator::T_NEAR);
     e.a.L(done);
     const JitCallTarget* const tp = &t;
@@ -410,21 +397,70 @@ void EmitStaticArgTest(BlockEmitter& e, const JitCallTarget& t) {
     });
 }
 
+// NormalizeCallFloatReturn after the call op e.index made: f1's paired bit cleared, unless the form analysis knows f1 is scalar
+// before the call (a callee leaves f1 scalar, every way a call op calls one: the bit is clear already).
+void EmitF1Scalar(BlockEmitter& e) {
+    if (e.KnownForm(e.index, 1) == Form::Scalar) return;
+    e.a.and_(e.PairedMask(), ~2u);
+}
+
 // Finishes a direct tail call whose saved return address (lr & ~3) sits in ebp: clears f1's paired bit, restores lr,
 // and either returns from the frame or continues at ebp through the inline cache.
 void EmitDirectTailFinish(BlockEmitter& e) {
     CodeGenerator& a = e.a;
     Xbyak::Label returned;
-    a.and_(e.PairedMask(), ~2u);
+    EmitF1Scalar(e);
     a.mov(e.Lr(), ebp);
-    a.mov(ecx, a.dword[kFrame + static_cast<int>(offsetof(Frame, returnAddress))]);
-    a.and_(ecx, ~3u);
-    a.cmp(ebp, ecx);
+    a.cmp(ebp, a.dword[kFrame + static_cast<int>(offsetof(Frame, returnAddress))]);  // kept & ~3 (Frame::returnAddress)
     a.je(returned, CodeGenerator::T_SHORT);
     a.mov(eax, ebp);
-    e.ExitDynamicCached(0);
+    e.ExitDynamicAfterCall(0);  // through the dispatcher when the callee set XER[SO] or moved the epoch
     a.L(returned);
     e.ExitReturn();
+}
+
+// A bl to a translated function `t` that is patched (its guard byte set when the block is compiled), the common JIT->JIT call:
+// while the guard byte stays set and no redirect applies, the callee's block is called in a subcall frame
+// (BlockEmitter::CallSubFrame), which is what calling the wrapper does then (RunPatched, RunCompiledEntry, jit_enter_direct)
+// without the C++ in between. Otherwise the wrapper, or JitCallOp in the rollback loop frame (Call decides its calls, before the
+// float arguments are touched).
+void EmitSubFrameBl(BlockEmitter& e, uint32_t index, const JitCallTarget& t) {
+    CodeGenerator& a = e.a;
+    const uint32_t pc = e.PcOf(index);
+    const uint32_t target = t.target;
+    const auto T = CodeGenerator::T_NEAR;
+    Xbyak::Label& loopFrame = e.NewLabel();
+    Xbyak::Label& wrapper = e.NewLabel();  // the wrapper, float arguments done
+    Xbyak::Label& resume = e.NewLabel();
+    Xbyak::Label& made = e.NewLabel();
+    a.mov(e.Lr(), pc + 4);
+    a.test(a.byte[kFrame + static_cast<int>(offsetof(Frame, flags))], kFrameFlagLoopFrame);
+    a.jnz(loopFrame, T);
+    EmitStaticArgTest(e, t);
+    a.cmp(AbsMem(a, t.patchedByte, rcx, 8), 0);
+    a.je(wrapper, T);
+    a.cmp(AbsMem(a, GetPatchedHooks().lowestRedirect, rcx, 32), target);
+    a.jbe(wrapper, T);  // lowestRedirect <= target: RunPatched resolves it
+    e.CallSubFrame(target, pc + 4);
+    a.L(resume);
+    EmitF1Scalar(e);  // NormalizeCallFloatReturn (the callee's frame return made f1 scalar in its own frame)
+    a.L(made);
+    e.EmitRecheck(pc + 4);
+    const JitCallTarget* const tp = &t;
+    e.Cold([&loopFrame, &wrapper, &resume, &made, index, target, pc, tp](BlockEmitter& c) {
+        CodeGenerator& g = c.a;
+        g.L(wrapper);
+        g.mov(c.Pc(), pc);
+        g.lea(ArgReg(0), g.ptr[kCtxBase - kCtxBias]);
+        c.CallRaw(reinterpret_cast<const void*>(tp->entry));
+        g.jmp(resume, CodeGenerator::T_NEAR);
+        g.L(loopFrame);
+        c.CallHelper(&JitCallOp, kFrame, &c.block, index);
+        g.mov(rcx, rax);
+        g.shr(rcx, 32);
+        g.jz(made, CodeGenerator::T_NEAR);
+        EmitNotMade(c, true, target);
+    });
 }
 
 // A call to a translated function with a raw dispatch record (`t`), as thin as Call makes it. The caller has stored nothing yet.
@@ -433,6 +469,10 @@ void EmitThinBl(BlockEmitter& e, uint32_t index, const JitCallTarget& t) {
     CodeGenerator& a = e.a;
     const uint32_t pc = e.PcOf(index);
     const uint32_t target = t.target;
+    if (kDirectCalls && t.fastDirect && t.patchedByte != nullptr && *t.patchedByte != 0 && SubFramesPossible()) {
+        EmitSubFrameBl(e, index, t);
+        return;
+    }
     Xbyak::Label& loopFrame = e.NewLabel();
     Xbyak::Label& resume = e.NewLabel();
     a.mov(e.Pc(), pc);
@@ -441,20 +481,14 @@ void EmitThinBl(BlockEmitter& e, uint32_t index, const JitCallTarget& t) {
     EmitStaticArgTest(e, t);
     if (kDirectCalls && (t.fastDirect || (t.fprsOnly && !t.returnsPaired && !t.special))) {
         if (t.fastDirect) {
-            if (t.patchedByte != nullptr && *t.patchedByte != 0) {
-                a.mov(eax, target);
-                a.mov(rdx, reinterpret_cast<uint64_t>(&t));
-                e.CallSubCall();
-            } else {
-                a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
-                e.CallRaw(reinterpret_cast<const void*>(t.entry));
-            }
+            a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
+            e.CallRaw(reinterpret_cast<const void*>(t.entry));
         } else {
             a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
             a.mov(ArgReg(1), reinterpret_cast<uint64_t>(&t));
             e.CallRaw(reinterpret_cast<const void*>(&JitDirectFprsCall));
         }
-        a.and_(e.PairedMask(), ~2u);
+        EmitF1Scalar(e);
         a.L(resume);
         e.EmitRecheck(pc + 4);
         e.Cold([&loopFrame, &resume, index, target](BlockEmitter& c) {
@@ -529,6 +563,38 @@ uint32_t EmitBl(BlockEmitter& e, uint32_t index) {
     return 1;
 }
 
+// The ways of a cell after the first (the site tests the first itself): jumps to `hit` with rdx = the matching entry, else to `miss`.
+// eax is the target. An entry hit 8 times while not the first becomes the first (CellPromoteRoutine): the cell keeps the targets in
+// the order the misses put them in (the newest first), and a site's common target moves up to the one test the site makes first.
+// Clobbers rcx, xmm0-xmm3.
+void CellWays(BlockEmitter& e, Xbyak::Label& cell, Xbyak::Label& hit, Xbyak::Label& miss) {
+    CodeGenerator& a = e.a;
+    Xbyak::Label wayHit;
+    a.lea(rcx, a.ptr[a.rip + cell]);
+    for (uint32_t i = 1; i < kCellWays; ++i) {
+        const int at = static_cast<int>(i * sizeof(JitTargetCell));
+        a.cmp(eax, a.dword[rcx + at + static_cast<int>(offsetof(JitTargetCell, target))]);
+        a.lea(rdx, a.ptr[rcx + at]);  // lea leaves the flags
+        a.je(wayHit, CodeGenerator::T_NEAR);
+    }
+    a.jmp(miss, CodeGenerator::T_NEAR);
+    a.L(wayHit);
+    a.add(a.byte[rdx + static_cast<int>(offsetof(JitTargetCell, hits))], 32);  // carries on the 8th
+    a.jnc(hit, CodeGenerator::T_NEAR);
+    // Not CallRaw: its far form loads the address into rax, and eax (the target) is read after the hit (jit_subcall). r10 is
+    // free here: the GPR cache is flushed before a bctr or bctrl.
+    static const bool alwaysLong = [] { const char* v = std::getenv("BRAWL_JIT_FAR_JUMPS"); return v != nullptr && *v != '\0' && *v != '0'; }();
+    const void* const promote = CellPromoteRoutine();
+    const int64_t distance = reinterpret_cast<const uint8_t*>(promote) - (a.getCurr() + 5);
+    if (!alwaysLong && distance >= INT32_MIN && distance <= INT32_MAX) {
+        a.call(promote);
+    } else {
+        a.mov(r10, reinterpret_cast<uint64_t>(promote));
+        a.call(r10);
+    }
+    a.jmp(hit, CodeGenerator::T_NEAR);
+}
+
 uint32_t EmitBctrl(BlockEmitter& e, uint32_t index) {
     // The registry is fixed once published: before that, nothing may be remembered.
     if (!TranslatedFunctionRegistry::IsLookupPublished()) {
@@ -543,52 +609,45 @@ uint32_t EmitBctrl(BlockEmitter& e, uint32_t index) {
     a.mov(e.Pc(), pc);
     a.mov(e.Lr(), pc + 4);
     EmitLoopFrameTest(e, generic);
-    // The cell holds the last translated targets this site called and their records; the key is the ctr it was found for.
+    // The cell holds the last translated targets this site called, their records and what to call for each (JitFastCallFor: the
+    // entry, or a routine that does what JitThinCall does); the key is the ctr it was found for.
     a.mov(eax, e.Ctr());
     a.and_(eax, ~3u);
-    e.CellProbe(cell, generic);
     if (kDirectCalls) {
-        Xbyak::Label& guarded = e.NewLabel();
-        Xbyak::Label& norm = e.NewLabel();
-        Xbyak::Label& afterNorm = e.NewLabel();
-        Xbyak::Label& subCallPath = e.NewLabel();
-        Xbyak::Label& afterCall = e.NewLabel();
-        Xbyak::Label aotCall;
-        a.cmp(a.byte[rdx + static_cast<int>(offsetof(JitCallTarget, fastDirect))], 0);
-        a.je(guarded, CodeGenerator::T_NEAR);
-        a.mov(ecx, a.dword[rdx + static_cast<int>(offsetof(JitCallTarget, argMask))]);
-        a.test(e.PairedMask(), ecx);
-        a.jnz(norm, CodeGenerator::T_NEAR);
-        a.L(afterNorm);
-        a.mov(rcx, a.qword[rdx + static_cast<int>(offsetof(JitCallTarget, patchedByte))]);
-        a.test(rcx, rcx);
-        a.jz(aotCall, CodeGenerator::T_SHORT);
-        a.cmp(a.byte[rcx], 0);
-        a.jne(subCallPath, CodeGenerator::T_NEAR);
-        a.L(aotCall);
+        // The newest target of the cell first, then the inline cache of untranslated targets (1, shared with the block's bctr:
+        // both put only pcs that are no translated function in it, and a call to one in this frame is interpreted here: lr is set,
+        // it is a jump), then the cell's other targets. A miss of all of them is JitCallOpCached; its interpret-here answer
+        // (here, not in the loop frame, where Call decides otherwise: an untranslated target) links cache 1.
+        Xbyak::Label& ways = e.NewLabel();
+        Xbyak::Label& hit = e.NewLabel();
+        Xbyak::Label& miss = e.NewLabel();
+        a.cmp(eax, a.dword[a.rip + cell]);
+        a.jne(ways, CodeGenerator::T_NEAR);
+        a.lea(rdx, a.ptr[a.rip + cell]);
+        a.L(hit);
         a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
-        a.call(a.qword[rdx + static_cast<int>(offsetof(JitCallTarget, entry))]);
-        a.L(afterCall);
-        a.and_(e.PairedMask(), ~2u);
+        a.call(a.qword[rdx + static_cast<int>(offsetof(JitTargetCell, fast))]);
+        EmitF1Scalar(e);  // NormalizeCallFloatReturn
         a.L(resume);
         e.EmitRecheck(pc + 4);
-        e.Cold([&subCallPath, &afterCall](BlockEmitter& c) {
-            c.a.L(subCallPath);
-            c.a.mov(eax, c.a.dword[rdx + static_cast<int>(offsetof(JitCallTarget, target))]);
-            c.CallSubCall();
-            c.a.jmp(afterCall, CodeGenerator::T_NEAR);
-        });
-        e.Cold([&norm, &afterNorm, &guarded, &generic, &resume, &cell, index](BlockEmitter& c) {
-            c.a.L(norm);
-            c.a.mov(rbp, rdx);
-            c.CallHelper(&JitNormalizeArgs, kFrame, rdx);
-            c.a.mov(rdx, rbp);
-            c.a.jmp(afterNorm, CodeGenerator::T_NEAR);
-            c.a.L(guarded);
-            c.CallHelper(&JitThinCall, kFrame, rdx);
-            c.a.test(rax, rax);
+        e.Cold([&ways, &hit, &miss, &resume, &cell, index](BlockEmitter& c) {
+            c.a.L(ways);
+            c.CacheProbe(1);
+            CellWays(c, cell, hit, miss);
+            c.a.L(miss);
+            c.a.lea(r10, c.a.ptr[c.a.rip + cell]);
+            c.CallHelper(&JitCallOpCached, kFrame, &c.block, index, r10);
+            c.a.mov(rcx, rax);
+            c.a.shr(rcx, 32);
             c.a.jz(resume, CodeGenerator::T_NEAR);
+            Xbyak::Label pending;
+            c.a.cmp(ecx, kReturnPending);
+            c.a.je(pending);
+            c.ExitDynamicMiss(1);  // eax: the target
+            c.a.L(pending);
             c.ExitPending();
+        });
+        e.Cold([&generic, &resume, &cell, index](BlockEmitter& c) {  // the rollback loop frame: Call decides
             c.a.L(generic);
             c.a.lea(r10, c.a.ptr[c.a.rip + cell]);
             c.CallHelper(&JitCallOpCached, kFrame, &c.block, index, r10);
@@ -599,6 +658,7 @@ uint32_t EmitBctrl(BlockEmitter& e, uint32_t index) {
         });
         return 1;
     }
+    e.CellProbe(cell, generic);
     Xbyak::Label& pending = e.NewLabel();
     e.CallHelper(&JitThinCall, kFrame, rdx);
     a.test(rax, rax);
@@ -628,7 +688,9 @@ void EmitTailResult(BlockEmitter& e) {
     e.a.je(returned);
     e.a.cmp(ecx, kReturnPending);
     e.a.je(pending);
-    e.ExitDynamicCached(0);  // goes on at lr (the tail caller was inlined code of this frame): a block of its own, probed first
+    // goes on at lr (the tail caller was inlined code of this frame): a block of its own, probed first; through the dispatcher
+    // when the callee set XER[SO] or moved the epoch
+    e.ExitDynamicAfterCall(0);
     e.a.L(returned);
     e.ExitReturn();
     e.a.L(pending);
@@ -689,37 +751,31 @@ uint32_t EmitBctr(BlockEmitter& e, uint32_t index) {
     Xbyak::Label& cell = e.NewCell();
     a.mov(eax, e.Ctr());
     a.and_(eax, ~3u);
-    e.CacheProbe(1);
-    // The cell holds the last translated targets this site jumped to and their records; eax is the target.
-    e.CellProbe(cell, generic);
-    a.mov(e.Pc(), pc);
-    EmitLoopFrameTest(e, generic);
     if (kDirectCalls) {
-        Xbyak::Label& guarded = e.NewLabel();
-        Xbyak::Label& norm = e.NewLabel();
-        Xbyak::Label& afterNorm = e.NewLabel();
-        a.cmp(a.byte[rdx + static_cast<int>(offsetof(JitCallTarget, fastDirect))], 0);
-        a.je(guarded, CodeGenerator::T_NEAR);
-        a.mov(ecx, a.dword[rdx + static_cast<int>(offsetof(JitCallTarget, argMask))]);
-        a.test(e.PairedMask(), ecx);
-        a.jnz(norm, CodeGenerator::T_NEAR);
-        a.L(afterNorm);
+        // The cell holds the last translated targets this site jumped to (a tail call), their records and what to call for each
+        // (JitFastCallFor); the inline cache (1) the untranslated ones, plain jumps. The two hold different pcs, so their order is
+        // free: the cell's newest target first, the inline cache, the cell's other targets.
+        Xbyak::Label& hit = e.NewLabel();
+        Xbyak::Label notFirst;
+        a.cmp(eax, a.dword[a.rip + cell]);
+        a.jne(notFirst, CodeGenerator::T_NEAR);
+        a.lea(rdx, a.ptr[a.rip + cell]);
+        a.L(hit);
+        a.mov(e.Pc(), pc);
+        EmitLoopFrameTest(e, generic);
         a.mov(ebp, e.Lr());
         a.and_(ebp, ~3u);
         a.lea(ArgReg(0), a.ptr[kCtxBase - kCtxBias]);
-        a.call(a.qword[rdx + static_cast<int>(offsetof(JitCallTarget, entry))]);
+        a.call(a.qword[rdx + static_cast<int>(offsetof(JitTargetCell, fast))]);  // keeps rbp: no subcall frame (JitFastCallFor)
         EmitDirectTailFinish(e);
-        e.Cold([&norm, &afterNorm, &guarded](BlockEmitter& c) {
-            c.a.L(norm);
-            c.a.mov(rbp, rdx);
-            c.CallHelper(&JitNormalizeArgs, kFrame, rdx);
-            c.a.mov(rdx, rbp);
-            c.a.jmp(afterNorm, CodeGenerator::T_NEAR);
-            c.a.L(guarded);
-            c.CallHelper(&JitThinTail, kFrame, rdx);
-            EmitTailResult(c);
-        });
+        a.L(notFirst);
+        e.CacheProbe(1);
+        CellWays(e, cell, hit, generic);
     } else {
+        e.CacheProbe(1);
+        e.CellProbe(cell, generic);
+        a.mov(e.Pc(), pc);
+        EmitLoopFrameTest(e, generic);
         e.CallHelper(&JitThinTail, kFrame, rdx);
         EmitTailResult(e);
     }
@@ -745,11 +801,43 @@ uint32_t EmitBctr(BlockEmitter& e, uint32_t index) {
 
 }  // namespace
 
+uint32_t EmitCompareBranch(BlockEmitter& e, uint32_t index) {
+    const Block& b = e.block;
+    uint32_t j = index + 1;
+    while (j < b.count && b.ops[j].kind == K::Jmp) ++j;
+    if (j >= b.count || b.ops[j].kind != K::Bc || KindForced(K::Bc)) return 0;
+    const Op& o = b.ops[index];
+    const Op& bc = b.ops[j];
+    Compare c{};
+    uint32_t field = 0;
+    switch (o.kind) {
+    case K::Cmpwi: case K::Cmplwi: case K::Cmpw: case K::Cmplw: field = static_cast<uint32_t>(o.d) >> 2u; break;
+    case K::RlwinmRc: case K::AndiRc: case K::AndisRc: case K::AndRc: case K::OrRc: break;
+    default: return 0;
+    }
+    if ((bc.d & 0x10u) != 0 || (bc.a >> 2) != field) return 0;  // the pair gains only when the bc tests this op's field
+    // What the core does before a Bc of its own (EmitOps): the FPR cache's dirty slots and pending forms stored first. Here it
+    // must come before the record form, whose flags the branch uses: a pending form's store is an `or` / `and` that would
+    // clobber them in EmitCondBranch's flush.
+    e.FlushDirtyFprs();
+    const Xbyak::Reg32* result = nullptr;
+    bool resultFlags = false;
+    switch (o.kind) {
+    case K::Cmpwi: c = {Compare::Imm, true, field, static_cast<int32_t>(o.imm), o.a, 0}; break;
+    case K::Cmplwi: c = {Compare::Imm, false, field, static_cast<int32_t>(o.imm), o.a, 0}; break;
+    case K::Cmpw: c = {Compare::Reg, true, field, 0, o.a, o.b}; break;
+    case K::Cmplw: c = {Compare::Reg, false, field, 0, o.a, o.b}; break;
+    default: result = EmitRecordResult(e, o, c, resultFlags); break;
+    }
+    EmitCondBranch(e, j, &c, result, resultFlags);
+    return j - index + 1;
+}
+
 uint32_t EmitBranch(BlockEmitter& e, uint32_t index) {
     const Op& o = e.block.ops[index];
     switch (o.kind) {
     case K::Bc:
-        EmitBc(e, o, nullptr, false);
+        EmitCondBranch(e, index, nullptr, nullptr, false);
         return 1;
     case K::CmpwiBc: case K::CmplwiBc: case K::CmpwBc: case K::CmplwBc: case K::RlwinmRcBc:
         return EmitFusedCompare(e, index);

@@ -11,6 +11,7 @@
 // other form, the same PPC_PsFromScalarInline / PPC_PsToScalarInline conversions translated code makes.
 #include "ppc_interpreter.h"
 #include "ppc_interpreter_internal.h"
+#include "ppc_interpreter_diag.h"
 #include "brawl_online_core.h"
 #include "brawl_rollback.h"
 #include "brawl_dirty_memory.h"
@@ -681,14 +682,22 @@ void JitNormalizeArgs(Frame* f, const JitCallTarget* t) noexcept { NormalizeArgM
 namespace {
 // Puts `t` at the front of the site's cell, the older entries moving down (the oldest falls out), unless it is there already (a call
 // made in the rollback loop frame comes here without having probed).
-inline void RememberTarget(JitTargetCell* cell, uint32_t target, const JitCallTarget* t) noexcept {
+inline void RememberTarget(JitTargetCell* cell, uint32_t target, const JitCallTarget* t, bool tail) noexcept {
     for (uint32_t i = 0; i < kCellWays; ++i)
         if (cell[i].target == target) return;
     for (uint32_t i = kCellWays - 1; i > 0; --i) cell[i] = cell[i - 1];
     cell[0].record = t;
+    cell[0].argMask = static_cast<uint16_t>(t->argMask);  // bits 1-13
+    cell[0].hits = 0;
+    cell[0].entry = t->entry;
+    cell[0].fast = JitFastCallFor(t, tail);
     cell[0].target = target;
 }
 }  // namespace
+
+#if !MKW_JIT
+const void* JitFastCallFor(const JitCallTarget*, bool) noexcept { return nullptr; }
+#endif
 
 void JitDirectFprsCall(CpuContext* cpu, const JitCallTarget* t) {
     if (t->address != 0) RecompMod::g_currentTranslatedExecutionAddress = t->address;
@@ -701,7 +710,7 @@ uint64_t JitCallOpCached(Frame* f, const Block* b, uint32_t index, JitTargetCell
     const uint32_t target = f->ctx->ctr & ~3u;
     const JitCallTarget* const t = JitCallTargetFor(target);
     if (t != nullptr && !t->special) {
-        RememberTarget(cell, target, t);
+        RememberTarget(cell, target, t, false);
         if (__builtin_expect((f->flags & kFrameFlagLoopFrame) == 0, 1)) {
             return ThinCallImpl<true>(f, t);
         }
@@ -713,7 +722,7 @@ uint64_t JitTailOpCached(Frame* f, const Block* b, uint32_t index, JitTargetCell
     const uint32_t target = f->ctx->ctr & ~3u;
     const JitCallTarget* const t = JitCallTargetFor(target);
     if (t != nullptr) {
-        RememberTarget(cell, target, t);
+        RememberTarget(cell, target, t, true);
         if (__builtin_expect(!t->special && (f->flags & kFrameFlagLoopFrame) == 0, 1)) {
             f->ctx->pc = b->pcs[index];
             return ThinTailImpl<true>(f, t);
@@ -1543,12 +1552,51 @@ struct BlockCache {
         const auto it = owners.find(mark);
         if (it == owners.end()) return;
         for (Block* o : it->second)
-            if (o->epoch != 0) { o->epoch = 0; ++retired; }
+            if (o->epoch != 0) DropCounted(*o);
+    }
+    // A block no longer known to match guest memory (epoch 0): the link slots aimed at it are suspended first, as compiled code
+    // follows a slot without testing the target's epoch (Block::jitLinked). A refresh that finds its words unchanged aims them
+    // at it again (Resume), so a block rollback's restore only may have written costs one compare, not a relink of every way in.
+    // Every write of a block's epoch: its compiled code holds a copy (Block::jitEpoch).
+    static void SetEpoch(Block& b, uint32_t epoch) {
+        b.epoch = epoch;
+        if (b.jitEpoch != nullptr)
+            if (const JitBackend* const backend = Backend()) backend->setEpoch(b);
+    }
+    static void Drop(Block& b) {
+        SetEpoch(b, 0);
+        if (b.jitIncoming != nullptr)
+            if (const JitBackend* const backend = Backend()) backend->suspend(b);
+    }
+    void DropCounted(Block& b) {
+        Drop(b);
+        ++retired;
+    }
+    static void Resume(Block& b) {
+        if (b.jitIncoming != nullptr)
+            if (const JitBackend* const backend = Backend()) backend->resume(b);
+    }
+    // The epoch the link slots of every cache were aimed in (g_jitLinkEpoch). When markEpoch has moved since, every slot is
+    // suspended: a block that matched guest memory then may not now (memory rewritten without marks), and its slots do not test
+    // its epoch. Called before a block is taken as matching in the epoch (Build, Refresh) and by the helpers compiled code
+    // calls that may have run guest code (JitNoteEpoch). Takes CachesMutex.
+    static void NoteEpoch(uint32_t epoch) {
+        if (__builtin_expect(epoch == g_jitLinkEpoch, 1)) return;
+        SweepLinks(epoch);
+    }
+    static MKW_PPC_NO_INLINE void SweepLinks(uint32_t epoch) {
+        std::lock_guard<std::mutex> lock(CachesMutex());
+        if (const JitBackend* const backend = Backend(); backend != nullptr && g_jitEpochFault != 1)
+            for (BlockCache* c : Caches())
+                for (const auto& [pc, b] : c->blocks)
+                    if (b->jitIncoming != nullptr) backend->suspend(*b);
+        g_jitLinkEpoch = epoch;
     }
     // BrawlDirtyMemory::consumingMarks: rollback's WriteWatch is about to clear its pages' marks, after which a
     // write they show would no longer show; retire the code under the set ones now. The marks are scanned in
     // ascending order, a few bytes per code block.
     static void ConsumingMarks(uint32_t seq) {
+        diag::Add(diag::kConsumes);
         std::lock_guard<std::mutex> lock(CachesMutex());
         const uint8_t* const marks = BrawlDirtyMemory::leanBlocks;
         constexpr uint32_t kLast = static_cast<uint32_t>(BrawlDirtyMemory::kLeanDirtyBlocks) - 7u;
@@ -1588,8 +1636,8 @@ struct BlockCache {
                     if (it != c->owners.end()) {
                         for (Block* o : it->second)
                             if (o->epoch != 0 && (o->epoch != curEpoch || !HoldsUnder(*o, m))) {
-                                o->epoch = 0;
-                                ++c->retired;
+                                c->DropCounted(*o);
+                                diag::Add(diag::kConsumeRetired);
                             }
                     }
                     c->NoteWritten(m, seq);
@@ -1601,6 +1649,12 @@ struct BlockCache {
     // guest memory changed where it was written since, all of which a later consume found (or code built since then
     // was decoded from). Retire that code; the restore counts as a write for any older snapshot.
     static void RestoredMarks(uint32_t snapshotSeq) {
+        diag::Add(diag::kRestores);
+        const uint64_t retiredBefore = diag::ChurnOn() ? RetiredTotal() : 0;
+        struct Tally {
+            uint64_t before;
+            ~Tally() { if (diag::ChurnOn()) diag::Add(diag::kRestoreRetired, RetiredTotal() - before); }
+        } tally{retiredBefore};
         const uint32_t now = BrawlDirtyMemory::consumeSeq.fetch_add(1, std::memory_order_acq_rel) + 1;
         std::lock_guard<std::mutex> lock(CachesMutex());
         for (BlockCache* c : Caches()) {
@@ -1622,8 +1676,14 @@ struct BlockCache {
                 c->writtenAt.insert(c->writtenAt.end(), again.begin(), again.end());
             }
             for (auto it = c->builtAt.rbegin(); it != c->builtAt.rend() && it->first >= snapshotSeq; ++it)
-                if (it->second->epoch != 0) { it->second->epoch = 0; ++c->retired; }
+                if (it->second->epoch != 0) c->DropCounted(*it->second);
         }
+    }
+    static uint64_t RetiredTotal() {  // BRAWL_JIT_CHURN: every cache's retired count (takes CachesMutex)
+        std::lock_guard<std::mutex> lock(CachesMutex());
+        uint64_t n = 0;
+        for (const BlockCache* c : Caches()) n += c->retired;
+        return n;
     }
     // The mark is about to be cleared: a block under it that matched guest memory in this epoch still does if its
     // words under the mark do; any other compares all its code before it runs again (with CachesMutex held).
@@ -1631,7 +1691,7 @@ struct BlockCache {
         const auto it = owners.find(mark);
         if (it == owners.end()) return;
         for (Block* o : it->second)
-            if (o != except && o->epoch != 0 && (o->epoch != epoch || !HoldsUnder(*o, mark))) { o->epoch = 0; ++retired; }
+            if (o != except && o->epoch != 0 && (o->epoch != epoch || !HoldsUnder(*o, mark))) DropCounted(*o);
     }
 #endif
 
@@ -1848,6 +1908,7 @@ struct BlockCache {
     // set until rollback consumes them (starting a new epoch), so until then the block compares under them each run.
     MKW_PPC_NO_INLINE bool Refresh(Block& b, uint32_t epoch) {
 #if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
+        NoteEpoch(epoch);  // before b can be taken in this epoch: no slot aimed in an older one may stay
         const bool whole = b.epoch != epoch;
         bool tracked = false;
         for (uint32_t s = 0; s < b.segments && !tracked; ++s) {
@@ -1868,26 +1929,27 @@ struct BlockCache {
                     for (BlockCache* c : Caches()) c->Recheck(m, &b, epoch);
                 }
                 if (!whole && !HoldsUnder(b, m)) {
-                    b.epoch = 0;  // its marks may be clear now: Current must not take it
+                    SetEpoch(b, 0);  // its marks may be clear now: Current must not take it
                     return false;
                 }
             }
         if (whole) {
             if (!Holds(b)) {
-                b.epoch = 0;
+                SetEpoch(b, 0);
                 return false;
             }
-            b.epoch = epoch;
+            SetEpoch(b, epoch);
+            Resume(b);  // its words are unchanged: the slots suspended when it was dropped (or the epoch moved) aim at it again
         } else {
             ++partial;
         }
         return true;
 #else
         if (!Holds(b)) {
-            b.epoch = 0;
+            SetEpoch(b, 0);
             return false;
         }
-        b.epoch = epoch;
+        SetEpoch(b, epoch);
         return true;
 #endif
     }
@@ -2082,8 +2144,11 @@ struct BlockCache {
         b->jitState = 0;
         b->jitEntry = nullptr;
         b->jitChecked = nullptr;
+        b->jitLinked = nullptr;
         b->jitIncoming = nullptr;
+        b->jitEpoch = nullptr;
 #if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
+        NoteEpoch(epoch);  // the block is taken as matching in this epoch: no slot aimed in an older one may stay
         {
             // every mark under the block's words, ascending; then the fewest 8-mark windows over them, each starting at
             // the lowest mark not yet covered (a segment spans at most three marks)
@@ -2130,6 +2195,7 @@ struct BlockCache {
     Block* Find(uint32_t pc) {
         const uint32_t epoch = BrawlDirtyMemory::markEpoch.load(std::memory_order_acquire);
         if (epoch != lastEpoch) { lastEpoch = epoch; ++epochs; }
+        diag::Add(diag::kFinds);
         Slot& slot = slots[SlotOf(pc)];
         Block* b = slot.pc == pc ? slot.block : nullptr;
         if (b == nullptr) {
@@ -2145,7 +2211,7 @@ struct BlockCache {
             if (CheckMarks() && !Holds(*b)) {
                 static std::atomic<int> logged{0};
                 if (logged.fetch_add(1, std::memory_order_relaxed) < 64) LogChange(*b, epoch);
-                b->epoch = 0;
+                SetEpoch(*b, 0);
                 Retire(*b);
                 b = Build(pc);
                 ++rebuilt;
@@ -2157,12 +2223,14 @@ struct BlockCache {
                      ? staleTracked : staleOther)++;
                 ++stalePcs[pc];
             }
+            if (diag::ChurnOn()) diag::AddKey(diag::kTStale, pc);
             if (!Refresh(*b, epoch)) {
                 NoteStale(*b);
-                b->epoch = 0;
+                SetEpoch(*b, 0);
                 Retire(*b);
                 b = Build(pc);
                 ++rebuilt;
+                if (diag::ChurnOn()) diag::AddKey(diag::kTRebuild, pc);
             }
         }
         slot = Slot{pc, b};
@@ -2197,6 +2265,7 @@ struct BlockCache {
             return b;
         }
 #endif
+        if (diag::ChurnOn()) diag::AddKey(diag::kTFind, (uint64_t{diag::kFromNext} << 32) | pc);
         Block* const found = Find(pc);
         if (from.link[0] != found) {
             from.link[1] = from.link[0];
@@ -2522,13 +2591,21 @@ MKW_PPC_NO_INLINE Step RunBlockVerify(Frame& f, const Block& b, uint32_t& next, 
 
 namespace detail {
 
+void JitSweepLinks() noexcept {
+#if MKW_LEAN_MEMORY && MKW_LEAN_DIRTY_MARKS
+    if (__builtin_expect(g_jitEpochFault == 2, 0)) return;
+    BlockCache::NoteEpoch(BrawlDirtyMemory::markEpoch.load(std::memory_order_acquire));
+#endif
+}
+
 uint64_t JitFallbackOp(Frame* f, const Block* b, uint32_t index) noexcept {
     const auto result = [](uint32_t what, uint32_t next) { return (uint64_t{what} << 32) | next; };
+    if (diag::ChurnOn()) diag::Fallback(b->pcs[index], static_cast<uint32_t>(b->ops[index].kind), b->words[index]);
     try {
         // RunBlock<false>'s loop body for one op
         Cursor at{b->ops + index, 0, 0, f->returnAddress, b};
         switch (RunOp(*f, f->ctx, at)) {
-        case Act::Next: return result(0, static_cast<uint32_t>(at.op - b->ops) + 1);
+        case Act::Next: JitNoteEpoch(); return result(0, static_cast<uint32_t>(at.op - b->ops) + 1);
         case Act::Exit: return result(1, at.next);
         case Act::Return: return result(2, 0);
         case Act::Exec: break;
@@ -2536,7 +2613,9 @@ uint64_t JitFallbackOp(Frame* f, const Block* b, uint32_t index) noexcept {
         const uint32_t pc = PcOf(at);
         f->ctx->pc = pc;
         uint32_t to = pc + 4;
-        if (Exec(*f, pc, b->words[at.op - b->ops], to, f->returnAddress) == Step::Return) return result(2, 0);
+        const Step step = Exec(*f, pc, b->words[at.op - b->ops], to, f->returnAddress);
+        JitNoteEpoch();  // Exec may have run guest code (a call): the block goes on and may follow its link slots
+        if (step == Step::Return) return result(2, 0);
         if (to != pc + 4) return result(1, to);
         return result(0, static_cast<uint32_t>(at.op - b->ops) + 1);
     } catch (...) {
@@ -2551,11 +2630,19 @@ uint64_t JitCallOp(Frame* f, const Block* b, uint32_t index) noexcept {
         const Op& o = b->ops[index];
         const uint32_t pc = b->pcs[index];
         f->ctx->pc = pc;
+        // Not made, the block leaves through a link slot or an inline cache with no validity test of its own first, and Call
+        // may have run BrawlRollback::LoopCall (the loop frame): JitNoteEpoch. Made: the block's EmitRecheck follows.
         if (o.kind == K::Bl) {
-            if (!Call(*f, o.imm, pc + 4, o.b != 0 ? &b->calls[o.b - 1] : nullptr)) return result(1, o.imm);
+            if (!Call(*f, o.imm, pc + 4, o.b != 0 ? &b->calls[o.b - 1] : nullptr)) {
+                JitNoteEpoch();
+                return result(1, o.imm);
+            }
         } else {
             const uint32_t target = f->ctx->ctr & ~3u;
-            if (!Call(*f, target, pc + 4)) return result(1, target);
+            if (!Call(*f, target, pc + 4)) {
+                JitNoteEpoch();
+                return result(1, target);
+            }
         }
         return 0;
     } catch (...) {
@@ -2664,6 +2751,10 @@ Mode InterpreterMode() {
 
 // Compiles a block the dispatcher has entered often enough (once: a block the backend turns down stays interpreted).
 MKW_PPC_NO_INLINE void CompileBlock(BlockCache& cache, const JitBackend& backend, Block& b) {
+    if (diag::ChurnOn()) {
+        diag::Add(diag::kCompileCalls);
+        diag::AddKey(diag::kTCompile, b.start);
+    }
     if (cache.jit == nullptr) cache.jit = backend.createCache();
     b.jitState = (cache.jit != nullptr && backend.compile(*cache.jit, b) && b.jitEntry != nullptr) ? 1 : 2;
     cache.UpdateOverLimit();
@@ -2777,7 +2868,7 @@ MKW_PPC_FORCE_INLINE void NoteEntry(ThreadState& state, CpuContext* ctx, uint32_
 // argument consumed by a paired op is splatted to both lanes, as lfs/fadds leave it on the hardware.
 MKW_PPC_FORCE_INLINE void StartFrame(Frame& f, CpuContext* ctx) {
     f.pairedMask = 0;
-    f.returnAddress = ctx->lr;
+    f.returnAddress = ctx->lr & ~3u;  // every user compares it with a word address; compiled code compares it unmasked
 }
 
 // The per-instruction bookkeeping touches these thread_locals on every guest instruction. Resolved once per Run: with emulated TLS,
@@ -2797,6 +2888,10 @@ MKW_PPC_FORCE_INLINE JitExit EnterCompiled(const JitBackend& backend, CpuContext
     if (first != trail.lastPc + 4) trail.branches[trail.count++ % kRecentBranches] = first;
     trail.lastPc = b.end;
     f.executed = 0;
+    if (diag::ChurnOn()) {
+        diag::Add(diag::kEnters);
+        diag::AddKey(diag::kTEnter, b.start);
+    }
     const JitExit exit = backend.enter(f, b);
     executed += f.executed;
     if (exit.status == JitStatus::Pending) {
@@ -2811,12 +2906,16 @@ MKW_PPC_FORCE_INLINE JitExit EnterCompiled(const JitBackend& backend, CpuContext
 // After compiled code left for exit.next: the block to go on with, linked from the slot the exit left through; null when it starts
 // at a hook, which the dispatcher's outer loop handles (f.pc is then where to go on).
 MKW_PPC_FORCE_INLINE Block* FollowExit(BlockCache& cache, const JitBackend& backend, Frame& f, const JitExit& exit) {
+    if (diag::ChurnOn()) diag::AddKey(diag::kTFind, (uint64_t{diag::kFromFollow} << 32) | exit.next);
     Block* const following = cache.Find(exit.next);
     if (following->hook) {
         f.pc = exit.next;
         return nullptr;
     }
-    if (exit.link != nullptr && following->jitEntry != nullptr) backend.link(*exit.link, *following);
+    if (exit.link != nullptr && following->jitEntry != nullptr) {
+        diag::Add(diag::kFollowLinks);
+        backend.link(*exit.link, *following);
+    }
     return following;
 }
 
@@ -2878,6 +2977,12 @@ MKW_PPC_NO_INLINE void RunLoop(const LoopEnv& env) {
             if(BrawlOnlineCore::FrameEnd(ctx)) {f.pc=0x80017508u;continue;}
         }
         if(loopDepth && pc==0x80017508u) {
+            if (diag::ChurnOn() && cache != nullptr) {
+                const uint64_t counts[diag::kCacheCounters] = {cache->built, cache->rebuilt, cache->slotMisses, cache->current,
+                                                               cache->linked, cache->claims, cache->retired, cache->epochs,
+                                                               cache->partial, cache->linkRefreshes, cache->clears};
+                diag::Pass(counts);
+            }
             for(uint32_t m=f.pairedMask; m!=0; m&=m-1u) { unsigned i=__builtin_ctz(m); SetScalar(f,i,Scalar(f,i)); }
             if(coreEnabled) BrawlOnlineCore::LoopEnd(ctx);
             CountInstructions(executed);return;
@@ -2906,13 +3011,14 @@ MKW_PPC_NO_INLINE void RunLoop(const LoopEnv& env) {
         if (cache != nullptr) {
             // Blocks run one after another here, each found through the last one's links, until the frame returns
             // or the next block starts at a hook (which the loop above handles first).
+            if (diag::ChurnOn() && first == nullptr) diag::AddKey(diag::kTFind, (uint64_t{diag::kFromLoop} << 32) | pc);
             Block* b = first != nullptr ? first : cache->Find(pc);
             first = nullptr;
             for (;;) {
                 if (jitBackend != nullptr) {
                     if (b->jitEntry == nullptr && b->jitState == 0 && ++b->entries > jitThreshold)
                         CompileBlock(*cache, *jitBackend, *b);
-                    if (b->jitEntry != nullptr) {
+                    if (b->jitEntry != nullptr && JitBlocksMayRun(ctx)) {
                         const JitExit exit = EnterCompiled(*jitBackend, ctx, f, *b, executed, trail);
                         if (exit.status == JitStatus::Return) {
                             CountInstructions(executed);
@@ -2925,6 +3031,11 @@ MKW_PPC_NO_INLINE void RunLoop(const LoopEnv& env) {
                     }
                 }
                 const uint32_t start = b->start;
+                if (diag::ChurnOn() && jitBackend != nullptr) {
+                    diag::Add(diag::kInterpBlocks);
+                    diag::Add(diag::kInterpOps, b->count);
+                    diag::AddKey(diag::kTInterpBlock, start | (b->jitState == 2 ? uint64_t{1} << 32 : 0));
+                }
                 if (stats) {
                     ++cache->blocksRun;
                     cache->opsRun += b->count;
@@ -2973,6 +3084,10 @@ MKW_PPC_NO_INLINE void RunLoop(const LoopEnv& env) {
 
 void Run(CpuContext* ctx, uint32_t entry) {
     HZ_EXCLUSIVE(kHzInterpTicks);
+    if (diag::ChurnOn()) {
+        diag::Add(diag::kRuns);
+        diag::AddKey(diag::kTRun, entry);
+    }
     ThreadState& state = State();
     NoteEntry(state, ctx, entry);
     Frame f(ctx, entry);
@@ -3029,9 +3144,13 @@ void detail::JitDirectContinue(DirectEnterState* ds, Frame* f, uint64_t statusAn
     // Clear direct/subcall flags before any RunLoop -> jit_enter call reuses this Frame, so its exits return to Enter().
     const bool wasSubCall = (f->flags & kFrameFlagSubCall) != 0;
     f->flags &= ~(kFrameFlagDirectEnter | kFrameFlagSubCall);
-    ThreadState& state = *static_cast<ThreadState*>(ds->threadState);
+    if (wasSubCall) f->entry = f->pc;  // a subcall frame stores pc = entry only (nothing in compiled code writes either)
+    // A subcall frame passes no state (its caller may be any frame of this thread): the thread's own.
+    ThreadState& state = ds != nullptr ? *static_cast<ThreadState*>(ds->threadState) : State();
+    diag::Add(diag::kDirectContinues);
     BlockCache& cache = state.cache;
     const JitBackend& backend = *Backend();
+    if (wasSubCall) NoteEntry(state, f->ctx, f->entry);  // what RunCompiledEntry does for an entry it runs (the log of entries)
     uint64_t executed = f->executed;
     const JitExit exit{static_cast<JitStatus>(statusAndNext >> 32), static_cast<uint32_t>(statusAndNext), link};
     if (exit.status == JitStatus::Pending) {
@@ -3057,6 +3176,7 @@ void detail::JitDirectContinue(DirectEnterState* ds, Frame* f, uint64_t statusAn
 }
 
 MKW_PPC_NO_INLINE bool RunCompiledEntrySlow(CpuContext* ctx, uint32_t entry) {
+    diag::Add(diag::kSlowEntries);
     struct Once {
         const JitBackend* backend;
         bool defaultJit;
@@ -3080,8 +3200,10 @@ MKW_PPC_NO_INLINE bool RunCompiledEntrySlow(CpuContext* ctx, uint32_t entry) {
     ThreadState& state = State();
     BlockCache& cache = state.cache;
     if (cache.depth == 0 && cache.overLimit) return false;
+    if (diag::ChurnOn()) diag::AddKey(diag::kTFind, (uint64_t{diag::kFromEntrySlow} << 32) | entry);
     Block* const b = cache.FindCurrent(entry);
-    if (b->hook || b->jitEntry == nullptr) return false;
+    if (b->hook || b->jitEntry == nullptr || !JitBlocksMayRun(ctx)) return false;
+    diag::Add(diag::kSlowEntriesRan);
     NoteEntry(state, ctx, entry);
     if (b->jitChecked != nullptr) {
         cache.fastEntries[FastEntryIdx(entry)] = FastEntrySlot{entry, 0, b->jitChecked};
@@ -3111,8 +3233,10 @@ MKW_PPC_NO_INLINE bool RunCompiledEntrySlow(CpuContext* ctx, uint32_t entry) {
     RunLoop(env);
     return true;
 }
+const FastEntrySlot* detail::JitThreadFastEntries() noexcept { return State().cache.fastEntries; }
 #else
 void detail::JitDirectContinue(DirectEnterState*, Frame*, uint64_t, JitLink*) {}
+const FastEntrySlot* detail::JitThreadFastEntries() noexcept { return nullptr; }
 #endif
 
 // The entry for the common call from translated code (GuestCodePatch::RunPatched's last step): Run(ctx, entry) when `entry` is
@@ -3126,7 +3250,8 @@ bool detail::RunCompiledEntry(CpuContext* ctx, uint32_t entry) {
                              TryGetCpuContext() == ctx &&
                              (!state->cache.overLimit || state->cache.depth != 0), 1)) {
         const FastEntrySlot& fe = state->cache.fastEntries[FastEntryIdx(entry)];
-        if (__builtin_expect(fe.pc == entry && fe.jitChecked != nullptr, 1)) {
+        if (__builtin_expect(fe.pc == entry && fe.jitChecked != nullptr && JitBlocksMayRun(ctx), 1)) {
+            diag::Add(diag::kFastEntries);
             ++state->cache.depth;
             struct DepthScope {
                 BlockCache* cache;

@@ -1,7 +1,9 @@
 #pragma once
 
-// Memory the host runs as code, for the run-time compiler of guest code (src/jit). Emitted code calls runtime helpers
-// through an absolute address in a register, so none of this memory has to be near the executable.
+// Memory the host runs as code, for the run-time compiler of guest code (src/jit). On Linux x86-64 it is mapped within a
+// rel32 displacement of the executable's text while a 256 MiB reservation there lasts, so that emitted code calls translated
+// functions and runtime helpers with `call rel32`; elsewhere it is mapped anywhere, and emitted code, which checks the
+// distance of every such call, goes through an absolute address in a register (BRAWL_JIT_FAR_MEMORY=1 forces that).
 
 #include <cstddef>
 #include <vector>

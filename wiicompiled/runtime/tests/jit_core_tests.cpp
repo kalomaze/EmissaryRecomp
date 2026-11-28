@@ -81,12 +81,75 @@ void TestLinkRetireRelink() {
     // The very first block replaced (it has no incoming slot; its own exit slot stays linked to the old second block).
     Memory::Write32(base, Addi(3, 3, 5));
     for (int i = 0; i < 3; ++i) CHECK(Run(base) == 104);
-    // A new epoch with nothing written: every block revalidates in place and keeps its links.
+    // A new epoch with nothing written: every block revalidates in place and keeps its links (they are suspended at the new
+    // epoch, as a link does not test its target's epoch, and aimed again when the refresh finds the target's words unchanged:
+    // no new link is made).
     BrawlDirtyMemory::MarksCleared();
     const JitX64Stats s4 = JitX64GetStats();
     for (int i = 0; i < 3; ++i) CHECK(Run(base) == 104);
     const JitX64Stats s5 = JitX64GetStats();
     CHECK(s5.compiled == s4.compiled);
+    CHECK(s5.links == s4.links);
+    // The same after a restore notification that covers the code (rollback's: everything built since the snapshot is dropped).
+    BrawlDirtyMemory::MarksRestored(0);
+    for (int i = 0; i < 3; ++i) CHECK(Run(base) == 104);
+    const JitX64Stats s6 = JitX64GetStats();
+    CHECK(s6.compiled == s5.compiled && s6.links == s5.links);
+}
+
+// A loop back to a block's own start: straight to its entry when nothing in the block before the jump can have changed its code
+// (no store, no call: the blr after it does not count), through its validity test otherwise (a store to its own words must be
+// seen on the next iteration: jit_stale_tests).
+// The loop: addi r3,r3,1; cmpw r3,r4; blt start (a fused pair whose taken exit is the back edge); blr.
+void TestSelfLoop() {
+    const uint32_t base = kCodeBase + 0x6000;
+    constexpr uint32_t kCmpwR3R4 = (31u << 26) | (3u << 16) | (4u << 11);
+    const auto bltTo = [](uint32_t from, uint32_t to) { return (16u << 26) | (12u << 21) | (0u << 16) | ((to - from) & 0xFFFCu); };
+    Memory::Write32(base, Addi(3, 3, 1));
+    Memory::Write32(base + 4, kCmpwR3R4);
+    Memory::Write32(base + 8, bltTo(base + 8, base));
+    Memory::Write32(base + 12, kBlr);
+    const auto run = [&](uint32_t n) {
+        CpuContext ctx{};
+        ctx.lr = kReturn;
+        ctx.gpr[1] = 0x80180000u;
+        ctx.gpr[4] = n;
+        CpuContextScope scope(&ctx);
+        PpcInterpreter::Run(&ctx, base);
+        return ctx.gpr[3];
+    };
+    const JitX64Stats before = JitX64GetStats();
+    CHECK(run(10) == 10);
+    const JitX64Stats a = JitX64GetStats();
+    CHECK(a.selfLoops - before.selfLoops == 1);
+    const uint64_t counted = PpcInterpreter::InstructionCount();
+    CHECK(run(1000) == 1000);
+    const JitX64Stats b = JitX64GetStats();
+    CHECK(b.links == a.links);                                        // the back edge is no link
+    CHECK(b.enters - a.enters == 1);                                  // nor a dispatcher round
+    CHECK(PpcInterpreter::InstructionCount() - counted == 4u * 1000);  // every iteration counts the block's 4 ops
+    // the loop's code changed from outside between runs: the new word runs
+    Memory::Write32(base, Addi(3, 3, 2));
+    CHECK(run(1000) == 1000);
+    CHECK(run(7) == 8);
+    // with a store in the loop (stw r3,0x40(r5), r5 = base: the word after the loop's line) the back edge goes through the test
+    const JitX64Stats c = JitX64GetStats();
+    Memory::Write32(base + 12, (36u << 26) | (3u << 21) | (5u << 16) | 0x40u);
+    Memory::Write32(base + 16, bltTo(base + 16, base));
+    Memory::Write32(base + 8, (31u << 26) | (3u << 16) | (4u << 11));  // cmpw r3,r4 (the old blt's place)
+    Memory::Write32(base + 4, Addi(0, 0, 0));                           // li r0,0
+    Memory::Write32(base + 20, kBlr);
+    CpuContext ctx{};
+    ctx.lr = kReturn;
+    ctx.gpr[1] = 0x80180000u;
+    ctx.gpr[4] = 50;
+    ctx.gpr[5] = base;
+    {
+        CpuContextScope scope(&ctx);
+        PpcInterpreter::Run(&ctx, base);
+    }
+    CHECK(ctx.gpr[3] == 50 && Memory::Read32(base + 0x40) == 50);  // addi r3,r3,2 each time round, until r3 is 50
+    CHECK(JitX64GetStats().selfLoops == c.selfLoops);
 }
 
 // A linked block whose code changed without anything reaching the dispatcher between: the target's checked entry sees the
@@ -103,7 +166,7 @@ void TestLinkedBlockSeesChange() {
     }
 }
 
-// The inline cache of a dynamic exit (BlockEmitter::ExitDynamicCached; here bctr's, a 16-entry table selected by (pc >> 2) & 15):
+// The inline cache of a dynamic exit (BlockEmitter::ExitDynamicCached; here bctr's, a 32-entry table selected by (pc >> 2) & 31):
 // a target is filled in by the dispatcher's link on the first miss, hit afterwards without the dispatcher, two targets of
 // different entries alternate with no misses, two that select the same entry evict each other, and a target whose code is
 // replaced empties its entry (retire resets the key) so the next jump to it goes through the dispatcher and relinks. The
@@ -225,6 +288,7 @@ int main() {
     PpcInterpreter::SetJitThreshold(0);
     TestLinkRetireRelink();
     TestLinkedBlockSeesChange();
+    TestSelfLoop();
     TestInlineCache();
     TestCodeLimit();
     const JitX64Stats s = JitX64GetStats();
