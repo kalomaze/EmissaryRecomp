@@ -1877,11 +1877,20 @@ MKW_PPC_FORCE_INLINE void PPC_PsqStSegmentInline(CpuContext* cpu, uint8_t* resol
 }
 
 // A scalar source supplies both lanes: convert and sanitize once before duplicating.
+// PpcStorePsqFloatBitsInline of a host double->float cast's result: the cast never returns a signalling NaN, so the
+// quieting arm is the identity and only the subnormal flush remains (a cmov instead of two compares and cmovs).
+inline uint32_t PpcStorePsqCastFloatBitsInline(float single)
+{
+    const uint32_t bits = PpcBitCastToU32Inline(single);
+    return (bits & 0x7FFFFFFFu) < 0x00800000u ? bits & 0x80000000u : bits;
+}
+
 inline uint64_t PpcScalarPsqFloatBitsInline(double value)
 {
-    uint32_t bits = PpcBitCastToU32Inline(static_cast<float>(value));
-#if !MKW_FAST_FLOAT
-    bits = PpcStorePsqFloatBitsInline(bits);
+#if MKW_FAST_FLOAT
+    const uint32_t bits = PpcBitCastToU32Inline(static_cast<float>(value));
+#else
+    const uint32_t bits = PpcStorePsqCastFloatBitsInline(static_cast<float>(value));
 #endif
     return (static_cast<uint64_t>(bits) << 32) | bits;
 }

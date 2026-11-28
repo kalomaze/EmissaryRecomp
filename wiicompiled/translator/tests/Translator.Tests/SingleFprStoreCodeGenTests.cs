@@ -38,7 +38,9 @@ public sealed class SingleFprStoreCodeGenTests
             new IrAssign("f2", IrValue.Register("f1")),
             new IrStore(new IrAddress("r5", 0), IrValue.Register("f2"), 4));
 
-        Assert.Contains("MemoryInline::FlatWrite32(r5, fbits_f1", code, StringComparison.Ordinal);
+        // The move copies the word into the move's own bits local (CxxLinearCodeGenerator.SingleFpr.cs).
+        Assert.Contains("fbits_f2_0 = fbits_f1_0;", code, StringComparison.Ordinal);
+        Assert.Contains("MemoryInline::FlatWrite32(r5, fbits_f2_0);", code, StringComparison.Ordinal);
         Assert.DoesNotContain("FlatWriteFloat32", code, StringComparison.Ordinal);
     }
 
@@ -140,6 +142,75 @@ public sealed class SingleFprStoreCodeGenTests
         Assert.Contains("PpcFmulsSingleCInline(", code, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void FmulsThenStfsStoresTheProductsWord()
+    {
+        var code = Emit(
+            new IrLoad("f1", new IrAddress("r4", 0), 4),
+            new IrCall("f3", "PPC_Fmuls", new[] { IrValue.Register("f2"), IrValue.Register("f1") }),
+            new IrStore(new IrAddress("r5", 0), IrValue.Register("f3"), 4));
+
+        Assert.Contains("= PpcBitCastToU32Inline(PpcFmulsFloatInline<true>(f2.d, f1.d));", code, StringComparison.Ordinal);
+        Assert.Contains("f3.d = static_cast<double>(PpcBitCastToFloatInline(fbits_f3", code, StringComparison.Ordinal);
+        Assert.Contains("MemoryInline::FlatWrite32(r5, fbits_f3", code, StringComparison.Ordinal);
+        Assert.DoesNotContain("FlatWriteFloat32", code, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void FnmsubsThenStfsStoresTheResultsWord()
+    {
+        var code = Emit(
+            new IrCall("f3", "PPC_Fnmsubs", new[] { IrValue.Register("f1"), IrValue.Register("f2"), IrValue.Register("f4") }),
+            new IrStore(new IrAddress("r5", 0), IrValue.Register("f3"), 4));
+
+        Assert.Contains("PpcFusedSingleFloatInline<true, true, false>(f1.d, f2.d, f4.d)", code, StringComparison.Ordinal);
+        Assert.Contains("MemoryInline::FlatWrite32(r5, fbits_f3", code, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void FmulsWithoutAStoreKeepsTheDoubleEntryPoint()
+    {
+        var code = Emit(
+            new IrCall("f3", "PPC_Fmuls", new[] { IrValue.Register("f2"), IrValue.Register("f1") }));
+
+        Assert.Contains("f3.d = PpcFmulsInline(f2.d, f1.d);", code, StringComparison.Ordinal);
+        Assert.DoesNotContain("fbits_", code, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AVolatileSingleLosesItsBitsAcrossAnIndirectCall()
+    {
+        var code = Emit(
+            new IrLoad("f1", new IrAddress("r4", 0), 4),
+            new IrIndirectCall(string.Empty, IrValue.Register("r12"), Array.Empty<IrValue>()),
+            new IrStore(new IrAddress("r5", 0), IrValue.Register("f1"), 4));
+
+        Assert.Contains("MemoryInline::FlatWriteFloat32(r5, f1.d);", code, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AVolatileSingleLosesItsBitsOnAPathThroughACall()
+    {
+        var code = EmitBlocks(
+            new IrBasicBlock("entry", new List<IrInstruction>
+            {
+                new IrLoad("f3", new IrAddress("r4", 0), 4),
+                new IrBranch("ne", "left", "join")
+            }),
+            new IrBasicBlock("left", new List<IrInstruction>
+            {
+                new IrIndirectCall(string.Empty, IrValue.Register("r12"), Array.Empty<IrValue>()),
+                new IrJump("join")
+            }),
+            new IrBasicBlock("join", new List<IrInstruction>
+            {
+                new IrStore(new IrAddress("r5", 0), IrValue.Register("f3"), 4),
+                new IrReturn(null)
+            }));
+
+        Assert.Contains("MemoryInline::FlatWriteFloat32(r5, f3.d);", code, StringComparison.Ordinal);
+    }
+
     private static string Emit(params IrInstruction[] instructions)
     {
         var body = new List<IrInstruction>(instructions) { new IrReturn(null) };
@@ -151,7 +222,25 @@ public sealed class SingleFprStoreCodeGenTests
             ["f1"] = ValueRepresentation.Float64,
             ["f2"] = ValueRepresentation.Float64,
             ["f3"] = ValueRepresentation.Float64,
-            ["f4"] = ValueRepresentation.Float64
+            ["f4"] = ValueRepresentation.Float64,
+            ["f20"] = ValueRepresentation.Float64,
+            ["r12"] = ValueRepresentation.UInt32
+        });
+        var signature = new FunctionAbiClassification("single_store_probe", ValueRepresentation.Void);
+        return new CxxLinearCodeGenerator().Emit(0x80040000, new SsaTransformer().Convert(function), signature, types);
+    }
+
+    private static string EmitBlocks(params IrBasicBlock[] blocks)
+    {
+        var function = new IrFunction("single_store_probe", blocks[0].Label, blocks);
+        var types = new RepresentationEnvironment(new Dictionary<string, ValueRepresentation>
+        {
+            ["r4"] = ValueRepresentation.UInt32,
+            ["r5"] = ValueRepresentation.UInt32,
+            ["r12"] = ValueRepresentation.UInt32,
+            ["f3"] = ValueRepresentation.Float64,
+            ["f20"] = ValueRepresentation.Float64,
+            ["f21"] = ValueRepresentation.Float64
         });
         var signature = new FunctionAbiClassification("single_store_probe", ValueRepresentation.Void);
         return new CxxLinearCodeGenerator().Emit(0x80040000, new SsaTransformer().Convert(function), signature, types);

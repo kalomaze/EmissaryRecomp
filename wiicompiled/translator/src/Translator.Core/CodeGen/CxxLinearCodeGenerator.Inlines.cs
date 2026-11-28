@@ -174,6 +174,15 @@ public sealed partial class CxxLinearCodeGenerator
                 if (helper is "PpcFmulsInline" or "PpcFmulsNoNiInline" && call.Arguments.Count == 2 &&
                     IsSingleFprOperand(call.Arguments[1], localPaired))
                     helper = helper == "PpcFmulsInline" ? "PpcFmulsSingleCInline" : "PpcFmulsSingleCNoNiInline";
+                // fmuls whose result's bits a store reuses: computed as its float (SingleFpr.cs, IsSingleProductCall).
+                if (helper is "PpcFmulsInline" or "PpcFmulsSingleCInline" && call.Arguments.Count == 2 &&
+                    TryGetRawSingleRoot(call.Destination!, out _))
+                {
+                    var singleC = helper == "PpcFmulsSingleCInline" ? "true" : "false";
+                    EmitSingleResult(sb, pad, call.Destination!, dest!,
+                        $"PpcFmulsFloatInline<{singleC}>({string.Join(", ", arguments)})");
+                    return true;
+                }
                 var expression = $"{helper}({string.Join(", ", arguments)})";
                 if (scalarSpec.Kind == ScalarInlineKind.RoundedHelper && !scalarSpec.NoNiVariant)
                 {

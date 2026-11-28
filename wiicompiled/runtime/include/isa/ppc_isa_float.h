@@ -705,6 +705,27 @@ extern "C" inline double PPC_FnmsubsSingleC(double a, double c, double b)
     return static_cast<double>(PpcNegateMaddResultInline(result));
 }
 
+// fmuls and the fused single family as the float they round to, for a result whose single bits the translator keeps
+// for a store (CxxLinearCodeGenerator.SingleFpr.cs): the double entry points above return exactly
+// static_cast<double>() of these (same operations; the negation of fnmadds/fnmsubs is applied to the float there too).
+template <bool CIsSingle>
+inline float PpcFmulsFloatInline(double a, double c)
+{
+#if MKW_FAST_FLOAT
+    return static_cast<float>(a * c);
+#endif
+    return PpcForceSingleValueBody(PpcFmulBody(a, CIsSingle || std::isnan(c) ? c : PpcForce25BitInline(c)));
+}
+
+template <bool Subtract, bool Negate, bool CIsSingle>
+inline float PpcFusedSingleFloatInline(double a, double c, double b)
+{
+    const float result = PpcForceSingleValueBody(PpcAccurateSingleMaddIntermediateInline<Subtract, CIsSingle>(a, c, b));
+    if constexpr (Negate)
+        return PpcNegateMaddResultInline(result);
+    return result;
+}
+
 // The entry points translated code calls (see PpcForceSingleValueBody).
 #if MKW_OUTLINE_GUEST_OPS
 MKW_PPC_NO_INLINE MKW_GUEST_OP_CC double PpcFaddOutlined(double a, double b);
@@ -1164,6 +1185,21 @@ MKW_PPC_NO_INLINE MKW_PPC_COLD MKW_COLD_OP_CC inline uint64_t PpcConvertToDouble
     return ((x & 0xC0000000ULL) << 32) | z | ((x & 0x3FFFFFFFULL) << 29);
 }
 
+// Whether single `value` is a normal number or a zero: the words the host's float->double cast widens exactly under
+// any MXCSR (DAZ flushes subnormal inputs, and a cast quiets a signalling NaN). The direct test, `magnitude - 2^23 <
+// 0x7F000000 || magnitude == 0`, is two compares joined branchlessly (mov, and, lea, cmp, setae, test, setne, test,
+// jne at every lfs). One compare does it: shifting out the sign leaves the exponent in the top byte; flipping the 23
+// fraction bits moves +-0 to the top of the exponent-0 block (0x00FFFFFE) and the subnormals below it; adding 2^24
+// wraps the exponent-255 block (infinities, NaNs) to [0, 0x00FFFFFF] and puts the subnormals at
+// [0x01000000, 0x01FFFFFC], directly above it, and zero at 0x01FFFFFE, just past both. Normals land at 0x02000000 or
+// higher. So the not-normal-not-zero words are exactly the keys below 0x01FFFFFE (checked over all 2^32 words by
+// tests/single_widen_exhaustive.cpp). Clang emits lea, xor, add, cmp, ja.
+inline bool PpcSingleWidensByCastInline(uint32_t value)
+{
+    const uint32_t key = ((value ^ 0x007FFFFFu) << 1) + 0x01000000u;
+    return key >= 0x01FFFFFEu;
+}
+
 inline uint64_t PpcConvertToDoubleBitsInline(uint32_t value)
 {
     float single;
@@ -1173,8 +1209,7 @@ inline uint64_t PpcConvertToDoubleBitsInline(uint32_t value)
 #endif
     // Normal singles and zeros widen exactly, so the host cast gives the manual's bits (its normal arm is this exact
     // widening written in integer ops); everything else takes the manual's algorithm.
-    const uint32_t magnitude = value & 0x7FFFFFFFu;
-    if (magnitude - 0x00800000u < 0x7F000000u || magnitude == 0) [[likely]]
+    if (PpcSingleWidensByCastInline(value)) [[likely]]
         return PpcBitCastToU64Inline(static_cast<double>(single));
     return PpcConvertToDoubleBitsSlow(value);
 }

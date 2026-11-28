@@ -77,11 +77,22 @@ public sealed partial class CxxLinearCodeGenerator
         public required HashSet<string> IntactPhis { get; init; }
         public required HashSet<string> SingleDefinitionFprs { get; init; }
 
+        /// <summary>
+        /// Refined mode (<see cref="FprBarrierClobbers"/>): per barrier, the FPR locals (bit n: fn) its emission may
+        /// assign, as the recording pass saw them. A barrier missing from the map clobbers every FPR local.
+        /// </summary>
+        public IReadOnlyDictionary<IrInstruction, uint>? BarrierClobbers { get; init; }
+
         /// <summary>Advances <paramref name="intact"/> over <paramref name="instruction"/>.</summary>
         public void Step(HashSet<string> intact, IrInstruction instruction)
         {
             if (IsFprBarrier(instruction))
-                intact.Clear();
+            {
+                if (BarrierClobbers is not null && BarrierClobbers.TryGetValue(instruction, out var clobbered))
+                    intact.RemoveWhere(name => !TryParseFloatRegisterIndex(name, out var index) || (clobbered & (1u << index)) != 0);
+                else
+                    intact.Clear();
+            }
             if (instruction is IrPhi phi)
             {
                 if (IntactPhis.Contains(phi.Destination)) intact.Add(phi.Destination);
@@ -98,7 +109,55 @@ public sealed partial class CxxLinearCodeGenerator
                                                       : new HashSet<string>(StringComparer.Ordinal);
     }
 
-    private static FprIntactness ComputeFprIntactness(IrFunction function)
+    /// <summary>
+    /// MKW_FPR_CALL_INTACT=0 turns this off. A guest call is an FPR barrier only for the locals its emission assigns:
+    /// the reload after it is narrowed by the callee's contract and the EABI (a caller keeps f14-f31 in its own locals
+    /// and does not reload them), so a value in such a local survives the call unchanged even though the IR's SSA name
+    /// is not versioned there. The recording pass of the residency (which observes every local write and every reload
+    /// of the emission) supplies, per barrier, the FPR locals it writes; the text of the barrier's emission is
+    /// scanned for assignments too. Off where LR-continuation labels let control enter mid-block from other call
+    /// sites. The same analysis kills a register on a CFG edge that converts its representation
+    /// (EmitNormalizePairedStateOnEdge), which rewrites the local without a definition.
+    /// </summary>
+    private static readonly bool FprCallIntactness = Environment.GetEnvironmentVariable("MKW_FPR_CALL_INTACT") != "0";
+
+    /// <summary>The FPR registers (base names) whose representation <see cref="EmitNormalizePairedStateOnEdge"/> converts on edge from -> to.</summary>
+    private sealed record PairedEdgeNormalization(
+        IReadOnlyDictionary<string, HashSet<string>> PairedOut,
+        IReadOnlyDictionary<string, HashSet<string>> PairedIn,
+        IReadOnlyDictionary<string, HashSet<string>> LiveIn)
+    {
+        public bool Normalizes(string from, string to, string registerBase)
+        {
+            if (!LiveIn.TryGetValue(to, out var live) || !live.Contains(registerBase))
+                return false;
+            var fromPaired = PairedOut.TryGetValue(from, out var fromSet) && fromSet.Contains(registerBase);
+            var toPaired = PairedIn.TryGetValue(to, out var toSet) && toSet.Contains(registerBase);
+            return fromPaired != toPaired;
+        }
+    }
+
+    /// <summary>
+    /// Text of one barrier's emission: FPR locals it assigns outside the residency accessors (none are known; this
+    /// only guards the recorder's view). Any `fN = ...`, `fN.d = ...`, `fN.raw = ...`, `fN.paired.psK = ...`,
+    /// `PpcSetPairedFprInline(fN, ...)` or `&fN` counts.
+    /// </summary>
+    private static readonly System.Text.RegularExpressions.Regex FprLocalAssignment = new(
+        @"(?<![\w>.\[])f(?<n>\d+)(?:\.d|\.raw|\.paired\.ps[01])?\s*=(?!=)|PpcSetPairedFprInline\(\s*f(?<n>\d+)\b|&\s*f(?<n>\d+)\b",
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    private static uint TextualFprAssignments(StringBuilder body, int start)
+    {
+        var mask = 0u;
+        foreach (System.Text.RegularExpressions.Match match in FprLocalAssignment.Matches(body.ToString(start, body.Length - start)))
+            foreach (System.Text.RegularExpressions.Capture capture in match.Groups["n"].Captures)
+                if (int.TryParse(capture.Value, out var index) && index is >= 0 and < 32)
+                    mask |= 1u << index;
+        return mask;
+    }
+
+    private static FprIntactness ComputeFprIntactness(IrFunction function,
+        IReadOnlyDictionary<IrInstruction, uint>? barrierClobbers = null, PairedEdgeNormalization? edges = null)
     {
         var definitions = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var block in function.Blocks)
@@ -112,7 +171,20 @@ public sealed partial class CxxLinearCodeGenerator
         var blockIn = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
         var blockOut = new Dictionary<string, HashSet<string>?>(StringComparer.Ordinal);  // null: not reached yet (top)
         var intactPhis = new HashSet<string>(singleDefinition, StringComparer.Ordinal);  // optimistic, shrinks
-        var analysis = new FprIntactness { BlockIn = blockIn, IntactPhis = intactPhis, SingleDefinitionFprs = singleDefinition };
+        var analysis = new FprIntactness
+        {
+            BlockIn = blockIn, IntactPhis = intactPhis, SingleDefinitionFprs = singleDefinition, BarrierClobbers = barrierClobbers
+        };
+        // What reaches `to` along the edge from `from`: the predecessor's exit set less the registers the edge converts.
+        HashSet<string> EdgeOut(string from, string to, HashSet<string> predOut)
+        {
+            if (edges is null) return predOut;
+            HashSet<string>? adjusted = null;
+            foreach (var name in predOut)
+                if (edges.Normalizes(from, to, GetRegisterBaseName(name)))
+                    (adjusted ??= new HashSet<string>(predOut, StringComparer.Ordinal)).Remove(name);
+            return adjusted ?? predOut;
+        }
         foreach (var block in function.Blocks) blockOut[block.Label] = null;
         bool changed;
         var rounds = 0;
@@ -127,8 +199,9 @@ public sealed partial class CxxLinearCodeGenerator
                     foreach (var pred in cfg.Predecessors(block.Label))
                     {
                         if (blockOut.GetValueOrDefault(pred) is not { } predOut) continue;
-                        if (entry is null) entry = new HashSet<string>(predOut, StringComparer.Ordinal);
-                        else entry.IntersectWith(predOut);
+                        var reaching = EdgeOut(pred, block.Label, predOut);
+                        if (entry is null) entry = new HashSet<string>(reaching, StringComparer.Ordinal);
+                        else entry.IntersectWith(reaching);
                     }
                     if (entry is null) continue;  // not reached (yet)
                 }
@@ -137,7 +210,7 @@ public sealed partial class CxxLinearCodeGenerator
                 {
                     if (instruction is not IrPhi phi || !intactPhis.Contains(phi.Destination)) continue;
                     foreach (var (pred, source) in phi.Sources)
-                        if (blockOut.GetValueOrDefault(pred) is { } predOut && !predOut.Contains(source))
+                        if (blockOut.GetValueOrDefault(pred) is { } predOut && !EdgeOut(pred, block.Label, predOut).Contains(source))
                         {
                             intactPhis.Remove(phi.Destination);
                             changed = true;
@@ -289,6 +362,18 @@ public sealed partial class CxxLinearCodeGenerator
         !spec.NoNiVariant && call.Arguments.Count == 2;
 
     /// <summary>
+    /// fmuls and the fused single family (not their NoNi forms): emitted as the float they round to when their
+    /// result's bits are kept (PpcFmulsFloatInline, PpcFusedSingleFloatInline), so they can be roots too.
+    /// MKW_RAW_SINGLE_PRODUCTS=0 leaves them out.
+    /// </summary>
+    private static readonly bool RawSingleProducts = Environment.GetEnvironmentVariable("MKW_RAW_SINGLE_PRODUCTS") != "0";
+
+    private static bool IsSingleProductCall(IrCall call) =>
+        RawSingleProducts && !string.IsNullOrWhiteSpace(call.Destination) && IsFloatRegister(call.Destination) &&
+        ((call.Target.Equals("PPC_Fmuls", StringComparison.OrdinalIgnoreCase) && call.Arguments.Count == 2) ||
+         (FusedSingleTargets.Contains(call.Target) && call.Arguments.Count == 3));
+
+    /// <summary>
     /// The 4-byte FPR stores whose value's single bits are available as an integer (see <see cref="RawSingleStores"/>):
     /// the value is defined in the same block by a 4-byte FPR load (lfs, a resolved or segment lfs, an element of a lean
     /// segment pair), by fadds/fsubs/fdivs or frsp, or by an fmr chain from one, and nothing in between is a barrier.
@@ -359,8 +444,8 @@ public sealed partial class CxxLinearCodeGenerator
                         Root(pair.FirstDestination);
                         Root(pair.SecondDestination);
                         break;
-                    case IrCall call when IsRoundedSingleCall(call):
-                        Root(call.Destination);
+                    case IrCall call when IsRoundedSingleCall(call) || IsSingleProductCall(call):
+                        Root(call.Destination!);
                         break;
                     case IrBinary { Op: "frsp" } frsp:
                         Root(frsp.Destination);
@@ -370,6 +455,125 @@ public sealed partial class CxxLinearCodeGenerator
             }
         }
         return (stores, roots);
+    }
+
+    /// <summary>The body being emitted: FPR moves (dest -> source) that copy a raw single bits local along with the value.</summary>
+    [ThreadStatic]
+    private static Dictionary<string, string>? _rawSingleCopies;
+
+    /// <summary>
+    /// <see cref="ComputeRawSingleStores"/> across blocks, for the refined intactness (<see cref="FprCallIntactness"/>).
+    /// Every FPR SSA value with known single bits gets its own bits local, assigned where the value is defined: a
+    /// 4-byte load, a rounded single (fadds/fsubs/fdivs, frsp), or an fmr of such a value that is intact at the move
+    /// (the move copies the bits local, fbits_dest = fbits_source). A 4-byte store of a value that is intact there
+    /// stores its bits local. Sound because a value and its bits local are assigned together at the value's single
+    /// definition and nowhere else: if the store finds the value's local intact (no barrier assigned it, no edge
+    /// converted it, on any path since the definition last ran), that run also left the bits local holding its word.
+    /// The definition dominates the store (SSA), so the local was assigned on every path.
+    /// </summary>
+    private static (Dictionary<IrInstruction, string?[]> Stores, HashSet<string> Roots, Dictionary<string, string> Copies)
+        ComputeRawSingleStoresAcrossBlocks(IrFunction function, FprIntactness intactness)
+    {
+        var stores = new Dictionary<IrInstruction, string?[]>(ReferenceEqualityComparer.Instance);
+        var roots = new HashSet<string>(StringComparer.Ordinal);
+        var copies = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (!RawSingleStores)
+            return (stores, roots, copies);
+        bool Eligible(string name) => IsFloatRegister(name) && intactness.SingleDefinitionFprs.Contains(name);
+        // Values whose bits are known at their definition, and candidate moves with their source's intactness there.
+        var known = new HashSet<string>(StringComparer.Ordinal);
+        var moves = new List<(string Dest, string Source)>();
+        foreach (var block in function.Blocks)
+        {
+            var intact = intactness.EntryOf(block.Label);
+            foreach (var instruction in block.Instructions)
+            {
+                switch (instruction)
+                {
+                    case IrLoad { SizeBytes: 4 } load when Eligible(load.Destination):
+                        known.Add(load.Destination);
+                        break;
+                    case IrResolvedLoad { SizeBytes: 4 } load when Eligible(load.Destination):
+                        known.Add(load.Destination);
+                        break;
+                    case IrResolvedLoadPair { ElementSizeBytes: 4 } pair when LeanRanges:
+                        if (Eligible(pair.FirstDestination)) known.Add(pair.FirstDestination);
+                        if (Eligible(pair.SecondDestination)) known.Add(pair.SecondDestination);
+                        break;
+                    case IrCall call when (IsRoundedSingleCall(call) || IsSingleProductCall(call)) && Eligible(call.Destination!):
+                        known.Add(call.Destination!);
+                        break;
+                    case IrBinary { Op: "frsp" } frsp when Eligible(frsp.Destination):
+                        known.Add(frsp.Destination);
+                        break;
+                    case IrAssign { Value: { Kind: "register", RegisterName: { } source } } move
+                        when Eligible(move.Destination) && IsFloatRegister(source) && intact.Contains(source):
+                        moves.Add((move.Destination, source));
+                        break;
+                }
+                intactness.Step(intact, instruction);
+            }
+        }
+        bool changed;
+        do
+        {
+            changed = false;
+            foreach (var (dest, source) in moves)
+                if (!known.Contains(dest) && known.Contains(source))
+                {
+                    known.Add(dest);
+                    copies[dest] = source;
+                    changed = true;
+                }
+        } while (changed);
+
+        foreach (var block in function.Blocks)
+        {
+            var intact = intactness.EntryOf(block.Label);
+            string? Bits(IrValue value, int sizeBytes)
+            {
+                if (sizeBytes != 4 || value is not { Kind: "register", RegisterName: { } name } || !intact.Contains(name) ||
+                    !known.Contains(name))
+                    return null;
+                roots.Add(name);
+                return RawSingleBitsLocal(name);
+            }
+            foreach (var instruction in block.Instructions)
+            {
+                switch (instruction)
+                {
+                    case IrStore store when Bits(store.Source, store.SizeBytes) is { } bits:
+                        stores[store] = new string?[] { bits };
+                        break;
+                    case IrResolvedStore store when Bits(store.Source, store.SizeBytes) is { } bits:
+                        stores[store] = new string?[] { bits };
+                        break;
+                    case IrResolvedStorePair pair:
+                        var first = Bits(pair.FirstSource, pair.ElementSizeBytes);
+                        var second = Bits(pair.SecondSource, pair.ElementSizeBytes);
+                        if (first is not null || second is not null)
+                            stores[pair] = new[] { first, second };
+                        break;
+                }
+                intactness.Step(intact, instruction);
+            }
+        }
+        // A stored copy needs its source's bits local, transitively.
+        var pending = new Stack<string>(roots);
+        while (pending.Count > 0)
+            if (copies.TryGetValue(pending.Pop(), out var source) && roots.Add(source))
+                pending.Push(source);
+        foreach (var dest in copies.Keys.ToList())
+            if (!roots.Contains(dest))
+                copies.Remove(dest);
+        return (stores, roots, copies);
+    }
+
+    /// <summary>The bits copy an FPR move makes (<see cref="ComputeRawSingleStoresAcrossBlocks"/>), if any.</summary>
+    private static void EmitRawSingleCopy(StringBuilder sb, string pad, string destination)
+    {
+        if (_rawSingleCopies?.TryGetValue(destination, out var source) == true)
+            sb.AppendLine($"{pad}{RawSingleBitsLocal(destination)} = {RawSingleBitsLocal(source)};");
     }
 
     /// <summary>The raw single bits local element <paramref name="element"/> of 4-byte FPR store <paramref name="store"/> stores, if any.</summary>

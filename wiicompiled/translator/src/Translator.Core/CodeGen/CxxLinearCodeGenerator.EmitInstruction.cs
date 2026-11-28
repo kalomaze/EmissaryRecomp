@@ -45,6 +45,7 @@ public sealed partial class CxxLinearCodeGenerator
                     sb.AppendLine($"{pad}{dest} = {src};");
                     if (IsFloatRegister(assign.Destination))
                     {
+                        EmitRawSingleCopy(sb, pad, assign.Destination);
                         var paired = false;
                         if (assign.Value.Kind == "register" &&
                             assign.Value.RegisterName != null &&
@@ -585,7 +586,17 @@ public sealed partial class CxxLinearCodeGenerator
                         ? FormatSymbol(call.Target) + "SingleC"
                         : FormatSymbol(call.Target);
                     var callExpr = $"{callSymbol}({string.Join(", ", args)})";
-                    if (!string.IsNullOrWhiteSpace(call.Destination))
+                    if (FusedSingleTargets.Contains(call.Target) && call.Arguments.Count == 3 &&
+                        !string.IsNullOrWhiteSpace(call.Destination) && TryGetRawSingleRoot(call.Destination, out _))
+                    {
+                        // A fused single whose result's bits a store reuses: computed as its float (SingleFpr.cs).
+                        var subtract = call.Target.EndsWith("subs", StringComparison.OrdinalIgnoreCase) ? "true" : "false";
+                        var negate = call.Target.StartsWith("PPC_Fn", StringComparison.OrdinalIgnoreCase) ? "true" : "false";
+                        var singleC = callSymbol.EndsWith("SingleC", StringComparison.Ordinal) ? "true" : "false";
+                        EmitSingleResult(sb, pad, call.Destination, ToDestination(call.Destination, types),
+                            $"PpcFusedSingleFloatInline<{subtract}, {negate}, {singleC}>({string.Join(", ", args)})");
+                    }
+                    else if (!string.IsNullOrWhiteSpace(call.Destination))
                     {
                         sb.AppendLine(IsPairedProducerTarget(call.Target)
                             ? $"{pad}{PairedAssignment(call.Destination, callExpr, types)}"

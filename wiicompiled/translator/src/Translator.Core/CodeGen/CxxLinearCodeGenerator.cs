@@ -336,8 +336,13 @@ public sealed partial class CxxLinearCodeGenerator
         var fprIntactness = ComputeFprIntactness(func);
         var singleFprValues = ComputeSingleFprValues(func, fprIntactness);
         var (rawSingleStores, rawSingleRoots) = ComputeRawSingleStores(func, fprIntactness);
+        var rawSingleCopies = new Dictionary<string, string>(StringComparer.Ordinal);
+        // Refined FPR intactness (SingleFpr.cs, FprCallIntactness): the recording pass collects what each barrier's
+        // emission assigns.
+        var captureFprBarriers = FprCallIntactness && continuationCallCount == 0;
         string EmitFunctionBody(RegisterResidency? residency, int bufferBaseLength, bool discardResult = false,
-            GuestEabiVariant? variantBody = null)
+            GuestEabiVariant? variantBody = null,
+            Dictionary<IrInstruction, uint>? fprBarrierClobbers = null)
         {
             var previousVariantBody = _eabiVariantBody;
             var previousVariants = _eabiVariants;
@@ -355,8 +360,10 @@ public sealed partial class CxxLinearCodeGenerator
             var previousRawSingleStores = _rawSingleStores;
             var previousRawSingleRoots = _rawSingleRoots;
             var previousIntactFprs = _intactFprs;
+            var previousRawSingleCopies = _rawSingleCopies;
             _rawSingleStores = rawSingleStores;
             _rawSingleRoots = rawSingleRoots;
+            _rawSingleCopies = rawSingleCopies;
             var previousSegmentPsqStores = _segmentPsqStores;
             _segmentPsqStores = LeanRanges && !emitStateFreeLeafVariant;
             _activeResidency = residency;
@@ -486,6 +493,10 @@ public sealed partial class CxxLinearCodeGenerator
                         var inlineGuestThunkStackBase = block.Instructions[i] is IrCall &&
                             HasLocallyProvenStackFrameBase(block.Instructions, i, stackFacts);
                         _activeGpuFifoBurstSlot = gpuFifoBurstPlan.Slot(block.Label, i);
+                        var captureBarrier = fprBarrierClobbers is not null && residency is not null &&
+                                             IsFprBarrier(block.Instructions[i]);
+                        var barrierTextStart = body.Length;
+                        if (captureBarrier) residency!.BeginFprCapture();
                         try
                         {
                             EmitInstruction(block.Label, directCallOrdinal, block.Instructions[i], body, bufferBaseLength, 1, cfg, labelNames, types, signature, localPaired, _guestAbiProvider, knownConstants, localConstants, linkedAddressRemap, nonReturningCallTargets, lrContinuationCallTargets, stackFacts, inlineGuestThunkStackBase, localFallthroughLr, guestAbiContracts, stateFreeAbiContracts, stateFreeCallSymbols, stateFreeCallSiteVariants, modOverridableCallTargets, shareLrContinuationDispatch);
@@ -494,6 +505,9 @@ public sealed partial class CxxLinearCodeGenerator
                         {
                             _activeGpuFifoBurstSlot = null;
                         }
+                        if (captureBarrier && residency!.EndFprCapture() is { } barrierFprs)
+                            fprBarrierClobbers![block.Instructions[i]] =
+                                barrierFprs | TextualFprAssignments(body, barrierTextStart);
                         UpdateKnownUIntConstants(block.Instructions[i], localConstants);
                         fprIntactness.Step(intactFprs, block.Instructions[i]);
                         if (gpuFifoBurstPlan.Completion(block.Label, i) is { } completedBurst)
@@ -627,6 +641,7 @@ public sealed partial class CxxLinearCodeGenerator
                 _singleFprValues = previousSingleFprValues;
                 _rawSingleStores = previousRawSingleStores;
                 _rawSingleRoots = previousRawSingleRoots;
+                _rawSingleCopies = previousRawSingleCopies;
                 _intactFprs = previousIntactFprs;
                 _segmentPsqStores = previousSegmentPsqStores;
                 _eabiVariantBody = previousVariantBody;
@@ -645,7 +660,20 @@ public sealed partial class CxxLinearCodeGenerator
         RegisterResidency? variantResidency = null;
         {
             var recorder = RegisterResidency.CreateRecorder();
-            EmitFunctionBody(recorder, bodyBufferBaseLength, discardResult: true);
+            var fprBarrierClobbers = captureFprBarriers
+                ? new Dictionary<IrInstruction, uint>(ReferenceEqualityComparer.Instance)
+                : null;
+            EmitFunctionBody(recorder, bodyBufferBaseLength, discardResult: true, fprBarrierClobbers: fprBarrierClobbers);
+            if (fprBarrierClobbers is not null)
+            {
+                // The real emissions below use what the recording saw: FPR values stay intact across barriers that do
+                // not assign their locals (SingleFpr.cs). Only expressions change (raw single stores, single-operand
+                // forms); the flushes, reloads and local writes the recorder planned are the same.
+                fprIntactness = ComputeFprIntactness(func, fprBarrierClobbers,
+                    new PairedEdgeNormalization(pairedOut, pairedIn, pairedEdgeLiveness.In));
+                singleFprValues = ComputeSingleFprValues(func, fprIntactness);
+                (rawSingleStores, rawSingleRoots, rawSingleCopies) = ComputeRawSingleStoresAcrossBlocks(func, fprIntactness);
+            }
             if (ownEabiVariant is not null)
             {
                 recorder.RequireLocals(
