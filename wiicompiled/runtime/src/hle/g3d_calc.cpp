@@ -1828,7 +1828,7 @@ constexpr uint32_t kMaxMemBytes = 1u << 24;
 // (src + n - 1 forward, src backward); r3 is unchanged.
 bool MemcpyNative(CpuContext* ctx) {
     const uint32_t dst = ctx->gpr[3], src = ctx->gpr[4], n = ctx->gpr[5];
-    if (n > kMaxMemBytes || !LeanReady() || !OneView(src, n) || !PlainRange(dst, n)) return false;
+    if (n > kMaxMemBytes || !LeanReady() || !OneView(src, n) || !MemoryInline::LeanStoresArePlain(dst, n)) return false;
     const bool backward = src < dst;
     if (n != 0) {
         if (Overlap(src, n, dst, n) && backward != (Canonical(src) < Canonical(dst))) return false;
@@ -1846,22 +1846,35 @@ bool MemcpyNative(CpuContext* ctx) {
 
 // __fill_mem(dst = r3, value = r4, n = r5): n bytes of value & 0xFF. Under 32 bytes, byte stores; else byte stores up
 // to a word boundary, words (the byte replicated), then the remaining 0-3 bytes: the last store is a word at
-// dst + n - 4 when no byte remains, which decides the run's last mark pair. Writes back r3 and r4 as the original
-// leaves them: unchanged under 32 bytes; else r3 = the stwu pointer (the aligned start - 4 + the words' bytes) and,
-// when the byte is not zero, r4 = byte | byte << 8 (the first step of its replication).
+// dst + n - 4 when no byte remains, which decides the run's last mark pair. The destination may lie in a chunk the
+// store policy flags only because a 4 KiB page next to it holds guarded code (P+ clears a heap buffer beside its
+// Syriinge trampolines every frame): LeanStoresArePlain accepts it when no page of the range holds guarded code.
+// Writes back every register the original writes, as it leaves them: r5 = 0, r6 = dst + n - 1, r7 = the byte
+// (replicated to a word from 32 bytes on), XER[CA] set by any of its count-down loops (every n > 0), CR0 = r5's
+// compare with zero; from 32 bytes on also r0 = 0, r3 = the stwu pointer (the aligned start - 4 + the words' bytes)
+// and, when the byte is not zero, r4 = byte | byte << 8 (the first step of its replication).
 bool FillMemNative(CpuContext* ctx) {
     const uint32_t dst = ctx->gpr[3], value = ctx->gpr[4], n = ctx->gpr[5];
-    if (n > kMaxMemBytes || !LeanReady() || !PlainRange(dst, n)) return false;
+    if (n > kMaxMemBytes || !LeanReady() || !MemoryInline::LeanStoresArePlain(dst, n)) return false;
     const uint8_t byte = static_cast<uint8_t>(value);
-    if (n != 0) std::memset(Window() + Canonical(dst), byte, n);
+    if (n != 0) {
+        std::memset(Window() + Canonical(dst), byte, n);
+        ctx->xer |= 0x20000000u;
+    }
     if (n < 32u) {
         if (n != 0) MarkStoreRun(dst, dst + n - 1u);
-        return true;
+        ctx->gpr[7] = byte;
+    } else {
+        const uint32_t head = (0u - dst) & 3u, words = (n - head) & ~3u, tail = (n - head) & 3u;
+        MarkStoreRun(dst, tail != 0 ? dst + n - 1u : dst + n - 4u);
+        ctx->gpr[0] = 0;
+        ctx->gpr[3] = dst + head - 4u + words;
+        if (byte != 0) ctx->gpr[4] = byte | (static_cast<uint32_t>(byte) << 8);
+        ctx->gpr[7] = byte * 0x01010101u;
     }
-    const uint32_t head = (0u - dst) & 3u, words = (n - head) & ~3u, tail = (n - head) & 3u;
-    MarkStoreRun(dst, tail != 0 ? dst + n - 1u : dst + n - 4u);
-    ctx->gpr[3] = dst + head - 4u + words;
-    if (byte != 0) ctx->gpr[4] = byte | (static_cast<uint32_t>(byte) << 8);
+    ctx->gpr[5] = 0;
+    ctx->gpr[6] = dst + n - 1u;
+    ctx->crv[0] = PpcCrvCompare(int32_t{0}, int32_t{0}, ctx->xer);
     return true;
 }
 bool MemcpyWrites(const CpuContext& ctx, Ranges& ranges) {
@@ -2428,7 +2441,7 @@ extern "C" void G3dCalc_Memcpy(CpuContext* ctx) {
 
 extern "C" void G3dCalc_FillMem(CpuContext* ctx) {
 #if MKW_LEAN_MEMORY
-    func_80004388_body(ctx);
+    g3dcalc::Run(g3dcalc::kFillMem, ctx, func_80004388_body, g3dcalc::MemcpyWrites, g3dcalc::FillMemNative);
 #else
     func_80004388_body(ctx);
 #endif

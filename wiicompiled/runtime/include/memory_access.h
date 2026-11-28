@@ -147,6 +147,13 @@ template <typename T>
 MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC void WriteResolvedFallback(uint32_t addr, T value);
 MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC void WriteResolvedFallbackFloat32(uint32_t addr, double val);
 MKW_MEMORY_NO_INLINE MKW_MEMORY_COLD MKW_COLD_OP_CC void WriteResolvedFallbackFloat64(uint32_t addr, double val);
+#if MKW_LEAN_MEMORY
+// Every guest store into [addr, addr + size) ends as the dirty marks and the bytes in the window, on whichever path the
+// policy sends it: the chunks are unflagged, or the range lies in MEM1's or MEM2's cached view where
+// WriteResolvedFallback's fast exit takes it (no guarded code in any of its 4 KiB pages). For natives that write a
+// whole range at once (memcpy, memset's body): plain host stores plus the marks of the run are then exact.
+bool LeanStoresArePlain(uint32_t addr, uint32_t size);
+#endif
 #if MKW_OUTLINE_GUEST_OPS && MKW_LEAN_MEMORY
 // Lean stores and exact single loads/stores, out of line (src/guest_ops_outlined.cpp): FlatStore/FlatStoreRam's lean
 // bodies and lfs/stfs's conversions, each the inline code below compiled once.
