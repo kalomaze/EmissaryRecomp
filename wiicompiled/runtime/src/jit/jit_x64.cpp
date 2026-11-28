@@ -1701,7 +1701,7 @@ uint32_t BlockEmitter::SelfLoopPrefix(const Block& b) {
         case K::Mfspr: case K::Mtspr: case K::PsqL: case K::PsqLu: return i;
         case K::B:
             // a tail call, not decided at decode, or a jump a code variant may continue (EmitB's fallback call)
-            if (o.b != 2 || JitContinuationsPossible() || JitContinuationAt(o.imm)) return i;
+            if (o.b != 2 || JitContinuationPossibleAt(o.imm)) return i;
             continue;
         case K::Bc: case K::CmpwiBc: case K::CmplwiBc: case K::CmpwBc: case K::CmplwBc: case K::RlwinmRcBc: case K::Jmp:
             continue;

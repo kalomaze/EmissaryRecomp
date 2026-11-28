@@ -428,12 +428,9 @@ uint64_t JitTailOpCached(Frame* f, const Block* b, uint32_t index, JitTargetCell
 void JitNormalizeF1(Frame* f) noexcept;
 // The cell holding the pointer of the rollback loop frame (Call compares the frame with its current value).
 const void* const* JitRollbackLoopFrameCell() noexcept;
-// Whether GuestCodePatch::ContinuationAt can ever answer non-null in this process: code variants built in and not
-// switched off (the same conditions InitVariants applies). False is permanent.
-bool JitContinuationsPossible() noexcept;
-// GuestCodePatch::ContinuationAt(pc) != nullptr, for a block's compile to ask about a b's target (answers that depend on the
-// address alone, as a test's stub does, are settled this way).
-bool JitContinuationAt(uint32_t pc) noexcept;
+// Whether GuestCodePatch::ContinuationAt(pc) can ever answer non-null (GuestCodePatch::ContinuationPossibleAt), for a
+// block's compile to ask about a b's target. False is permanent for that pc.
+bool JitContinuationPossibleAt(uint32_t pc) noexcept;
 
 // The interpreter's own routines, for native code to call or mirror. They may throw (a guest call into code that does).
 Step Exec(Frame& f, uint32_t pc, uint32_t w, uint32_t& next, uint32_t returnAddress);

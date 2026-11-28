@@ -147,6 +147,7 @@ std::vector<std::pair<uint32_t, uint32_t>> g_variantSlots;              // open-
 uint32_t g_variantSlotMask = 0;
 bool g_variantsEnabled = false;
 std::once_flag g_variantsOnce;
+std::atomic<bool> g_variantsReady{false};  // InitVariants has run: g_variantsEnabled and g_variantSlots are final
 
 uint32_t VariantSlot(uint32_t address) { return ((address >> 2) * 0x9E3779B1u) >> 8; }
 
@@ -559,6 +560,7 @@ void RegisterJitHooks();
 void Protect(uint32_t start, uint32_t end, const char* name) {
     std::call_once(g_variantsOnce, [] {
         InitVariants();
+        g_variantsReady.store(true, std::memory_order_release);
         ProtectVariantRegions();
         if (!g_variantsEnabled) RegisterJitHooks();
     });
@@ -1104,6 +1106,16 @@ void ClearRedirect(uint32_t homeStart) {
 }
 
 void (*ContinuationAt(uint32_t address))(CpuContext*) { return MatchingVariant(address); }
+
+bool ContinuationPossibleAt(uint32_t address) {
+    if (!g_variantsReady.load(std::memory_order_acquire)) return true;  // before the first Protect: not settled yet
+    if (!g_variantsEnabled) return false;
+    for (uint32_t slot = VariantSlot(address) & g_variantSlotMask;; slot = (slot + 1) & g_variantSlotMask) {
+        const auto& [key, value] = g_variantSlots[slot];
+        if (value == 0) return false;
+        if (key == address) return true;
+    }
+}
 
 void ModuleLinkedInPlace(uint32_t start, uint32_t end) {
     if (!g_variantsEnabled || end <= start) return;

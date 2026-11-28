@@ -2900,28 +2900,7 @@ const void* const* JitRollbackLoopFrameCell() noexcept {
     return reinterpret_cast<const void* const*>(&g_rollbackLoopFrame);
 }
 
-// The count of code variants this build links, or 0. A build without them (the interpreter tests) does not define the
-// symbol, which a weak reference tolerates; Windows' linker has no weak undefined references, so there the tests define
-// it themselves (tests/interpreter_test_support.cpp).
-#if defined(_WIN32)
-extern "C" const uint32_t g_mkwCodeVariantCount;
-#else
-extern "C" const uint32_t g_mkwCodeVariantCount __attribute__((weak));
-#endif
-
-bool JitContinuationsPossible() noexcept {
-    static const bool possible = [] {
-#if defined(_WIN32)
-        if (g_mkwCodeVariantCount == 0) return false;
-#else
-        if (&g_mkwCodeVariantCount == nullptr || g_mkwCodeVariantCount == 0) return false;
-#endif
-        return std::getenv("BRAWL_NO_CODE_VARIANTS") == nullptr && std::getenv("BRAWL_INTERPRET") == nullptr;
-    }();
-    return possible;
-}
-
-bool JitContinuationAt(uint32_t pc) noexcept { return GuestCodePatch::ContinuationAt(pc) != nullptr; }
+bool JitContinuationPossibleAt(uint32_t pc) noexcept { return GuestCodePatch::ContinuationPossibleAt(pc); }
 
 #if MKW_JIT
 const JitBackend* Backend() { return JitX64Backend(); }

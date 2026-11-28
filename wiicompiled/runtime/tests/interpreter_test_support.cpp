@@ -33,10 +33,6 @@ struct TestAbiTable {
 constexpr TestAbiTable kTestAbi;
 }  // namespace
 extern "C" const uint32_t g_mkwGuestFloatAbiCount = kTestAbiCount;
-#if defined(_WIN32)
-// No code variants here. Elsewhere the interpreter reads the count through a weak reference; Windows needs the symbol.
-extern "C" const uint32_t g_mkwCodeVariantCount = 0u;
-#endif
 extern "C" const MkwGuestFloatAbi g_mkwGuestFloatAbi[kTestAbiCount] = {
 #define A(i) kTestAbi.entries[i]
 #define A8(i) A(i), A(i + 1), A(i + 2), A(i + 3), A(i + 4), A(i + 5), A(i + 6), A(i + 7)
@@ -126,6 +122,7 @@ static void TestContinuation(CpuContext* ctx) { ctx->gpr[3] = 0x55; }
 void (*ContinuationAt(uint32_t address))(CpuContext*) {
     return address == 0x8000d004u ? TestContinuation : nullptr;
 }
+bool ContinuationPossibleAt(uint32_t address) { return address == 0x8000d004u; }
 
 // A double of the patch machinery for the call tests: a small table saying where a call of a "patched" registered function X runs
 // guest code (TestSetInterpreted(X, X'); X' 0: the function's own body runs). The test's function for X does what RunPatched does
