@@ -45,6 +45,7 @@ public sealed partial class CxxLinearCodeGenerator
                     sb.AppendLine($"{pad}{dest} = {src};");
                     if (IsFloatRegister(assign.Destination))
                     {
+                        EmitRawSingleCopy(sb, pad, assign.Destination);
                         var paired = false;
                         if (assign.Value.Kind == "register" &&
                             assign.Value.RegisterName != null &&
@@ -61,6 +62,16 @@ public sealed partial class CxxLinearCodeGenerator
                 {
                     var dest = ToDestination(bin.Destination, types);
                     var scalarFloatOperation = IsFloatRegister(bin.Destination);
+                    if (scalarFloatOperation && bin.Op == "frsp")
+                    {
+                        // frsp: a single operand rounds by the plain conversion, and the result's bits may be kept for
+                        // a store (CxxLinearCodeGenerator.SingleFpr.cs).
+                        var source = ToScalarFloatExpression(bin.Left, types, localPaired);
+                        EmitSingleResult(sb, pad, bin.Destination, dest,
+                            RoundToSingleExpression(source, IsSingleFprValue(bin.Left, localPaired)));
+                        localPaired[GetRegisterBaseName(bin.Destination)] = false;
+                        break;
+                    }
                     var left = scalarFloatOperation
                         ? ToScalarFloatExpression(bin.Left, types, localPaired)
                         : ToExpression(bin.Left, types);
@@ -84,6 +95,12 @@ public sealed partial class CxxLinearCodeGenerator
 
                     if (TryEmitStackLoad(load, dest, isFloatDest, sb, pad, types, stackFacts))
                     {
+                    }
+                    else if (isFloatDest && load.SizeBytes == 4 && TryGetRawSingleRoot(load.Destination, out _))
+                    {
+                        // lfs is the 32-bit load and the exact widening (FlatReadFloat32Body); the word is kept for a store.
+                        EmitSingleLoad(sb, pad, load.Destination, dest,
+                            $"{GuestLoadHelper(4, isFloat: false)}({RemapAddress(load.Address, types, localConstants, linkedAddressRemap)})");
                     }
                     else if (isFloatDest && load.SizeBytes == 4)
                     {
@@ -132,7 +149,13 @@ public sealed partial class CxxLinearCodeGenerator
                         ? FlatWriteRamHelper(Bits(sizeBytes), isFloat)
                         : GuestStoreHelper(sizeBytes, isFloat);
 
-                    if (TryEmitStackStore(store, srcExpr, isFloatStore, sb, pad, types, stackFacts))
+                    // stfs of a value whose single bits are known: the integer store of the same family (SingleFpr.cs).
+                    if (isFloatStore && store.SizeBytes == 4 && TryGetRawStoreBits(store, 0, out var rawBits))
+                    {
+                        if (!TryEmitStackStore(store, rawBits, isFloatStore: false, sb, pad, types, stackFacts))
+                            sb.AppendLine($"{pad}{StoreHelper(4, isFloat: false)}({RemapAddress(store.Address, types, localConstants, linkedAddressRemap)}, {rawBits});");
+                    }
+                    else if (TryEmitStackStore(store, srcExpr, isFloatStore, sb, pad, types, stackFacts))
                     {
                     }
                     else if (isFloatStore && store.SizeBytes == 4)
@@ -185,7 +208,11 @@ public sealed partial class CxxLinearCodeGenerator
                     var isFloatDest = (destType is ValueRepresentation pt && pt.IsFloat) || IsFloatRegister(load.Destination);
                     var address = RemapAddress(load.OriginalAddress, types, localConstants, linkedAddressRemap);
                     var helper = isFloatDest ? $"Float{Bits(load.SizeBytes)}" : Bits(load.SizeBytes).ToString();
-                    sb.AppendLine($"{pad}{dest} = MemoryInline::{(LeanRanges ? "SegRead" : "ReadResolved")}{helper}({load.Range}, {load.RangeOffset}u, {address});");
+                    if (isFloatDest && load.SizeBytes == 4 && TryGetRawSingleRoot(load.Destination, out _))
+                        EmitSingleLoad(sb, pad, load.Destination, dest,
+                            $"MemoryInline::{(LeanRanges ? "SegRead" : "ReadResolved")}32({load.Range}, {load.RangeOffset}u, {address})");
+                    else
+                        sb.AppendLine($"{pad}{dest} = MemoryInline::{(LeanRanges ? "SegRead" : "ReadResolved")}{helper}({load.Range}, {load.RangeOffset}u, {address});");
                     if (IsFloatRegister(load.Destination))
                         localPaired[GetRegisterBaseName(load.Destination)] = false;
                 }
@@ -201,6 +228,11 @@ public sealed partial class CxxLinearCodeGenerator
                     var address = RemapAddress(store.OriginalAddress, types, localConstants, linkedAddressRemap);
                     var helper = isFloatStore ? $"Float{Bits(store.SizeBytes)}" : Bits(store.SizeBytes).ToString();
                     var value = isFloatStore || store.SizeBytes == 4 ? srcExpr : $"static_cast<uint{Bits(store.SizeBytes)}_t>({srcExpr})";
+                    if (isFloatStore && store.SizeBytes == 4 && TryGetRawStoreBits(store, 0, out var rawStoreBits))
+                    {
+                        helper = "32";
+                        value = rawStoreBits;
+                    }
                     sb.AppendLine($"{pad}MemoryInline::{(LeanRanges ? "SegWrite" : "WriteResolved")}{helper}({store.Range}, {store.RangeOffset}u, {address}, {value});");
                 }
                 break;
@@ -278,14 +310,26 @@ public sealed partial class CxxLinearCodeGenerator
                     var secondMember = pair.Descending ? "first" : "second";
                     var firstOffset = pair.Descending ? pair.RangeOffset + pair.ElementSizeBytes : pair.RangeOffset;
                     var secondOffset = pair.Descending ? pair.RangeOffset : pair.RangeOffset + pair.ElementSizeBytes;
+                    // A float word whose bits a store reuses goes through its raw single bits local (SingleFpr.cs):
+                    // `word` is the element's 32-bit word, `value` its usual expression.
+                    void Element(string destination, bool isFloat, string word, string value)
+                    {
+                        var target = ToDestination(destination, types);
+                        if (isFloat && pair.ElementSizeBytes == 4 && LeanRanges && TryGetRawSingleRoot(destination, out _))
+                            EmitSingleLoad(sb, pad + "        ", destination, target, word);
+                        else
+                            sb.AppendLine($"{pad}        {target} = {value};");
+                    }
                     sb.AppendLine($"{pad}{{");
                     sb.AppendLine($"{pad}    const auto resolved_pair = {pairHelper};");
                     sb.AppendLine($"{pad}    if (resolved_pair.valid) {{");
-                    sb.AppendLine($"{pad}        {ToDestination(pair.FirstDestination, types)} = {FastValue(firstMember, firstFloat)};");
-                    sb.AppendLine($"{pad}        {ToDestination(pair.SecondDestination, types)} = {FastValue(secondMember, secondFloat)};");
+                    Element(pair.FirstDestination, firstFloat, $"resolved_pair.{firstMember}", FastValue(firstMember, firstFloat));
+                    Element(pair.SecondDestination, secondFloat, $"resolved_pair.{secondMember}", FastValue(secondMember, secondFloat));
                     sb.AppendLine($"{pad}    }} else {{");
-                    sb.AppendLine($"{pad}        {ToDestination(pair.FirstDestination, types)} = MemoryInline::{readPrefix}{SlowHelper(firstFloat)}({pair.Range}, {firstOffset}u, {firstAddress});");
-                    sb.AppendLine($"{pad}        {ToDestination(pair.SecondDestination, types)} = MemoryInline::{readPrefix}{SlowHelper(secondFloat)}({pair.Range}, {secondOffset}u, {secondAddress});");
+                    Element(pair.FirstDestination, firstFloat, $"MemoryInline::{readPrefix}32({pair.Range}, {firstOffset}u, {firstAddress})",
+                        $"MemoryInline::{readPrefix}{SlowHelper(firstFloat)}({pair.Range}, {firstOffset}u, {firstAddress})");
+                    Element(pair.SecondDestination, secondFloat, $"MemoryInline::{readPrefix}32({pair.Range}, {secondOffset}u, {secondAddress})",
+                        $"MemoryInline::{readPrefix}{SlowHelper(secondFloat)}({pair.Range}, {secondOffset}u, {secondAddress})");
                     sb.AppendLine($"{pad}    }}");
                     sb.AppendLine($"{pad}}}");
                     if (IsFloatRegister(pair.FirstDestination)) localPaired[GetRegisterBaseName(pair.FirstDestination)] = false;
@@ -307,6 +351,12 @@ public sealed partial class CxxLinearCodeGenerator
                     var secondFloat = IsFloat(pair.SecondSource);
                     var first = Source(pair.FirstSource);
                     var second = Source(pair.SecondSource);
+                    // A float word whose single bits are known is stored as that word (SingleFpr.cs).
+                    string? firstBits = null, secondBits = null;
+                    if (pair.ElementSizeBytes == 4 && firstFloat && TryGetRawStoreBits(pair, 0, out var firstRaw))
+                        firstBits = firstRaw;
+                    if (pair.ElementSizeBytes == 4 && secondFloat && TryGetRawStoreBits(pair, 1, out var secondRaw))
+                        secondBits = secondRaw;
                     // A float word is an stfs: Gekko's narrowing (ConvertPpcDoubleToSingleBits), not the host's rounding
                     // cast, for a value left in double precision. Segment pairs always store through this arm.
                     string Raw(string value, bool isFloat) => !isFloat
@@ -314,10 +364,10 @@ public sealed partial class CxxLinearCodeGenerator
                         : LeanRanges
                             ? $"MemoryInline::ConvertPpcDoubleToSingleBits({value})"
                             : $"PpcBitCastToU32Inline(static_cast<float>({value}))";
-                    var lowSource = pair.Descending ? second : first;
-                    var highSource = pair.Descending ? first : second;
-                    var lowFloat = pair.Descending ? secondFloat : firstFloat;
-                    var highFloat = pair.Descending ? firstFloat : secondFloat;
+                    var lowSource = pair.Descending ? secondBits ?? second : firstBits ?? first;
+                    var highSource = pair.Descending ? firstBits ?? first : secondBits ?? second;
+                    var lowFloat = pair.Descending ? secondFloat && secondBits is null : firstFloat && firstBits is null;
+                    var highFloat = pair.Descending ? firstFloat && firstBits is null : secondFloat && secondBits is null;
                     var packed = pair.ElementSizeBytes == 2
                         ? $"((static_cast<uint32_t>(static_cast<uint16_t>({lowSource})) << 16) | static_cast<uint16_t>({highSource}))"
                         : $"((static_cast<uint64_t>({Raw(lowSource, lowFloat)}) << 32) | {Raw(highSource, highFloat)})";
@@ -331,8 +381,8 @@ public sealed partial class CxxLinearCodeGenerator
                     var firstOffset = pair.Descending ? pair.RangeOffset + pair.ElementSizeBytes : pair.RangeOffset;
                     var secondOffset = pair.Descending ? pair.RangeOffset : pair.RangeOffset + pair.ElementSizeBytes;
                     sb.AppendLine($"{pad}if (!{fast}) {{");
-                    sb.AppendLine($"{pad}    MemoryInline::{writePrefix}{Helper(firstFloat)}({pair.Range}, {firstOffset}u, {firstAddress}, {first});");
-                    sb.AppendLine($"{pad}    MemoryInline::{writePrefix}{Helper(secondFloat)}({pair.Range}, {secondOffset}u, {secondAddress}, {second});");
+                    sb.AppendLine($"{pad}    MemoryInline::{writePrefix}{Helper(firstFloat && firstBits is null)}({pair.Range}, {firstOffset}u, {firstAddress}, {firstBits ?? first});");
+                    sb.AppendLine($"{pad}    MemoryInline::{writePrefix}{Helper(secondFloat && secondBits is null)}({pair.Range}, {secondOffset}u, {secondAddress}, {secondBits ?? second});");
                     sb.AppendLine($"{pad}}}");
                 }
                 break;
@@ -536,7 +586,17 @@ public sealed partial class CxxLinearCodeGenerator
                         ? FormatSymbol(call.Target) + "SingleC"
                         : FormatSymbol(call.Target);
                     var callExpr = $"{callSymbol}({string.Join(", ", args)})";
-                    if (!string.IsNullOrWhiteSpace(call.Destination))
+                    if (FusedSingleTargets.Contains(call.Target) && call.Arguments.Count == 3 &&
+                        !string.IsNullOrWhiteSpace(call.Destination) && TryGetRawSingleRoot(call.Destination, out _))
+                    {
+                        // A fused single whose result's bits a store reuses: computed as its float (SingleFpr.cs).
+                        var subtract = call.Target.EndsWith("subs", StringComparison.OrdinalIgnoreCase) ? "true" : "false";
+                        var negate = call.Target.StartsWith("PPC_Fn", StringComparison.OrdinalIgnoreCase) ? "true" : "false";
+                        var singleC = callSymbol.EndsWith("SingleC", StringComparison.Ordinal) ? "true" : "false";
+                        EmitSingleResult(sb, pad, call.Destination, ToDestination(call.Destination, types),
+                            $"PpcFusedSingleFloatInline<{subtract}, {negate}, {singleC}>({string.Join(", ", args)})");
+                    }
+                    else if (!string.IsNullOrWhiteSpace(call.Destination))
                     {
                         sb.AppendLine(IsPairedProducerTarget(call.Target)
                             ? $"{pad}{PairedAssignment(call.Destination, callExpr, types)}"
@@ -653,6 +713,11 @@ public sealed partial class CxxLinearCodeGenerator
         }
 
         var address = Address(load.Address, types);
+        if (isFloatDest && load.SizeBytes == 4 && TryGetRawSingleRoot(load.Destination, out _))
+        {
+            EmitSingleLoad(sb, pad, load.Destination, dest, $"{StackLoadHelper(4, isFloat: false)}({address})");
+            return true;
+        }
         if (isFloatDest && load.SizeBytes == 4)
         {
             sb.AppendLine($"{pad}{dest} = {StackLoadHelper(4, isFloat: true)}({address});");

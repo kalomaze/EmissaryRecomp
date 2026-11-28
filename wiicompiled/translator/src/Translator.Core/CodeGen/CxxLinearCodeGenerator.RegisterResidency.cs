@@ -387,8 +387,33 @@ public sealed partial class CxxLinearCodeGenerator
 
         private void RecordWrite(int key) => RecordEvent(new SyncEvent(SyncEventKind.Write, UInt128.One << key, true));
 
+        // Instruction capture (recording pass only): the FPR locals one instruction's emission writes or reloads.
+        private bool _capturing;
+        private uint _capturedFprs;
+
+        /// <summary>Starts collecting the FPR locals the next emission writes or reloads (recording pass).</summary>
+        public void BeginFprCapture()
+        {
+            _capturing = _recording;
+            _capturedFprs = 0;
+        }
+
+        /// <summary>
+        /// Ends a capture: every FPR local written (through the residency accessors) or reloaded from CpuContext since
+        /// <see cref="BeginFprCapture"/>, or null when this is not a recording residency.
+        /// </summary>
+        public uint? EndFprCapture()
+        {
+            var captured = _capturing ? _capturedFprs : (uint?)null;
+            _capturing = false;
+            _capturedFprs = 0;
+            return captured;
+        }
+
         private void RecordEvent(SyncEvent syncEvent)
         {
+            if (_capturing && syncEvent.Kind != SyncEventKind.Flush)
+                _capturedFprs |= (uint)((syncEvent.Mask >> 32) & uint.MaxValue);
             if (_block is null || !_blockEvents.TryGetValue(_block, out var events))
             {
                 _eventOutsideBlock = true;
